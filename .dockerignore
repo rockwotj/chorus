@@ -1,0 +1,6 @@
+rust/target
+p/PGenerated
+p/PCheckerOutput
+p/PVerifierGenerated
+artifacts
+.git

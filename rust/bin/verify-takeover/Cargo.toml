@@ -1,0 +1,26 @@
+[package]
+name = "verify-takeover"
+version = "0.1.0"
+publish = false
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Standalone probe that verifies, against a LIVE GCS Rapid zonal bucket, the
+# provider behavior characterized by the Chorus whitepaper. The requests are
+# raw storage-v2 calls; only feature-gated rich redirect decoding is shared with
+# chorus-client.
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+crc32c.workspace = true
+google-cloud-auth.workspace = true
+googleapis-tonic-google-storage-v2.workspace = true
+prost-types.workspace = true
+chorus-client = { path = "../../client", features = ["probe-support"] }
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
+tonic.workspace = true

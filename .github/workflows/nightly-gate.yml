@@ -1,0 +1,29 @@
+name: Nightly verification gate
+
+on:
+  schedule:
+    # 09:17 UTC daily; odd minute to avoid the top-of-hour scheduling rush.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  gate:
+    name: One-hour DST certification plus full verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build the pinned verification toolchain image
+        run: docker build -t chorus-gate -f docker/Dockerfile .
+      - name: Certify and verify (Python pipeline)
+        run: |
+          mkdir -p artifacts
+          docker run --rm -v "$PWD/artifacts:/workspace/artifacts" chorus-gate
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dst-certification
+          path: |
+            artifacts/dst-certification.json
+            artifacts/dst-certified-trace.jsonl
+          if-no-files-found: ignore

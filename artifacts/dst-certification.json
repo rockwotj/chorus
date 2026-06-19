@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "passed": true,
+  "requested_wall_seconds": 3600,
+  "elapsed_wall_millis": 3617427,
+  "started_unix_ms": 1781934124316,
+  "completed_unix_ms": 1781937741775,
+  "seeds_completed": 884,
+  "steps_per_seed": 2000,
+  "last_seed": 883,
+  "last_trace_digest": "ee23c0c8f662462962aa1117f26576af258e4b9a8d340f34afa88499fd6376e8",
+  "source_digest": "6cf96cf1b13d11ab791cc9161da9743e65f04a339d0b97053143ebcedf7775b3",
+  "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "cargo_lock_sha256": "3de8ad77566f8c472afa0f78abf9abe245416913ee9ec2c4393e6e713ec32611",
+  "source_commit": "85d53831464a86e86e48836b6b01eac6eb8d7198",
+  "dirty_tree": true,
+  "mode": "production"
+}

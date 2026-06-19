@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust workspace and DST smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Manifest model field parity
+        run: python3 ../docker/scripts/check_manifest_field_parity.py
+      - name: Python script unit tests
+        run: |
+          python3 ../docker/scripts/test_orchestrate.py
+          python3 ../bench/test_run_suite.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-features
+      - name: DST production smoke
+        run: >-
+          cargo run --release -p chorus-dst --
+          --seeds 10 --steps 128
+          --trace ../artifacts/dst-trace.jsonl
+      - name: Trace structure gate
+        run: >-
+          cargo run --release -p chorus-trace-checker --
+          ../artifacts/dst-trace.jsonl --event-manifest ../p/TRACE_EVENTS.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dst-traces
+          path: artifacts/*.jsonl
+
+  model:
+    name: P semantic gate (quick)
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dst-traces
+          path: artifacts
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install P
+        run: |
+          dotnet tool install --global P --version 3.1.0
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+      - name: Compile the P model and PObserve monitors
+        working-directory: p
+        run: |
+          p compile -pp QuorumModel.pproj
+          p compile -pp QuorumModel.pproj -md pobserve
+          mvn -q -f pobserve/pom.xml package
+      - name: PObserve monitors over the DST traces
+        working-directory: p
+        run: java -jar pobserve/target/chorus-pobserve.jar ../artifacts/dst-trace.jsonl
+      - name: Model-check protocol test cases (1000 schedules)
+        working-directory: p
+        run: >-
+          python3 ../docker/scripts/orchestrate.py check-model
+          --schedules 1000 --max-steps 10000

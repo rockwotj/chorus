@@ -1,0 +1,8 @@
+<Project>
+  <ProjectName>QuorumModel</ProjectName>
+  <InputFiles>
+    <PFile>./model/</PFile>
+  </InputFiles>
+  <OutputDir>./PGenerated/</OutputDir>
+</Project>
+

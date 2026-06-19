@@ -1,0 +1,8 @@
+# The single pinned toolchain for local builds, CI, the release gate, and
+# the verification image. rustup reads this file automatically wherever
+# cargo runs; CI and the Dockerfile install it with a bare
+# `rustup toolchain install`.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

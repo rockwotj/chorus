@@ -1,0 +1,37 @@
+# Rust build output and backups
+/rust/target/
+**/*.rs.bk
+
+# P generated code, checker output, and verifier caches
+/p/PGenerated/
+/p/PCheckerOutput/
+/p/PVerifierGenerated/
+/p/pobserve/target/
+**/*.coverage.txt
+**/*.sci
+
+# Deterministic simulation traces and source-bound certification receipts are
+# local build artifacts. The full gate consumes the current receipt in place.
+/artifacts/*.jsonl
+/artifacts/*.tmp
+/artifacts/dst-certification.json
+/artifacts/cert-batch/
+
+# Local environment, logs, and temporary files
+.env
+.env.*
+!.env.example
+*.log
+*.swp
+*.swo
+*~
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# go-task checksum cache
+.task/
+docker/scripts/__pycache__/
+/artifacts/*.log

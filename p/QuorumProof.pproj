@@ -1,0 +1,9 @@
+<Project>
+  <ProjectName>QuorumProof</ProjectName>
+  <InputFiles>
+    <PFile>./proof/</PFile>
+  </InputFiles>
+  <OutputDir>./PVerifierGenerated/</OutputDir>
+  <Target>PVerifier</Target>
+</Project>
+

@@ -1,0 +1,7 @@
+# turmoil only seeds tokio's runtime RNG (making the scheduler and non-biased
+# select! deterministic) under `--cfg tokio_unstable`. Without it, tokio's
+# internal scheduling is entropy-seeded per run, so deterministic-simulation
+# tests can flake whenever a tokio-internal (tonic/hyper) ready-branch tie is
+# reached. Enable it workspace-wide so the DST is fully deterministic.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

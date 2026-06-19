@@ -1,0 +1,43 @@
+[package]
+name = "chorus-client"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Quorum write-ahead log for databases over GCS Rapid zonal buckets"
+repository = "https://github.com/rockwotj/chorus"
+documentation = "https://docs.rs/chorus-client"
+readme = "README.md"
+keywords = ["gcs", "wal", "write-ahead-log", "quorum", "storage"]
+categories = ["database-implementations", "asynchronous"]
+exclude = ["src/grpc_internal_tests.rs", "src/grpc_internal_tests/**", "tests/**"]
+
+[features]
+default = []
+probe-support = []
+# Internal capacity introspection used by the deterministic simulation harness.
+dst-support = []
+
+[dependencies]
+arc-swap.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+googleapis-tonic-google-storage-v2.workspace = true
+google-cloud-auth.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+chorus-fake-gcs = { path = "../fake-gcs" }

@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package google.storage.v2;
+
+service Storage {
+  rpc DeleteObject(DeleteObjectRequest) returns (Empty);
+  rpc GetObject(GetObjectRequest) returns (Object);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc ReadObject(ReadObjectRequest) returns (stream ReadObjectResponse);
+  rpc UpdateObject(UpdateObjectRequest) returns (Object);
+  rpc WriteObject(stream WriteObjectRequest) returns (WriteObjectResponse);
+  rpc BidiWriteObject(stream BidiWriteObjectRequest)
+      returns (stream BidiWriteObjectResponse);
+}
+
+message ListObjectsRequest {
+  string parent = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  string delimiter = 4;
+  bool include_trailing_delimiter = 5;
+  string prefix = 6;
+  bool versions = 7;
+}
+
+message ListObjectsResponse {
+  repeated Object objects = 1;
+  repeated string prefixes = 2;
+  string next_page_token = 3;
+}
+
+message Empty {}
+
+message DeleteObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 4;
+  optional int64 if_generation_match = 5;
+  optional int64 if_generation_not_match = 6;
+  optional int64 if_metageneration_match = 7;
+  optional int64 if_metageneration_not_match = 8;
+}
+
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+message ObjectChecksums {
+  optional fixed32 crc32c = 1;
+  bytes md5_hash = 2;
+}
+
+message Object {
+  string name = 1;
+  string bucket = 2;
+  int64 generation = 3;
+  int64 metageneration = 4;
+  int64 size = 6;
+  string content_type = 13;
+  optional ObjectChecksums checksums = 16;
+  map<string, string> metadata = 22;
+  optional Timestamp finalize_time = 36;
+}
+
+message GetObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_generation_match = 4;
+  optional int64 if_metageneration_match = 6;
+}
+
+message ReadObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  int64 read_offset = 4;
+  int64 read_limit = 5;
+  optional int64 if_generation_match = 6;
+  optional int64 if_metageneration_match = 8;
+}
+
+message ChecksummedData {
+  bytes content = 1;
+  optional fixed32 crc32c = 2;
+}
+
+message ReadObjectResponse {
+  optional ChecksummedData checksummed_data = 1;
+  optional Object metadata = 4;
+}
+
+message UpdateObjectRequest {
+  optional Object object = 1;
+  optional int64 if_generation_match = 2;
+  optional int64 if_generation_not_match = 3;
+  optional int64 if_metageneration_match = 4;
+  optional int64 if_metageneration_not_match = 5;
+}
+
+message BidiWriteHandle {
+  bytes handle = 1;
+}
+
+message BidiWriteObjectRedirectedError {
+  optional string routing_token = 1;
+  optional BidiWriteHandle write_handle = 2;
+  optional int64 generation = 3;
+}
+
+message WriteObjectSpec {
+  optional Object resource = 1;
+  optional int64 if_generation_match = 3;
+  optional int64 if_generation_not_match = 4;
+  optional int64 if_metageneration_match = 5;
+  optional int64 if_metageneration_not_match = 6;
+  optional int64 object_size = 8;
+  optional bool appendable = 9;
+}
+
+message AppendObjectSpec {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_metageneration_match = 4;
+  optional int64 if_metageneration_not_match = 5;
+  optional string routing_token = 6;
+  optional BidiWriteHandle write_handle = 7;
+}
+
+message WriteObjectRequest {
+  oneof first_message {
+    string upload_id = 1;
+    WriteObjectSpec write_object_spec = 2;
+  }
+  int64 write_offset = 3;
+  oneof data {
+    ChecksummedData checksummed_data = 4;
+  }
+  bool finish_write = 7;
+}
+
+message WriteObjectResponse {
+  oneof write_status {
+    int64 persisted_size = 1;
+    Object resource = 2;
+  }
+}
+
+message BidiWriteObjectRequest {
+  oneof first_message {
+    string upload_id = 1;
+    WriteObjectSpec write_object_spec = 2;
+    AppendObjectSpec append_object_spec = 11;
+  }
+  int64 write_offset = 3;
+  oneof data {
+    ChecksummedData checksummed_data = 4;
+  }
+  bool state_lookup = 7;
+  bool flush = 8;
+  bool finish_write = 9;
+}
+
+message BidiWriteObjectResponse {
+  oneof write_status {
+    int64 persisted_size = 1;
+    Object resource = 2;
+  }
+  optional BidiWriteHandle write_handle = 3;
+}

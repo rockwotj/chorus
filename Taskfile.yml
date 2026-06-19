@@ -1,0 +1,168 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the whole Rust workspace
+    dir: rust
+    cmds:
+      - cargo build --workspace --all-targets
+
+  check:
+    desc: Type-check the whole Rust workspace
+    dir: rust
+    cmds:
+      - cargo check --workspace --all-targets
+
+  test:
+    desc: Run the Rust workspace test suite
+    dir: rust
+    cmds:
+      - cargo test --workspace
+
+  clippy:
+    desc: Lint the Rust workspace (warnings are errors)
+    dir: rust
+    cmds:
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  fmt:
+    desc: Format the Rust workspace
+    dir: rust
+    cmds:
+      - cargo fmt --all
+
+  fmt-check:
+    desc: Verify Rust formatting without modifying files
+    dir: rust
+    cmds:
+      - cargo fmt --all --check
+
+  dst:
+    desc: 'Run a short deterministic-simulation smoke (override: task dst SEEDS=100 STEPS=1000)'
+    dir: rust
+    vars:
+      SEEDS: '{{.SEEDS | default 5}}'
+      STEPS: '{{.STEPS | default 500}}'
+    cmds:
+      - cargo run -p chorus-dst --release -- --seeds {{.SEEDS}} --steps {{.STEPS}} --trace ../artifacts/dst-trace.jsonl
+
+  certify:
+    desc: 'Run the wall-clock DST certification gate (default 1h; override: task certify DURATION=21600)'
+    vars:
+      DURATION: '{{.DURATION | default 3600}}'
+    cmds:
+      - python3 docker/scripts/orchestrate.py certify --wall-seconds {{.DURATION}}
+
+  verify:
+    desc: Run the full verification gate (needs a fresh certification receipt and uclid on PATH)
+    cmds:
+      - python3 docker/scripts/orchestrate.py verify
+
+  verify-quick:
+    desc: Verification gate with fewer model-checking schedules and no receipt requirement
+    cmds:
+      - python3 docker/scripts/orchestrate.py verify --quick
+
+  pobserve:
+    desc: 'Run generated PObserve monitors over a trace (override: task pobserve TRACE=artifacts/other.jsonl)'
+    vars:
+      TRACE: '{{.TRACE | default "artifacts/dst-trace.jsonl"}}'
+    cmds:
+      - java -jar p/pobserve/target/chorus-pobserve.jar {{.TRACE}}
+
+  manifest-field-parity:
+    desc: Verify Rust ManifestRecord and P tManifestRecord field correspondence
+    cmds:
+      - python3 docker/scripts/check_manifest_field_parity.py
+
+  gate:
+    desc: 'Certification then full verification; the tree must not change while it runs (default 1h; override: task gate DURATION=21600)'
+    cmds:
+      - task: certify
+        vars:
+          DURATION: '{{.DURATION | default 3600}}'
+      - task: verify
+
+  ci:
+    desc: Local Rust format, lint, test, and paper build checks
+    cmds:
+      - task: fmt-check
+      - task: clippy
+      - task: test
+      - task: manifest-field-parity
+      - task: paper:pdf
+
+  release-check:
+    desc: Run the chorus-client checks required before publishing
+    dir: rust
+    env:
+      RUST_TEST_THREADS: '1'
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy -p chorus-client --all-targets --all-features -- -D warnings
+      - cargo test -p chorus-client --all-features
+      - cargo publish -p chorus-client --locked --dry-run
+
+  release:
+    desc: Verify main, create the signed crate-version tag, and push it
+    cmds:
+      - |
+        set -eu
+
+        branch="$(git branch --show-current)"
+        if [ "$branch" != main ]; then
+          echo "release must run from main, not $branch" >&2
+          exit 1
+        fi
+
+        verify_release_head() {
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "release requires a clean tracked worktree" >&2
+            exit 1
+          fi
+
+          git fetch origin main
+          head="$(git rev-parse HEAD)"
+          remote_main="$(git rev-parse origin/main)"
+          if [ "$head" != "$remote_main" ]; then
+            echo "main must exactly match origin/main before release" >&2
+            exit 1
+          fi
+        }
+
+        verify_release_head
+        task release-check
+        verify_release_head
+
+        head="$(git rev-parse HEAD)"
+
+        version="$(
+          cd rust
+          cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "chorus-client") | .version'
+        )"
+        tag="v${version}"
+
+        if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+          echo "release tag $tag already exists on origin" >&2
+          exit 1
+        fi
+
+        if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+          tag_commit="$(git rev-list -n 1 "$tag")"
+          if [ "$tag_commit" != "$head" ]; then
+            echo "local release tag $tag points to a different commit" >&2
+            exit 1
+          fi
+          git tag -v "$tag"
+        else
+          git tag -s "$tag" -m "chorus-client $tag"
+        fi
+
+        git push origin "refs/tags/$tag"
