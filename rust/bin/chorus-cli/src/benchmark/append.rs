@@ -1,140 +1,26 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use chorus_client::{
-    AppendReceipt, BearerAuth, ClientConfig, CounterFn, Error, GaugeFn, GrpcReplicaFactory,
-    HistogramFn, MetricsRecorder, RefreshingAuthConfig, SegmentedVolume, UpDownCounterFn,
-    WalEngineConfig, WalHandle, WalSeqNo,
+    AppendReceipt, ClientConfig, Error, MetricsRecorder, SegmentedVolume, WalEngineConfig,
+    WalHandle, WalSeqNo,
 };
-use clap::Parser;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use hdrhistogram::Histogram;
-use tracing_subscriber::EnvFilter;
+
+use super::BenchMetrics;
+use crate::ConnectedStorage;
 
 const OPEN_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 type TimedAppendCompletion = BoxFuture<'static, (Instant, Instant, Result<AppendReceipt, Error>)>;
 
-#[derive(Default)]
-struct BenchMetrics {
-    counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    gauges: Mutex<HashMap<String, Arc<AtomicI64>>>,
-}
-
-impl BenchMetrics {
-    fn counter(&self, name: &str) -> u64 {
-        self.counters.lock().unwrap()[name].load(Ordering::Relaxed)
-    }
-
-    fn gauge(&self, name: &str) -> i64 {
-        self.gauges.lock().unwrap()[name].load(Ordering::Relaxed)
-    }
-}
-
-struct BenchCounter(Arc<AtomicU64>);
-
-impl CounterFn for BenchCounter {
-    fn increment(&self, value: u64) {
-        self.0.fetch_add(value, Ordering::Relaxed);
-    }
-}
-
-struct BenchGauge(Arc<AtomicI64>);
-
-impl GaugeFn for BenchGauge {
-    fn set(&self, value: i64) {
-        self.0.store(value, Ordering::Relaxed);
-    }
-}
-
-struct NoopMetric;
-
-impl UpDownCounterFn for NoopMetric {
-    fn increment(&self, _value: i64) {}
-}
-
-impl HistogramFn for NoopMetric {
-    fn record(&self, _value: f64) {}
-}
-
-impl MetricsRecorder for BenchMetrics {
-    fn register_counter(
-        &self,
-        name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn CounterFn> {
-        let metric = self
-            .counters
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_default()
-            .clone();
-        Arc::new(BenchCounter(metric))
-    }
-
-    fn register_gauge(
-        &self,
-        name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn GaugeFn> {
-        let metric = self
-            .gauges
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_default()
-            .clone();
-        Arc::new(BenchGauge(metric))
-    }
-
-    fn register_up_down_counter(
-        &self,
-        _name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn UpDownCounterFn> {
-        Arc::new(NoopMetric)
-    }
-
-    fn register_histogram(
-        &self,
-        _name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-        _boundaries: &[f64],
-    ) -> Arc<dyn HistogramFn> {
-        Arc::new(NoopMetric)
-    }
-}
-
-#[derive(Parser, Debug)]
-#[command(about = "Production benchmark for the zonal GCS quorum WAL (1, 3, or 5 zones)")]
-struct Args {
-    #[arg(long, value_delimiter = ',', num_args = 1..=5)]
-    endpoints: Vec<String>,
-    #[arg(long, value_delimiter = ',', num_args = 1..=5)]
-    buckets: Vec<String>,
-    /// Endpoint of the regional bucket hosting the manifest register.
-    #[arg(long)]
-    manifest_endpoint: String,
-    /// Full v2 resource name of the regional manifest bucket.
-    #[arg(long)]
-    manifest_bucket: String,
-    #[arg(long)]
-    prefix: String,
-    #[arg(long, env = "GCS_BEARER_TOKEN")]
-    bearer_token: Option<String>,
-    #[arg(long, conflicts_with = "bearer_token")]
-    anonymous: bool,
+#[derive(clap::Args, Debug)]
+pub(crate) struct AppendArgs {
     #[arg(long, default_value_t = 60)]
     duration_seconds: u64,
     #[arg(long, default_value_t = 128)]
@@ -162,6 +48,33 @@ struct Args {
     worker_threads: usize,
 }
 
+impl AppendArgs {
+    pub(crate) fn worker_threads(&self) -> usize {
+        self.worker_threads
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.arrival_rate.is_finite() || self.arrival_rate < 0.0 {
+            bail!("--arrival-rate must be a finite non-negative number");
+        }
+        if self.outstanding_appends == 0
+            || self.payload_bytes == 0
+            || self.duration_seconds == 0
+            || self.max_record_bytes == 0
+            || self.pipeline_window == 0
+            || self.max_inflight_bytes == 0
+            || self.max_replica_lag_bytes == 0
+            || self.lane_stall_timeout_ms == 0
+            || self.queue_capacity == 0
+            || self.segment_bytes == 0
+            || self.worker_threads == 0
+        {
+            bail!("duration and all size/concurrency counts must be positive");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct WorkloadStats {
     completed_appends: u64,
@@ -169,41 +82,6 @@ struct WorkloadStats {
     outstanding_cap_waits: u64,
     drain_timed_out: bool,
     undrained_appends: usize,
-}
-
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-    let args = Args::parse();
-    if args.buckets.len() != args.endpoints.len() {
-        bail!("--endpoints and --buckets must list the same number of zones");
-    }
-    if !matches!(args.endpoints.len(), 1 | 3 | 5) {
-        bail!("1, 3, or 5 endpoints and buckets are required");
-    }
-    if !args.arrival_rate.is_finite() || args.arrival_rate < 0.0 {
-        bail!("--arrival-rate must be a finite non-negative number");
-    }
-    if args.outstanding_appends == 0
-        || args.payload_bytes == 0
-        || args.duration_seconds == 0
-        || args.max_record_bytes == 0
-        || args.pipeline_window == 0
-        || args.max_inflight_bytes == 0
-        || args.max_replica_lag_bytes == 0
-        || args.lane_stall_timeout_ms == 0
-        || args.queue_capacity == 0
-        || args.segment_bytes == 0
-        || args.worker_threads == 0
-    {
-        bail!("duration and all size/concurrency counts must be positive");
-    }
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.worker_threads)
-        .enable_all()
-        .build()?
-        .block_on(run(args))
 }
 
 fn record_open_loop_completion(
@@ -318,71 +196,13 @@ async fn run_open_loop(
     Ok((started, stats))
 }
 
-async fn run(args: Args) -> Result<()> {
-    let auth = if args.anonymous {
-        None
-    } else if let Some(token) = args.bearer_token {
-        Some(BearerAuth::static_token(token))
-    } else {
-        Some(
-            BearerAuth::google_adc(RefreshingAuthConfig::default())
-                .await
-                .context("load Google Application Default Credentials")?,
-        )
-    };
-    let zones = args.endpoints.len();
-    let mut factories = Vec::with_capacity(zones);
-    for zone in 0..zones {
-        let factory = match &auth {
-            Some(auth) => {
-                GrpcReplicaFactory::connect_with_auth(
-                    zone,
-                    &args.endpoints[zone],
-                    args.buckets[zone].clone(),
-                    auth.clone(),
-                )
-                .await
-            }
-            None => {
-                GrpcReplicaFactory::connect(
-                    zone,
-                    &args.endpoints[zone],
-                    args.buckets[zone].clone(),
-                    None,
-                )
-                .await
-            }
-        }
-        .with_context(|| format!("connect zone {zone}"))?;
-        factories.push(factory);
-    }
-    let manifest_factory = match &auth {
-        Some(auth) => {
-            GrpcReplicaFactory::connect_with_auth(
-                zones,
-                &args.manifest_endpoint,
-                args.manifest_bucket.clone(),
-                auth.clone(),
-            )
-            .await
-        }
-        None => {
-            GrpcReplicaFactory::connect(
-                zones,
-                &args.manifest_endpoint,
-                args.manifest_bucket.clone(),
-                None,
-            )
-            .await
-        }
-    }
-    .context("connect regional manifest bucket")?;
+pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendArgs) -> Result<()> {
     let metrics = Arc::new(BenchMetrics::default());
     let metrics_recorder: Arc<dyn MetricsRecorder> = metrics.clone();
     let volume = SegmentedVolume::new_with_metrics_recorder(
-        factories,
-        manifest_factory,
-        &args.prefix,
+        storage.factories,
+        storage.manifest_factory,
+        prefix,
         ClientConfig::default(),
         metrics_recorder,
     )?;

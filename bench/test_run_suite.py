@@ -59,12 +59,14 @@ class BenchmarkSuiteTests(unittest.TestCase):
 
         command = run_suite.chorus_command(
             config,
-            Path("/tmp/gcs-quorum-bench"),
+            Path("/tmp/chorus"),
             "qd1",
             ("--outstanding-appends", "1", "--arrival-rate", "0"),
         )
         self.assertEqual(command[command.index("--buckets") + 1], "zone-a,zone-b,zone-c")
         self.assertEqual(command[command.index("--manifest-bucket") + 1], "regional")
+        benchmark = command.index("benchmark")
+        self.assertEqual(command[benchmark : benchmark + 2], ["benchmark", "append"])
 
 
 if __name__ == "__main__":

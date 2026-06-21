@@ -1,63 +1,104 @@
 # chorus-dst
 
-`chorus-dst` provides deterministic failure-injection testing for Chorus.
+`chorus-dst` is the deterministic failure-injection harness for the Chorus
+client. It is verification infrastructure, not a storage service or a
+production deployment mode.
 
-`production` mode starts three zonal `chorus-fake-gcs` gRPC servers plus one
-regional manifest server and exercises only the normal public
-`GrpcReplicaFactory`, `SegmentedVolume`, `Recovery`, and `WalHandle` APIs. It
-imports no client protocol types or simulator hooks.
+## Simulation model
 
-Seeded schedules inject transient and delayed RPCs, zone crashes/restarts,
-partial writes, competing writer incarnations, takeover, admission bursts,
-automatic segment rotation, immutable sealed-copy repair, startup replay,
-truncation, and corruption of the two committing copies during the
-reduced-redundancy window. Recovery is exercised with one zone held down. Each
-seed runs twice and must emit an identical refinement trace. Segment and
-manifest observations come directly from explicit fake-service state
-snapshots. Fault phases run as a seeded shuffled deck, with every phase exactly
-once per 16-phase epoch; seed zero retains the fixed phase order for debugging.
-Production-mode repair uses only deterministic engine-start and post-rotation
-triggers; the periodic repair interval is disabled and no wall-clock timer
-drives convergence.
-Persistence, creation, finalization, and deletion observations retain every
-actual supporting zone in sorted order rather than normalizing witness identity.
-Manifest snapshots produce `EpochClaimed`, `ViewCommitted`, and
-`FloorCommitted` observations.
+Each seed runs the production WAL protocol against three zonal
+`chorus-fake-gcs` instances and one regional manifest instance. The primary
+harness uses `InMemoryReplicaFactory`, which drives the fake service directly
+without HTTP/2, TCP, or spawned stream-reader tasks. The client protocol,
+recovery, segment rotation, repair, truncation, and admission logic remain the
+same implementation used with the production transport; only the transport
+adapter and service are replaced.
 
-`chorus-trace-checker` validates the JSON envelope and event manifest. The semantic
-gate compiles `p/model/Monitors.p` with PObserve and feeds the production trace
-into the generated monitor classes. A checked-in JSONL fixture separately keeps
-the structural validator pinned to every declared event class.
+The harness runs in turmoil's single-threaded virtual-time runtime. Seeded
+schedules cover:
 
-Long certification runs retain every seed long enough to replay it through
-PObserve. Each seed is written deterministically as
-`--batch-dir/seed-{seed}.jsonl`; every `--batch-size` traces (50 by default) the
-Java adapter checks the directory with fresh monitor instances per trace.
-Accepted files are deleted, while a rejected batch is retained and makes the
-receipt fail with the offending seed path and monitor name before the Rust
-binary exits non-zero. The final partial batch is always checked. `--trace`
-still receives the last seed for compatibility with the single-trace
-development gate. Omitting `--pobserve-jar` is allowed for structural-only
-development runs, but emits a warning and leaves the per-seed traces
-unverified.
+- transient, delayed, redirected, expired, and throttled storage operations;
+- partial writes, ambiguous outcomes, stream fences, and competing writers;
+- zone crashes and restarts, including recovery with one zone unavailable;
+- automatic rotation, sealed-copy repair, replay, and truncation;
+- corruption and divergence during reduced-redundancy windows;
+- admission pressure and lane-stall behavior.
 
-The real tonic transport runs over turmoil's simulated TCP network with a
-single-threaded scheduler, fixed seed-derived latency, and virtual time. Kernel
-network behavior and separate operating-system processes belong to a different
-chaos-test layer.
+Adversarial scenarios run as a 16-phase deck. Seed `0` keeps the fixed phase
+order for debugging; other seeds shuffle each complete deck. Every seed is
+executed twice, and the two runs must produce the same trace digest.
+
+Targeted transport tests also run tonic over turmoil TCP. Those tests cover
+transport-specific behavior, but they are not the main certification path.
+Kernel networking, separate processes, and live GCS behavior require separate
+integration or chaos tests.
+
+## Run a smoke test
+
+From `rust/`:
 
 ```sh
-cargo run -p chorus-dst -- \
-  --seeds 10 --steps 128 \
+cargo run --release -p chorus-dst -- \
+  --seeds 10 \
+  --steps 128 \
   --trace ../artifacts/dst-trace.jsonl \
-  --batch-dir ../artifacts/cert-batch \
-  --pobserve-jar ../p/pobserve/target/chorus-pobserve.jar
+  --batch-dir ../artifacts/dst-smoke-batch
+```
 
+Use `--inject-latency` to add deterministic normal-service latency in addition
+to explicit faults. Without `--pobserve-jar`, this command emits a warning,
+performs only structural trace validation, and leaves its per-seed traces in
+the batch directory. Run `cargo run -p chorus-dst -- --help` for the full CLI.
+
+## Trace validation
+
+Trace checking has two intentionally separate layers:
+
+1. `chorus-trace-checker` parses JSONL, verifies contiguous sequence numbers,
+   rejects undeclared events, and requires the Rust event list to exactly match
+   `p/TRACE_EVENTS.txt`.
+2. The generated PObserve adapter evaluates protocol semantics using the
+   monitors in `p/model/Monitors.p`.
+
+The structural checker is a second binary in this package:
+
+```sh
+cargo run --release -p chorus-dst --bin chorus-trace-checker -- \
+  ../artifacts/dst-trace.jsonl \
+  --event-manifest ../p/TRACE_EVENTS.txt
+```
+
+Structural acceptance does not imply semantic conformance. Run PObserve over
+the same trace for that gate:
+
+```sh
+java -jar ../p/pobserve/target/chorus-pobserve.jar \
+  ../artifacts/dst-trace.jsonl
+```
+
+## Certification
+
+The repository orchestrator requires a previously built PObserve JAR. Build the
+generated adapter, then start certification from the repository root:
+
+```sh
+cd ../p
+p compile -pp QuorumModel.pproj -md pobserve
+mvn -q -f pobserve/pom.xml package
 cd ..
 python3 docker/scripts/orchestrate.py certify --wall-seconds 3600
 ```
 
-Certification should run through the pinned Docker verification image. Its
-receipt records measured runtime, achieved seed count, source digest, compiler
-version, `rust/Cargo.lock` SHA-256, and whether the source tree was dirty in
-`artifacts/dst-certification.json`.
+The orchestrator passes the JAR to `chorus-dst`, which checks every seed batch
+with fresh PObserve monitor instances for each trace. During certification,
+traces are written by default as
+`artifacts/cert-batch/seed-{seed}.jsonl`. Accepted batches are deleted. A
+rejected batch is retained and causes a non-zero exit with the failing trace
+and monitor in the diagnostic. The final partial batch is always checked.
+
+The receipt at `artifacts/dst-certification.json` records the elapsed wall
+time, seed count, last trace digest, source digest, Rust compiler version,
+`Cargo.lock` digest, source commit, and dirty-tree state. The orchestrator does
+not permit an unmonitored certification run. Omitting `--pobserve-jar` is
+available only when invoking `chorus-dst` directly for development; that mode
+emits a warning and produces only structurally validated traces.

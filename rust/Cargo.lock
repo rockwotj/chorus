@@ -352,9 +352,11 @@ name = "chorus-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chorus-client",
  "clap",
  "futures",
+ "hdrhistogram",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -426,16 +428,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "chorus-trace-checker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chorus-dst",
- "clap",
- "serde_json",
 ]
 
 [[package]]
@@ -886,21 +878,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "gcs-quorum-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chorus-client",
- "clap",
- "futures",
- "hdrhistogram",
- "serde_json",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2154,19 +2131,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "recovery-bench"
+name = "rapid-probe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
  "chorus-client",
- "chorus-fake-gcs",
  "clap",
- "futures",
- "hdrhistogram",
- "serde_json",
+ "crc32c",
+ "google-cloud-auth",
+ "googleapis-tonic-google-storage-v2",
+ "prost-types",
  "tokio",
- "tracing-subscriber",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -3181,23 +3159,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "verify-takeover"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chorus-client",
- "clap",
- "crc32c",
- "google-cloud-auth",
- "googleapis-tonic-google-storage-v2",
- "prost-types",
- "tokio",
- "tokio-stream",
- "tonic",
-]
 
 [[package]]
 name = "version_check"

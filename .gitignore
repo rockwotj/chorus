@@ -21,6 +21,8 @@
 .env
 .env.*
 !.env.example
+**/__pycache__/
+*.py[cod]
 *.log
 *.swp
 *.swo
@@ -33,5 +35,4 @@
 
 # go-task checksum cache
 .task/
-docker/scripts/__pycache__/
 /artifacts/*.log

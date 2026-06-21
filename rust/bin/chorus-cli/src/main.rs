@@ -1,4 +1,8 @@
+mod benchmark;
+
 use anyhow::{bail, Context, Result};
+use benchmark::append::AppendArgs;
+use benchmark::recovery::RecoveryArgs;
 use chorus_client::{
     BearerAuth, ClientConfig, GrpcReplicaFactory, RefreshingAuthConfig, SegmentedVolume,
     WalEngineConfig, WalSeqNo,
@@ -43,14 +47,82 @@ enum Command {
         #[arg(long)]
         record_index: u64,
     },
+    /// Run live GCS benchmarks using the production Chorus client.
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Subcommand, Debug)]
+enum BenchmarkCommand {
+    /// Measure sustained append latency and throughput.
+    Append(AppendArgs),
+    /// Measure recovery phases after populating a separate WAL.
+    Recovery(RecoveryArgs),
+}
+
+impl Command {
+    fn worker_threads(&self) -> usize {
+        match self {
+            Self::Benchmark {
+                command: BenchmarkCommand::Append(args),
+            } => args.worker_threads(),
+            Self::Benchmark {
+                command: BenchmarkCommand::Recovery(args),
+            } => args.worker_threads(),
+            _ => std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Benchmark {
+                command: BenchmarkCommand::Append(args),
+            } => args.validate(),
+            Self::Benchmark {
+                command: BenchmarkCommand::Recovery(args),
+            } => args.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+
+pub(crate) struct ConnectedStorage {
+    pub(crate) factories: Vec<GrpcReplicaFactory>,
+    pub(crate) manifest_factory: GrpcReplicaFactory,
+}
+
+impl ConnectedStorage {
+    fn volume(&self, prefix: &str) -> Result<SegmentedVolume> {
+        SegmentedVolume::new(
+            self.factories.clone(),
+            self.manifest_factory.clone(),
+            prefix,
+            ClientConfig::default(),
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    validate_storage_args(&args)?;
+    args.command.validate()?;
+    let worker_threads = args.command.worker_threads();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+fn validate_storage_args(args: &Args) -> Result<()> {
     let zones = args.endpoints.len();
     if args.buckets.len() != zones {
         bail!("--endpoints and --buckets must list the same number of zones");
@@ -58,10 +130,15 @@ async fn main() -> Result<()> {
     if !matches!(zones, 1 | 3 | 5) {
         bail!("1, 3, or 5 comma-separated endpoints and buckets are required");
     }
+    Ok(())
+}
+
+async fn connect(args: &Args) -> Result<ConnectedStorage> {
+    let zones = args.endpoints.len();
     let auth = if args.anonymous {
         None
-    } else if let Some(token) = args.bearer_token {
-        Some(BearerAuth::static_token(token))
+    } else if let Some(token) = &args.bearer_token {
+        Some(BearerAuth::static_token(token.clone()))
     } else {
         Some(
             BearerAuth::google_adc(RefreshingAuthConfig::default())
@@ -115,14 +192,18 @@ async fn main() -> Result<()> {
         }
     }
     .context("connect regional manifest bucket")?;
-    let volume = SegmentedVolume::new(
+    Ok(ConnectedStorage {
         factories,
         manifest_factory,
-        &args.prefix,
-        ClientConfig::default(),
-    )?;
+    })
+}
+
+async fn run(args: Args) -> Result<()> {
+    let storage = connect(&args).await?;
+    let prefix = args.prefix;
     match args.command {
         Command::Append { data, file } => {
+            let volume = storage.volume(&prefix)?;
             let mut recovery = volume.recover_from_committed_floor().await?;
             let next_seqno = recovery.end;
             while recovery.try_next().await?.is_some() {}
@@ -144,6 +225,7 @@ async fn main() -> Result<()> {
             wal.shutdown().await?;
         }
         Command::RepairSealed => {
+            let volume = storage.volume(&prefix)?;
             let report = volume.repair_sealed_segments().await?;
             println!(
                 "{}",
@@ -156,6 +238,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::TruncateBefore { record_index } => {
+            let volume = storage.volume(&prefix)?;
             let mut recovery = volume.recover_from_committed_floor().await?;
             while recovery.try_next().await?.is_some() {}
             let wal = recovery.start(WalEngineConfig::default()).await?;
@@ -166,6 +249,12 @@ async fn main() -> Result<()> {
             );
             wal.shutdown().await?;
         }
+        Command::Benchmark {
+            command: BenchmarkCommand::Append(benchmark_args),
+        } => benchmark::append::run(storage, prefix, benchmark_args).await?,
+        Command::Benchmark {
+            command: BenchmarkCommand::Recovery(benchmark_args),
+        } => benchmark::recovery::run(storage, prefix, benchmark_args).await?,
     }
     Ok(())
 }

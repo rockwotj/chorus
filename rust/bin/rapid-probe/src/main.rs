@@ -15,7 +15,7 @@
 //! that load-bearing behavior and the surrounding provider characteristics
 //! empirically against a real Rapid zonal bucket.
 //!
-//! Probes (each runs on its own fresh object and cleans up):
+//! Probes (each uses unique scratch object names and attempts cleanup):
 //!   T1  precondition enforced on a fresh open (no write_handle):
 //!         wrong if_metageneration_match -> FAILED_PRECONDITION; correct -> OK.
 //!   T2  a metadata CAS bumps metageneration and fences subsequent guarded opens:
@@ -23,19 +23,19 @@
 //!   T3  TAKEOVER: a second fresh open revokes a held-open prior stream:
 //!         after S2 opens+appends, S1's continued append must FAIL.   (D1 valid)
 //!   T4  a metadata CAS does NOT fence an already-open stream.
-//!   T5  finalization rejects every later append open.
+//!   T5  finalization rejects a subsequent append open.
 //!   T6  newly created segment-like objects are immediately visible to listing.
-//!   T7  reads hide open appendable bytes and size.
-//!   T8  repeated flushed appends succeed on one held session.
-//!   T9  one final flush durably covers a pipelined group.
-//!   T10 measures the live write-message size ceiling.
+//!   T7  reports open-object read/size visibility and verifies the finalized read.
+//!   T8  reports whether repeated flushed appends encounter throttling.
+//!   T9  measures flush latency and one-final-flush group durability.
+//!   T10 reports outcomes for a fixed matrix of write-message sizes.
 //!   T11 metadata CAS preserves an already-open stream under repeated writes.
 //!   T12 an appendable create stream accepts continuations and finalization.
 //!   TODO(T13): verify that finalize and immediate GetObject responses for a
 //!     finalized Rapid APPENDABLE object populate Object.checksums.crc32c.
 //!
-//! Every probe prints the raw observed gRPC status code(s) so the ground truth
-//! is visible even if a stated expectation turns out wrong.
+//! Expected rejections and failures print the raw observed gRPC status code and
+//! message; successful characterization results print their sizes or timings.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -64,8 +64,8 @@ const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "verify-takeover",
-    about = "Verify GCS Rapid append-stream fencing/takeover semantics (see the whitepaper, Object operations)"
+    name = "rapid-probe",
+    about = "Probe live GCS Rapid append, fencing, visibility, and finalization behavior"
 )]
 struct Args {
     /// gRPC endpoint. For a zonal Rapid bucket use its regional/zonal endpoint.
@@ -78,7 +78,7 @@ struct Args {
     bucket: String,
 
     /// Object-name prefix. A unique run id and probe tag are appended.
-    #[arg(long, default_value = "verify-takeover")]
+    #[arg(long, default_value = "rapid-probe")]
     object_prefix: String,
 
     /// Static OAuth bearer token. If omitted, Application Default Credentials.
@@ -235,10 +235,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("GENERATION-ZERO TAKEOVER PROBE FAILED");
     }
 
-    println!(
-        "verify-takeover against {} bucket={}",
-        args.endpoint, bucket
-    );
+    println!("rapid-probe against {} bucket={}", args.endpoint, bucket);
     println!("run id: {run_id}\n");
 
     let mut all_pass = true;
@@ -755,7 +752,7 @@ async fn create_appendable(ctx: &Ctx, object: &str) -> Result<()> {
 /// server-side flushes serialized?), and (c) the same burst with ONE flush on
 /// the last message (group commit), which is the production client's send
 /// pattern.
-/// T10: how large may a single write message (one ChecksummedData chunk) be?
+/// T10: which fixed single-message sizes does the service accept?
 /// The current storage.proto documents MaxReadChunkBytes = 2 MiB but no
 /// write-side constant. Sends one flushed message per size and reports what
 /// the service accepts.

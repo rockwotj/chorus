@@ -1,8 +1,8 @@
 # DST trace fixtures
 
-Each fixture is newline-delimited JSON with the same `TraceEvent` envelope the
-production DST writes. Structural fixtures must use contiguous `seq` values and
-event names from `p/TRACE_EVENTS.txt`; semantic fixtures may still describe a
+Each fixture is newline-delimited JSON with the same `TraceEvent` envelope
+emitted by `chorus-dst`. Structurally valid fixtures use contiguous `seq`
+values and event names from `p/TRACE_EVENTS.txt`; they may still describe a
 protocol execution that a generated PObserve monitor must reject.
 
 `pobserve-rejects-open-tail.jsonl` is deliberately bad for

@@ -3,7 +3,7 @@
 //! Each iteration populates a fresh prefix with `--populate-records` records,
 //! using a segment size tuned to produce roughly `--target-sealed-segments`
 //! sealed segments, then cleanly shuts the writer down (leaving an unsealed
-//! active tail). It then runs one cold `recover()` and times the recovery
+//! active tail). It then runs one measured `recover()` and times the recovery
 //! phases: epoch claim, prepare (directory adoption + committed-seal
 //! enforcement + appendable-candidate takeover), replay, and start. Replay size
 //! is controlled by `--replay-records` (the recovery checkpoint is set to
@@ -13,140 +13,24 @@
 //! by varying `--target-sealed-segments`. Output is JSON with per-phase latency
 //! percentiles across iterations.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chorus_client::{
-    BearerAuth, ClientConfig, CounterFn, GaugeFn, GrpcReplicaFactory, HistogramFn, MetricsRecorder,
-    RefreshingAuthConfig, SegmentedVolume, UpDownCounterFn, WalEngineConfig, WalHandle, WalSeqNo,
+    ClientConfig, MetricsRecorder, SegmentedVolume, WalEngineConfig, WalHandle, WalSeqNo,
 };
-use clap::Parser;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hdrhistogram::Histogram;
 use tokio::time::Instant;
-use tracing_subscriber::EnvFilter;
 
-#[derive(Default)]
-struct BenchMetrics {
-    counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    gauges: Mutex<HashMap<String, Arc<AtomicI64>>>,
-}
+use super::BenchMetrics;
+use crate::ConnectedStorage;
 
-impl BenchMetrics {
-    fn counter(&self, name: &str) -> u64 {
-        self.counters
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-}
-
-struct BenchCounter(Arc<AtomicU64>);
-
-impl CounterFn for BenchCounter {
-    fn increment(&self, value: u64) {
-        self.0.fetch_add(value, Ordering::Relaxed);
-    }
-}
-
-struct BenchGauge(Arc<AtomicI64>);
-
-impl GaugeFn for BenchGauge {
-    fn set(&self, value: i64) {
-        self.0.store(value, Ordering::Relaxed);
-    }
-}
-
-struct NoopMetric;
-
-impl UpDownCounterFn for NoopMetric {
-    fn increment(&self, _value: i64) {}
-}
-
-impl HistogramFn for NoopMetric {
-    fn record(&self, _value: f64) {}
-}
-
-impl MetricsRecorder for BenchMetrics {
-    fn register_counter(
-        &self,
-        name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn CounterFn> {
-        let metric = self
-            .counters
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_default()
-            .clone();
-        Arc::new(BenchCounter(metric))
-    }
-
-    fn register_gauge(
-        &self,
-        name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn GaugeFn> {
-        let metric = self
-            .gauges
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_default()
-            .clone();
-        Arc::new(BenchGauge(metric))
-    }
-
-    fn register_up_down_counter(
-        &self,
-        _name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-    ) -> Arc<dyn UpDownCounterFn> {
-        Arc::new(NoopMetric)
-    }
-
-    fn register_histogram(
-        &self,
-        _name: &str,
-        _description: &str,
-        _labels: &[(&str, &str)],
-        _boundaries: &[f64],
-    ) -> Arc<dyn HistogramFn> {
-        Arc::new(NoopMetric)
-    }
-}
-
-#[derive(Parser, Debug)]
-#[command(about = "Recovery-time benchmark for the zonal GCS quorum WAL")]
-struct Args {
-    #[arg(long, value_delimiter = ',', num_args = 1..=5)]
-    endpoints: Vec<String>,
-    #[arg(long, value_delimiter = ',', num_args = 1..=5)]
-    buckets: Vec<String>,
-    /// Endpoint of the regional bucket hosting the manifest register.
-    #[arg(long)]
-    manifest_endpoint: String,
-    /// Full v2 resource name of the regional manifest bucket.
-    #[arg(long)]
-    manifest_bucket: String,
-    /// Base object prefix; each iteration appends a unique sub-prefix.
-    #[arg(long)]
-    prefix: String,
-    #[arg(long, env = "GCS_BEARER_TOKEN")]
-    bearer_token: Option<String>,
-    #[arg(long, conflicts_with = "bearer_token")]
-    anonymous: bool,
+#[derive(clap::Args, Debug)]
+pub(crate) struct RecoveryArgs {
     /// Records written into each iteration's log before recovery.
     #[arg(long, default_value_t = 50_000)]
     populate_records: u64,
@@ -159,7 +43,7 @@ struct Args {
     /// above `populate_records` replays the whole log.
     #[arg(long)]
     replay_records: Option<u64>,
-    /// Independent cold recoveries measured, each on its own fresh prefix.
+    /// Independent recovery passes measured, each on its own subprefix.
     #[arg(long, default_value_t = 5)]
     iterations: u64,
     #[arg(long, default_value_t = 4096)]
@@ -171,25 +55,25 @@ struct Args {
     worker_threads: usize,
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-    let args = Args::parse();
-    if args.buckets.len() != args.endpoints.len() {
-        bail!("--endpoints and --buckets must list the same number of zones");
+impl RecoveryArgs {
+    pub(crate) fn worker_threads(&self) -> usize {
+        self.worker_threads
     }
-    if !matches!(args.endpoints.len(), 1 | 3 | 5) {
-        bail!("1, 3, or 5 endpoints and buckets are required");
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.populate_records == 0
+            || self.iterations == 0
+            || self.payload_bytes == 0
+            || self.populate_window == 0
+            || self.worker_threads == 0
+        {
+            bail!(
+                "--populate-records, --iterations, --payload-bytes, --populate-window, and \
+                 --worker-threads must be positive"
+            );
+        }
+        Ok(())
     }
-    if args.populate_records == 0 || args.iterations == 0 || args.payload_bytes == 0 {
-        bail!("--populate-records, --iterations, and --payload-bytes must be positive");
-    }
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.worker_threads)
-        .enable_all()
-        .build()?
-        .block_on(run(args))
 }
 
 /// Append `count` records starting at `start_seqno` through a pipeline window.
@@ -267,66 +151,11 @@ fn summarize(histogram: &Histogram<u64>) -> serde_json::Value {
     })
 }
 
-async fn run(args: Args) -> Result<()> {
-    let auth = if args.anonymous {
-        None
-    } else if let Some(token) = &args.bearer_token {
-        Some(BearerAuth::static_token(token.clone()))
-    } else {
-        Some(
-            BearerAuth::google_adc(RefreshingAuthConfig::default())
-                .await
-                .context("load Google Application Default Credentials")?,
-        )
-    };
-    let zones = args.endpoints.len();
-    let mut factories = Vec::with_capacity(zones);
-    for zone in 0..zones {
-        let factory = match &auth {
-            Some(auth) => {
-                GrpcReplicaFactory::connect_with_auth(
-                    zone,
-                    &args.endpoints[zone],
-                    args.buckets[zone].clone(),
-                    auth.clone(),
-                )
-                .await
-            }
-            None => {
-                GrpcReplicaFactory::connect(
-                    zone,
-                    &args.endpoints[zone],
-                    args.buckets[zone].clone(),
-                    None,
-                )
-                .await
-            }
-        }
-        .with_context(|| format!("connect zone {zone}"))?;
-        factories.push(factory);
-    }
-    let manifest_factory = match &auth {
-        Some(auth) => {
-            GrpcReplicaFactory::connect_with_auth(
-                zones,
-                &args.manifest_endpoint,
-                args.manifest_bucket.clone(),
-                auth.clone(),
-            )
-            .await
-        }
-        None => {
-            GrpcReplicaFactory::connect(
-                zones,
-                &args.manifest_endpoint,
-                args.manifest_bucket.clone(),
-                None,
-            )
-            .await
-        }
-    }
-    .context("connect regional manifest bucket")?;
-
+pub(crate) async fn run(
+    storage: ConnectedStorage,
+    prefix: String,
+    args: RecoveryArgs,
+) -> Result<()> {
     let payload = Bytes::from(vec![0x5a; args.payload_bytes]);
     let encoded_record = args.payload_bytes + 4;
     let max_segment_bytes = if args.target_sealed_segments == 0 {
@@ -352,10 +181,10 @@ async fn run(args: Args) -> Result<()> {
     let mut segments_sealed: Vec<u64> = Vec::new();
 
     for iteration in 0..args.iterations {
-        let prefix = format!("{}/i{iteration:03}", args.prefix);
+        let prefix = format!("{prefix}/i{iteration:03}");
         let volume = SegmentedVolume::new_with_metrics_recorder(
-            factories.clone(),
-            manifest_factory.clone(),
+            storage.factories.clone(),
+            storage.manifest_factory.clone(),
             &prefix,
             ClientConfig::default(),
             metrics_recorder.clone(),
@@ -381,7 +210,7 @@ async fn run(args: Args) -> Result<()> {
             .await
             .context("shutdown populated writer")?;
 
-        // --- measure one cold recovery -------------------------------------
+        // --- measure one recovery pass -------------------------------------
         let cas_before = metrics.counter("chorus.wal.manifest.cas_attempts");
         let sealed_before = metrics.counter("chorus.wal.seal.segments");
 
@@ -389,7 +218,7 @@ async fn run(args: Args) -> Result<()> {
         let mut recovery = volume
             .recover(WalSeqNo::record(checkpoint))
             .await
-            .context("cold recovery")?;
+            .context("measured recovery")?;
         // Epoch-claim and prepare durations are captured inside the client and
         // exposed on the recovery object; read them before `start()` moves it.
         let epoch_claim = recovery.timings.epoch_claim;

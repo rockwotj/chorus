@@ -42,7 +42,7 @@ jobs:
           --trace ../artifacts/dst-trace.jsonl
       - name: Trace structure gate
         run: >-
-          cargo run --release -p chorus-trace-checker --
+          cargo run --release -p chorus-dst --bin chorus-trace-checker --
           ../artifacts/dst-trace.jsonl --event-manifest ../p/TRACE_EVENTS.txt
       - uses: actions/upload-artifact@v7
         with:

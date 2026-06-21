@@ -7,6 +7,7 @@ use chorus_dst::{validate_trace_structure, TraceEvent, TRACE_EVENTS};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
+#[command(about = "Validate the structure and event manifest of a chorus-dst JSONL trace")]
 struct Args {
     trace: PathBuf,
     #[arg(long, default_value = "../p/TRACE_EVENTS.txt")]

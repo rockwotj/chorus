@@ -229,6 +229,8 @@ def chorus_command(
         config.regional_bucket,
         "--prefix",
         f"{config.prefix_base}/chorus-{name}",
+        "benchmark",
+        "append",
         "--duration-seconds",
         str(config.duration),
         "--payload-bytes",
@@ -278,6 +280,8 @@ def recovery_command(
         config.regional_bucket,
         "--prefix",
         f"{config.prefix_base}/recovery-{name}",
+        "benchmark",
+        "recovery",
         "--payload-bytes",
         str(config.payload),
         "--worker-threads",
@@ -319,17 +323,14 @@ def run_suite(config: SuiteConfig) -> None:
             "build",
             "--release",
             "-p",
-            "gcs-quorum-bench",
+            "chorus-cli",
             "-p",
             "disk-wal-bench",
-            "-p",
-            "recovery-bench",
         ),
         cwd=RUST_DIR,
     )
-    gqb = RUST_DIR / "target/release/gcs-quorum-bench"
+    chorus = RUST_DIR / "target/release/chorus"
     dwb = RUST_DIR / "target/release/disk-wal-bench"
-    rcb = RUST_DIR / "target/release/recovery-bench"
 
     chorus_runs = (
         ("qd1", ("--outstanding-appends", "1", "--arrival-rate", "0")),
@@ -348,7 +349,7 @@ def run_suite(config: SuiteConfig) -> None:
     for name, extra in chorus_runs:
         print(f"==> chorus {name}", flush=True)
         run(
-            chorus_command(config, gqb, name, extra),
+            chorus_command(config, chorus, name, extra),
             cwd=REPO_ROOT,
             stdout=config.outdir / f"chorus-{name}.json",
         )
@@ -391,7 +392,7 @@ def run_suite(config: SuiteConfig) -> None:
         run(
             recovery_command(
                 config,
-                rcb,
+                chorus,
                 name,
                 (
                     "--populate-records",
@@ -414,7 +415,7 @@ def run_suite(config: SuiteConfig) -> None:
         run(
             recovery_command(
                 config,
-                rcb,
+                chorus,
                 name,
                 (
                     "--populate-records",

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live verification of GCS Rapid append-stream takeover fencing (whitepaper, "Object operations").
+# Live characterization of the GCS Rapid behavior required by Chorus.
 #
 # WARNING: writes and deletes real objects in $BUCKET and incurs billing.
 # Point it at a scratch Rapid zonal bucket you own.
@@ -24,4 +24,4 @@ args=(--endpoint "$ENDPOINT" --bucket "$BUCKET")
 [[ -n "${KEEP:-}" ]] && args+=(--keep)
 
 cd "$SCRIPT_DIR/../.."
-exec cargo run --release -p verify-takeover -- "${args[@]}"
+exec cargo run --release -p rapid-probe -- "${args[@]}"

@@ -2,10 +2,15 @@
 name = "chorus-dst"
 version = "0.1.0"
 publish = false
+default-run = "chorus-dst"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[[bin]]
+name = "chorus-trace-checker"
+path = "src/bin/trace_checker.rs"
 
 [dependencies]
 anyhow.workspace = true

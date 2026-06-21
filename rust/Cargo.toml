@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["client", "fake-gcs", "dst", "trace-checker", "bin/gcs-quorum-bench", "bin/disk-wal-bench", "bin/recovery-bench", "bin/chorus-cli", "bin/verify-takeover"]
+members = ["client", "fake-gcs", "dst", "bin/disk-wal-bench", "bin/chorus-cli", "bin/rapid-probe"]
 
 [workspace.package]
 authors = ["Tyler Rockwood <rockwotj@gmail.com>"]

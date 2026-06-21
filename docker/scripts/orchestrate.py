@@ -386,6 +386,8 @@ def verify(*, quick: bool) -> int:
             "run",
             "--release",
             "-p",
+            "chorus-dst",
+            "--bin",
             "chorus-trace-checker",
             "--",
             smoke_trace,
