@@ -58,30 +58,11 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: task release-check
 
-      - name: Detect bootstrap credentials
-        id: bootstrap
-        env:
-          TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: |
-          if [[ -n "$TOKEN" ]]; then
-            echo 'configured=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'configured=false' >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Authenticate with crates.io
         id: auth
-        if: steps.bootstrap.outputs.configured != 'true'
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish package with bootstrap token
-        if: steps.bootstrap.outputs.configured == 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p chorus-client --locked
-
-      - name: Publish package with trusted publishing
-        if: steps.bootstrap.outputs.configured != 'true'
+      - name: Publish package
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish -p chorus-client --locked
