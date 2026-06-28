@@ -29,8 +29,8 @@ use chorus_fake_gcs::{FakeGcs, SimSessionOpen};
 use tonic::{Code, Request, Status};
 
 use chorus_client::{
-    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaSnapshot,
-    TransportCode, TransportError,
+    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaRangeRead,
+    ReplicaSnapshot, TransportCode, TransportError,
 };
 
 fn map_code(status: &Status) -> TransportCode {
@@ -327,6 +327,19 @@ impl Replica for InMemoryReplica {
             .await
             .map_err(|status| status_err(self.zone, &status))?;
         Ok(snapshot_from_object(self.zone, object, bytes))
+    }
+
+    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
+        let (generation, bytes) = self
+            .fake
+            .sim_bidi_read_bytes(&self.bucket, &self.object, offset)
+            .await
+            .map_err(|status| status_err(self.zone, &status))?;
+        Ok(ReplicaRangeRead {
+            zone: self.zone,
+            generation,
+            bytes,
+        })
     }
 
     async fn create_appendable(

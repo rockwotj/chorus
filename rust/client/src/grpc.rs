@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     bidi_write_object_request, bidi_write_object_response, storage_client::StorageClient,
-    write_object_request, write_object_response, AppendObjectSpec, BidiWriteHandle,
+    write_object_request, write_object_response, AppendObjectSpec, BidiReadObjectRedirectedError,
+    BidiReadObjectRequest, BidiReadObjectResponse, BidiReadObjectSpec, BidiWriteHandle,
     BidiWriteObjectRedirectedError, BidiWriteObjectRequest, BidiWriteObjectResponse,
     ChecksummedData, DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, Object,
-    ReadObjectRequest, UpdateObjectRequest, WriteObjectRequest, WriteObjectSpec,
+    ReadObjectRequest, ReadRange, UpdateObjectRequest, WriteObjectRequest, WriteObjectSpec,
 };
 use prost::Message as _;
 use tokio::sync::{mpsc, watch, Mutex as SessionMutex};
@@ -22,12 +23,12 @@ use crate::auth::BearerAuth;
 use crate::error::Error;
 use crate::transport::{
     AppendToken, LaneDurableChange, ListedObject, PackedAppend, PackedAppendMessage, Replica,
-    ReplicaFactory, ReplicaSnapshot, TransportCode, TransportError,
+    ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
 };
 
-/// Cached zonal write routing token, learned from a `BidiWriteObjectRedirectedError`
-/// and replayed in `x-goog-request-params` to land on the bucket's location.
-/// Shared across every replica produced by one factory.
+/// Cached zonal routing token, learned from a bidirectional read or write
+/// redirect and replayed in `x-goog-request-params` to land on the bucket's
+/// location. Shared across every replica produced by one factory.
 type RoutingToken = Arc<ArcSwap<Option<Arc<String>>>>;
 
 #[derive(Clone)]
@@ -38,6 +39,8 @@ struct GrpcReplica {
     auth: Option<BearerAuth>,
     client: StorageClient<Channel>,
     routing_token: RoutingToken,
+    /// Persistent bidirectional read stream reused for successive tail ranges.
+    read_session: Arc<SessionMutex<Option<BidiReadSession>>>,
     /// The lane's persistent append session. The live service rate limits
     /// per-object *mutations*, and every fresh append open is one — so a
     /// lane opens its session once (at takeover) and streams every window
@@ -78,6 +81,13 @@ struct RedirectAwareStream {
     responses: Streaming<BidiWriteObjectResponse>,
     first: BidiWriteObjectResponse,
     attempt: u32,
+}
+
+struct BidiReadSession {
+    tx: mpsc::Sender<BidiReadObjectRequest>,
+    responses: Streaming<BidiReadObjectResponse>,
+    generation: i64,
+    next_read_id: i64,
 }
 
 struct SessionWait {
@@ -390,11 +400,9 @@ impl GrpcReplica {
         snapshot
     }
 
-    /// If `status` is a zonal write redirect, cache its routing token for replay
-    /// and report `true` so the caller retries the same guarded open. The
-    /// redirect fields are intentionally ignored: conditional creates replay
-    /// their create precondition, takeovers replay their metageneration guard,
-    /// and resumes replay their existing handle.
+    /// If `status` is a zonal bidirectional redirect, cache its routing token
+    /// for replay and report `true`. Write opens replay their original
+    /// preconditions or handles; reads replay their object spec and range.
     fn try_capture_redirect(&self, status: &Status) -> bool {
         match redirect_routing_token(status) {
             Some(token) => {
@@ -402,6 +410,54 @@ impl GrpcReplica {
                 true
             }
             None => false,
+        }
+    }
+
+    async fn collect_bidi_range(
+        &self,
+        session: &mut BidiReadSession,
+        read_id: i64,
+    ) -> Result<ReplicaRangeRead, Status> {
+        let mut bytes = Vec::new();
+        loop {
+            let response = tokio::time::timeout(RPC_TIMEOUT, session.responses.message())
+                .await
+                .map_err(|_| Status::deadline_exceeded("BidiReadObject range timed out"))??;
+            let Some(response) = response else {
+                return Err(Status::unavailable(
+                    "BidiReadObject ended before completing its range",
+                ));
+            };
+            if let Some(metadata) = response.metadata {
+                session.generation = metadata.generation;
+            }
+            for range in response.object_data_ranges {
+                if range
+                    .read_range
+                    .as_ref()
+                    .is_some_and(|range| range.read_id != read_id)
+                {
+                    return Err(Status::data_loss(
+                        "BidiReadObject returned an unexpected read id",
+                    ));
+                }
+                if let Some(data) = range.checksummed_data {
+                    if data
+                        .crc32c
+                        .is_some_and(|expected| expected != crc32c::crc32c(&data.content))
+                    {
+                        return Err(Status::data_loss("BidiReadObject response CRC32C mismatch"));
+                    }
+                    bytes.extend_from_slice(&data.content);
+                }
+                if range.range_end {
+                    return Ok(ReplicaRangeRead {
+                        zone: self.zone,
+                        generation: session.generation,
+                        bytes,
+                    });
+                }
+            }
         }
     }
 
@@ -884,6 +940,7 @@ impl GrpcReplicaFactory {
             auth: self.auth.clone(),
             client: self.client.clone(),
             routing_token: self.routing_token.clone(),
+            read_session: Arc::new(SessionMutex::new(None)),
             session: Arc::new(SessionSlot::new()),
         }
     }
@@ -1103,6 +1160,7 @@ impl ReplicaFactory for GrpcReplicaFactory {
             auth: self.auth.clone(),
             client: self.client.clone(),
             routing_token: self.routing_token.clone(),
+            read_session: Arc::new(SessionMutex::new(None)),
             session: Arc::new(SessionSlot::new()),
         })
     }
@@ -1115,6 +1173,7 @@ impl ReplicaFactory for GrpcReplicaFactory {
             auth: self.auth.clone(),
             client: self.client.clone(),
             routing_token: self.routing_token.clone(),
+            read_session: Arc::new(SessionMutex::new(None)),
             session: Arc::new(SessionSlot::new()),
         };
         let mut page_token = String::new();
@@ -1230,6 +1289,120 @@ impl Replica for GrpcReplica {
             }
         }
         Ok(self.snapshot_from_object(object, bytes))
+    }
+
+    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
+        if offset < 0 {
+            return Err(self.error(
+                TransportCode::InvalidArgument,
+                "bidirectional read offset must be nonnegative",
+            ));
+        }
+        for attempt in 0..=MAX_WRITE_REDIRECTS {
+            let mut slot = self.read_session.lock().await;
+            let read_id = match slot.as_mut() {
+                Some(session) => {
+                    let read_id = session.next_read_id;
+                    session.next_read_id = session.next_read_id.checked_add(1).unwrap_or(1);
+                    let request = BidiReadObjectRequest {
+                        read_object_spec: None,
+                        read_ranges: vec![ReadRange {
+                            read_offset: offset,
+                            read_length: 0,
+                            read_id,
+                        }],
+                    };
+                    match tokio::time::timeout(RPC_TIMEOUT, session.tx.send(request)).await {
+                        Ok(Ok(())) => read_id,
+                        Ok(Err(_)) | Err(_) => {
+                            *slot = None;
+                            drop(slot);
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    let read_id = 1;
+                    let routing_token = self
+                        .routing_token
+                        .load_full()
+                        .as_ref()
+                        .as_ref()
+                        .map(|token| token.as_ref().clone());
+                    let first = BidiReadObjectRequest {
+                        read_object_spec: Some(BidiReadObjectSpec {
+                            bucket: self.bucket.clone(),
+                            object: self.object.clone(),
+                            routing_token,
+                            ..Default::default()
+                        }),
+                        read_ranges: vec![ReadRange {
+                            read_offset: offset,
+                            read_length: 0,
+                            read_id,
+                        }],
+                    };
+                    let (tx, rx) = mpsc::channel(64);
+                    tx.send(first).await.map_err(|_| {
+                        self.error(
+                            TransportCode::Internal,
+                            "BidiReadObject request channel closed before open",
+                        )
+                    })?;
+                    let request = self.request_no_deadline(ReceiverStream::new(rx))?;
+                    let opened = tokio::time::timeout(
+                        RPC_TIMEOUT,
+                        self.client.clone().bidi_read_object(request),
+                    )
+                    .await;
+                    let responses = match opened {
+                        Ok(Ok(response)) => response.into_inner(),
+                        Ok(Err(status)) => {
+                            drop(slot);
+                            if attempt < MAX_WRITE_REDIRECTS && self.try_capture_redirect(&status) {
+                                continue;
+                            }
+                            return Err(self.status(status));
+                        }
+                        Err(_) => {
+                            return Err(self.error(
+                                TransportCode::DeadlineExceeded,
+                                "BidiReadObject stream open timed out",
+                            ));
+                        }
+                    };
+                    *slot = Some(BidiReadSession {
+                        tx,
+                        responses,
+                        generation: 0,
+                        next_read_id: 2,
+                    });
+                    read_id
+                }
+            };
+            let result = self
+                .collect_bidi_range(
+                    slot.as_mut()
+                        .expect("bidirectional read session was initialized"),
+                    read_id,
+                )
+                .await;
+            match result {
+                Ok(read) => return Ok(read),
+                Err(status) => {
+                    *slot = None;
+                    drop(slot);
+                    if attempt < MAX_WRITE_REDIRECTS && self.try_capture_redirect(&status) {
+                        continue;
+                    }
+                    return Err(self.status(status));
+                }
+            }
+        }
+        Err(self.error(
+            TransportCode::Aborted,
+            "BidiReadObject exhausted zonal redirects",
+        ))
     }
 
     async fn create_appendable(
@@ -1799,10 +1972,10 @@ struct RichStatus {
     details: ::prost::alloc::vec::Vec<::prost_types::Any>,
 }
 
-/// Extract the routing token from a `BidiWriteObjectRedirectedError` attached to
-/// an ABORTED status, if present. The feature-gated `probe_support` module
-/// exports this for repository probes that must replay redirects exactly like
-/// the production transport.
+/// Extract the routing token from a zonal bidirectional read or write redirect
+/// attached to an ABORTED status, if present. The feature-gated `probe_support`
+/// module exports this for repository probes that must replay redirects exactly
+/// like the production transport.
 ///
 /// Normal users do not need this helper; the production transport consumes and
 /// caches redirects automatically.
@@ -1818,6 +1991,15 @@ pub fn redirect_routing_token(status: &Status) -> Option<String> {
             .ends_with("google.storage.v2.BidiWriteObjectRedirectedError")
         {
             if let Ok(redirect) = BidiWriteObjectRedirectedError::decode(any.value.as_slice()) {
+                if let Some(token) = redirect.routing_token {
+                    return Some(token);
+                }
+            }
+        } else if any
+            .type_url
+            .ends_with("google.storage.v2.BidiReadObjectRedirectedError")
+        {
+            if let Ok(redirect) = BidiReadObjectRedirectedError::decode(any.value.as_slice()) {
                 if let Some(token) = redirect.routing_token {
                     return Some(token);
                 }

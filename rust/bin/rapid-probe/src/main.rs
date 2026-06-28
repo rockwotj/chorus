@@ -25,7 +25,8 @@
 //!   T4  a metadata CAS does NOT fence an already-open stream.
 //!   T5  finalization rejects a subsequent append open.
 //!   T6  newly created segment-like objects are immediately visible to listing.
-//!   T7  reports open-object read/size visibility and verifies the finalized read.
+//!   T7  verifies BidiReadObject visibility of flushed open-object bytes,
+//!         reports unary read/size visibility, and verifies the finalized read.
 //!   T8  reports whether repeated flushed appends encounter throttling.
 //!   T9  measures flush latency and one-final-flush group durability.
 //!   T10 reports outcomes for a fixed matrix of write-message sizes.
@@ -50,9 +51,9 @@ use googleapis_tonic_google_storage_v2::google::storage::v2::{
     bidi_write_object_request::{Data, FirstMessage},
     bidi_write_object_response::WriteStatus,
     storage_client::StorageClient,
-    AppendObjectSpec, BidiWriteObjectRequest, BidiWriteObjectResponse, ChecksummedData,
-    DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, Object, ReadObjectRequest,
-    UpdateObjectRequest, WriteObjectSpec,
+    AppendObjectSpec, BidiReadObjectRequest, BidiReadObjectSpec, BidiWriteObjectRequest,
+    BidiWriteObjectResponse, ChecksummedData, DeleteObjectRequest, GetObjectRequest,
+    ListObjectsRequest, Object, ReadObjectRequest, ReadRange, UpdateObjectRequest, WriteObjectSpec,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -295,8 +296,8 @@ struct Ctx {
     client: StorageClient<Channel>,
     auth: MetadataValue<Ascii>,
     bucket: String,
-    /// Zonal write routing token, learned from the first BidiWriteObjectRedirectedError
-    /// and replayed on every later RPC. Reuses the production client's extractor.
+    /// Zonal routing token learned from a bidirectional read or write redirect
+    /// and replayed on later RPCs. Reuses the production client's extractor.
     routing_token: Mutex<Option<String>>,
     keep: bool,
 }
@@ -326,8 +327,8 @@ impl Ctx {
         request
     }
 
-    /// If `status` is a zonal write redirect, cache its routing token (via the
-    /// production client's extractor) and report `true` so the caller retries.
+    /// If `status` is a zonal bidirectional redirect, cache its routing token
+    /// and report `true` so the caller retries.
     fn capture_redirect(&self, status: &Status) -> bool {
         match chorus_client::probe_support::redirect_routing_token(status) {
             Some(token) => {
@@ -1190,6 +1191,7 @@ async fn probe_t7(ctx: &Ctx, run_id: u128) -> Result<ProbeResult> {
     .await
     .map_err(|status| anyhow::anyhow!("append: {}", code_of(&status)))?;
     let open_read = read_all(ctx, &object, generation).await;
+    let open_bidi_read = bidi_read_all(ctx, &object, generation).await;
     let (_, _, open_stat_size) = stat(ctx, &object).await?;
     finalize_once(ctx, &object, generation, metageneration, tail)
         .await
@@ -1200,17 +1202,90 @@ async fn probe_t7(ctx: &Ctx, run_id: u128) -> Result<ProbeResult> {
         Ok(bytes) => format!("{bytes} bytes"),
         Err(status) => format!("error {}", code_of(status)),
     };
+    let open_bidi_desc = match &open_bidi_read {
+        Ok(bytes) => format!("{bytes} bytes"),
+        Err(status) => format!("error {}", code_of(status)),
+    };
     let final_desc = match &final_read {
         Ok(bytes) => format!("{bytes} bytes"),
         Err(status) => format!("error {}", code_of(status)),
     };
     let detail = format!(
-        "persisted {tail}B flushed; OPEN object: ReadObject -> {open_desc}, GetObject.size -> {open_stat_size}; FINALIZED: ReadObject -> {final_desc}"
+        "persisted {tail}B flushed; OPEN object: BidiReadObject -> {open_bidi_desc}, \
+         ReadObject -> {open_desc}, GetObject.size -> {open_stat_size}; \
+         FINALIZED: ReadObject -> {final_desc}"
     );
-    match final_read {
-        Ok(bytes) if bytes as i64 == tail => ok(detail),
+    match (open_bidi_read, final_read) {
+        (Ok(open_bytes), Ok(final_bytes))
+            if open_bytes as i64 == tail && final_bytes as i64 == tail =>
+        {
+            ok(detail)
+        }
         _ => bad(detail),
     }
+}
+
+async fn bidi_read_all(ctx: &Ctx, object: &str, generation: i64) -> Result<usize, Status> {
+    for attempt in 0..=MAX_REDIRECTS {
+        let routing_token = ctx.routing_token.lock().unwrap().clone();
+        let request = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: ctx.bucket.clone(),
+                object: object.to_string(),
+                generation,
+                routing_token,
+                ..Default::default()
+            }),
+            read_ranges: vec![ReadRange {
+                read_offset: 0,
+                read_length: 0,
+                read_id: 1,
+            }],
+        };
+        let open = ctx
+            .client
+            .clone()
+            .bidi_read_object(ctx.request(tokio_stream::iter([request])))
+            .await;
+        let mut stream = match open {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                if attempt < MAX_REDIRECTS && ctx.capture_redirect(&status) {
+                    continue;
+                }
+                return Err(status);
+            }
+        };
+        let mut total = 0usize;
+        loop {
+            match stream.message().await {
+                Ok(Some(response)) => {
+                    for range in response.object_data_ranges {
+                        if let Some(data) = range.checksummed_data {
+                            let actual = crc32c::crc32c(&data.content);
+                            if data.crc32c != Some(actual) {
+                                return Err(Status::data_loss(
+                                    "BidiReadObject response CRC32C mismatch",
+                                ));
+                            }
+                            total += data.content.len();
+                        }
+                        if range.range_end {
+                            return Ok(total);
+                        }
+                    }
+                }
+                Ok(None) => return Ok(total),
+                Err(status) => {
+                    if total == 0 && attempt < MAX_REDIRECTS && ctx.capture_redirect(&status) {
+                        break;
+                    }
+                    return Err(status);
+                }
+            }
+        }
+    }
+    Err(Status::aborted("BidiReadObject exhausted zonal redirects"))
 }
 
 async fn read_all(ctx: &Ctx, object: &str, generation: i64) -> Result<usize, Status> {
