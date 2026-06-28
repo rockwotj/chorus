@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::join_all;
-use futures::stream::BoxStream;
-use futures::{Stream, StreamExt};
+use futures::future::{join_all, BoxFuture};
+use futures::stream::{BoxStream, FuturesUnordered};
+use futures::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -23,7 +23,9 @@ use crate::protocol::{
     ProtocolError, QuorumVolume, RecoveredTail, RecoveryCandidate, Writer,
 };
 use crate::record::RecordFrame;
-use crate::transport::{Replica, ReplicaFactory, ReplicaSnapshot, TransportCode, TransportError};
+use crate::transport::{
+    Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Quorum-derived state of one opaque segment-object id across replicas.
@@ -91,6 +93,89 @@ pub struct SegmentedVolume {
     prefix: String,
     client_config: ClientConfig,
     metrics: Arc<Metrics>,
+}
+
+/// Polling controls for a readonly follower.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadOnlyConfig {
+    /// Delay between active-tail reads while the follower is caught up or
+    /// waiting for a complete frame to become visible on a replica quorum.
+    pub poll_interval: Duration,
+}
+
+impl Default for ReadOnlyConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl ReadOnlyConfig {
+    fn validate(&self) -> Result<(), Error> {
+        if self.poll_interval == Duration::ZERO {
+            return Err(Error::InvalidConfig(
+                "readonly poll_interval must be nonzero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ordered stream of quorum-durable records observed from a live Chorus writer.
+///
+/// A readonly follower never claims a manifest epoch, opens an append stream,
+/// repairs data, truncates history, or otherwise coordinates with the writer.
+/// It polls the linearizable manifest, reads sealed directory entries, and
+/// observes the active appendable segment through bidirectional range reads.
+/// An active record is emitted only after identical complete frame bytes are
+/// visible on a strict majority, making the exposed prefix stable under the
+/// same quorum intersection used by recovery.
+///
+/// The stream remains pending while caught up and automatically observes later
+/// seals. If writer truncation advances beyond the follower's next checkpoint,
+/// it returns [`Error::ReadOnlyLagged`] instead of skipping missing history.
+pub struct ReadOnlyFollower {
+    /// Inclusive checkpoint supplied when the follower was opened.
+    pub from: WalSeqNo,
+    inner: StartupReplayStream,
+}
+
+struct ActiveReadState {
+    id: String,
+    epoch: u64,
+    base_record_index: u64,
+    byte_offset: i64,
+    skip_records: u64,
+    replicas: Vec<Arc<dyn Replica>>,
+    inflight: FuturesUnordered<BoxFuture<'static, ActiveReadResult>>,
+    inflight_offsets: Vec<Option<i64>>,
+}
+
+struct ActiveReadResult {
+    replica_index: usize,
+    byte_offset: i64,
+    read: Result<ReplicaRangeRead, TransportError>,
+}
+
+enum ActiveReadObservation {
+    Pending,
+    Failed,
+    Records(Vec<RecordFrame>),
+}
+
+enum ActiveReadDecision {
+    Pending,
+    Frames(Vec<RecordFrame>),
+    NoReadQuorum,
+}
+
+struct ReadOnlyManifestTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReadOnlyManifestTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Wall-clock cost of the recovery phases that finish before the replay stream
@@ -284,6 +369,14 @@ impl Stream for Recovery {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Stream for ReadOnlyFollower {
+    type Item = Result<WalRecord, crate::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(context)
     }
 }
 
@@ -702,6 +795,158 @@ mod recovery {
             )
             .await
             .map_err(Into::into)
+        }
+
+        async fn open_existing_manifest(&self) -> Result<Option<Manifest>, Error> {
+            Manifest::open_existing(
+                Arc::clone(&self.manifest_store),
+                self.client_config.clone(),
+                Arc::clone(&self.metrics),
+                self.factories.len(),
+                self.bucket_names.clone(),
+            )
+            .await
+            .map_err(Into::into)
+        }
+
+        /// Open a non-coordinating follower at `checkpoint`.
+        ///
+        /// The returned stream remains open after it catches up and polls for
+        /// newly quorum-visible records, including complete frames in the active
+        /// appendable segment.
+        ///
+        /// The application must retain WAL history until every follower has
+        /// durably advanced its own checkpoint. No reader registration is
+        /// performed; if truncation overtakes this checkpoint, the stream
+        /// returns [`crate::Error::ReadOnlyLagged`].
+        pub async fn open_readonly(&self, checkpoint: WalSeqNo) -> Result<ReadOnlyFollower, Error> {
+            self.open_readonly_with_config(checkpoint, ReadOnlyConfig::default())
+                .await
+        }
+
+        /// [`Self::open_readonly`] with explicit polling controls.
+        pub async fn open_readonly_with_config(
+            &self,
+            checkpoint: WalSeqNo,
+            config: ReadOnlyConfig,
+        ) -> Result<ReadOnlyFollower, Error> {
+            config.validate()?;
+            let manifest = self
+                .open_existing_manifest()
+                .await?
+                .ok_or(Error::Uninitialized)?;
+            check_readonly_floor(manifest.record(), checkpoint)?;
+            Ok(ReadOnlyFollower {
+                from: checkpoint,
+                inner: self.follow_readonly(manifest, checkpoint, config.poll_interval),
+            })
+        }
+
+        fn follow_readonly(
+            &self,
+            manifest: Manifest,
+            checkpoint: WalSeqNo,
+            poll_interval: Duration,
+        ) -> StartupReplayStream {
+            let factories = self.factories.clone();
+            let prefix = self.prefix.clone();
+            async_stream::try_stream! {
+                let mut next = checkpoint;
+                let (mut manifest_updates, _manifest_task) =
+                    spawn_readonly_manifest_poller(manifest, poll_interval);
+                let initial_record = { manifest_updates.borrow().clone() };
+                let mut record = initial_record?;
+                let mut active = None;
+                'follow: loop {
+                    check_readonly_floor(&record, next)?;
+                    let sealed_end = WalSeqNo::record(record.tail_base);
+                    let segments = readonly_segments(&record)?;
+                    for segment in segments {
+                        if segment.end_record_index < next.record_index
+                            || segment.base_record_index >= sealed_end.record_index
+                        {
+                            continue;
+                        }
+                        let object = format!("{prefix}/segments/{}", segment.id);
+                        let frames = match read_sealed_segment(&factories, &object, &segment).await {
+                            Ok(frames) => frames,
+                            Err(Error::NoReadQuorum) => {
+                                tokio::time::sleep(poll_interval).await;
+                                let update = { manifest_updates.borrow_and_update().clone() };
+                                record = update?;
+                                continue 'follow;
+                            }
+                            Err(error) => Err(error)?,
+                        };
+                        for wal_record in replay_records(&segment, &frames, next, sealed_end)? {
+                            next = wal_record.next_seqno();
+                            yield wal_record;
+                        }
+                    }
+                    if next.record_index < sealed_end.record_index {
+                        Err(Error::InvalidCatalog(format!(
+                            "readonly checkpoint {} is not covered through published end {}",
+                            next.record_index, sealed_end.record_index
+                        )))?;
+                    }
+
+                    let tail_id = record.tail_id.clone().ok_or_else(|| {
+                        Error::InvalidCatalog("claimed manifest is missing chorus.tail_id".into())
+                    })?;
+                    let reset_active = active.as_ref().is_none_or(|state: &ActiveReadState| {
+                        state.id != tail_id
+                            || state.epoch != record.epoch
+                            || state.base_record_index != record.tail_base
+                    });
+                    if reset_active {
+                        let object = format!("{prefix}/segments/{tail_id}");
+                        let replicas = replicas_for(&factories, &object);
+                        let replica_count = replicas.len();
+                        active = Some(ActiveReadState {
+                            id: tail_id,
+                            epoch: record.epoch,
+                            base_record_index: record.tail_base,
+                            byte_offset: 0,
+                            skip_records: next.record_index.saturating_sub(record.tail_base),
+                            replicas,
+                            inflight: FuturesUnordered::new(),
+                            inflight_offsets: vec![None; replica_count],
+                        });
+                    }
+                    let state = active.as_mut().expect("active state was initialized");
+                    match read_active_quorum(state).await {
+                        Ok(frames) => {
+                            for frame in frames {
+                                state.byte_offset = state
+                                    .byte_offset
+                                    .checked_add(frame.encoded_len()? as i64)
+                                    .ok_or_else(|| {
+                                        Error::InvalidSegmentData(
+                                            "active segment byte offset overflowed".into(),
+                                        )
+                                    })?;
+                                if state.skip_records > 0 {
+                                    state.skip_records -= 1;
+                                    continue;
+                                }
+                                let wal_record = WalRecord {
+                                    seqno: next,
+                                    payload: frame.payload,
+                                };
+                                next = wal_record.next_seqno();
+                                yield wal_record;
+                            }
+                        }
+                        Err(Error::NoReadQuorum) => {}
+                        Err(error) => Err(error)?,
+                    }
+
+                    tokio::time::sleep(poll_interval).await;
+                    let update = { manifest_updates.borrow_and_update().clone() };
+                    record = update?;
+                }
+            }
+            .boxed()
         }
 
         /// Fence and seal the prior writer, then prepare database startup replay.
@@ -2248,6 +2493,130 @@ async fn read_sealed_segment(
     Ok(records)
 }
 
+async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFrame>, Error> {
+    if state.replicas.is_empty() {
+        return Err(Error::InvalidCatalog(
+            "active segment has no configured replicas".into(),
+        ));
+    }
+    let byte_offset = state.byte_offset;
+    let quorum = majority(state.replicas.len());
+    let mut observations = (0..state.replicas.len())
+        .map(|_| ActiveReadObservation::Pending)
+        .collect::<Vec<_>>();
+    ensure_active_reads(state);
+
+    loop {
+        let Some(result) = state.inflight.next().await else {
+            return Err(Error::NoReadQuorum);
+        };
+        if state.inflight_offsets[result.replica_index] == Some(result.byte_offset) {
+            state.inflight_offsets[result.replica_index] = None;
+        }
+        if result.byte_offset != byte_offset {
+            start_active_read(state, result.replica_index);
+            continue;
+        }
+
+        observations[result.replica_index] = match result.read {
+            Ok(read) => {
+                ActiveReadObservation::Records(RecordFrame::decode_complete_prefix(&read.bytes).0)
+            }
+            Err(_) => ActiveReadObservation::Failed,
+        };
+        match active_read_decision(&observations, quorum)? {
+            ActiveReadDecision::Pending => {}
+            ActiveReadDecision::Frames(frames) => return Ok(frames),
+            ActiveReadDecision::NoReadQuorum => return Err(Error::NoReadQuorum),
+        }
+    }
+}
+
+fn ensure_active_reads(state: &mut ActiveReadState) {
+    for replica_index in 0..state.replicas.len() {
+        start_active_read(state, replica_index);
+    }
+}
+
+fn start_active_read(state: &mut ActiveReadState, replica_index: usize) {
+    if state.inflight_offsets[replica_index].is_some() {
+        return;
+    }
+    let byte_offset = state.byte_offset;
+    let replica = Arc::clone(&state.replicas[replica_index]);
+    state.inflight_offsets[replica_index] = Some(byte_offset);
+    let task = tokio::spawn(async move { replica.read_range(byte_offset).await });
+    state.inflight.push(
+        async move {
+            let read = task.await.unwrap_or_else(|error| {
+                Err(TransportError {
+                    zone: replica_index,
+                    code: TransportCode::Internal,
+                    message: format!("readonly active read task failed: {error}"),
+                })
+            });
+            ActiveReadResult {
+                replica_index,
+                byte_offset,
+                read,
+            }
+        }
+        .boxed(),
+    );
+}
+
+fn active_read_decision(
+    observations: &[ActiveReadObservation],
+    quorum: usize,
+) -> Result<ActiveReadDecision, Error> {
+    let successful = observations
+        .iter()
+        .filter(|observation| matches!(observation, ActiveReadObservation::Records(_)))
+        .count();
+    let pending = observations
+        .iter()
+        .filter(|observation| matches!(observation, ActiveReadObservation::Pending))
+        .count();
+    let mut accepted = Vec::new();
+    for record_index in 0usize.. {
+        let mut frame_votes: HashMap<Vec<u8>, (usize, RecordFrame)> = HashMap::new();
+        let mut end_votes = 0;
+        for observation in observations {
+            let ActiveReadObservation::Records(records) = observation else {
+                continue;
+            };
+            let Some(frame) = records.get(record_index) else {
+                end_votes += 1;
+                continue;
+            };
+            let encoded = frame.encode()?.to_vec();
+            frame_votes
+                .entry(encoded)
+                .and_modify(|(count, _)| *count += 1)
+                .or_insert_with(|| (1, frame.clone()));
+        }
+        if let Some((_, frame)) = frame_votes
+            .into_values()
+            .find(|(count, _)| *count >= quorum)
+        {
+            accepted.push(frame);
+            continue;
+        }
+        if !accepted.is_empty() || end_votes >= quorum {
+            return Ok(ActiveReadDecision::Frames(accepted));
+        }
+        if pending == 0 {
+            return if successful < quorum {
+                Ok(ActiveReadDecision::NoReadQuorum)
+            } else {
+                Ok(ActiveReadDecision::Frames(Vec::new()))
+            };
+        }
+        return Ok(ActiveReadDecision::Pending);
+    }
+    unreachable!("an active read decision always terminates at a finite prefix")
+}
+
 fn decoded_sealed_snapshot(
     snapshot: &ReplicaSnapshot,
     expected_records: u64,
@@ -2952,6 +3321,85 @@ fn replay_records(
         });
     }
     Ok(records)
+}
+
+fn check_readonly_floor(record: &ManifestRecord, next: WalSeqNo) -> Result<(), Error> {
+    if next.record_index < record.trunc {
+        return Err(Error::ReadOnlyLagged {
+            next,
+            truncation_floor: WalSeqNo::record(record.trunc),
+        });
+    }
+    Ok(())
+}
+
+fn readonly_segments(record: &ManifestRecord) -> Result<Vec<SegmentDescriptor>, Error> {
+    let mut segments = Vec::with_capacity(record.segments.len());
+    for (index, entry) in record.segments.iter().enumerate() {
+        let next_base = record
+            .segments
+            .get(index + 1)
+            .map_or(record.tail_base, |next| next.base);
+        let end_record_index = next_base.checked_sub(1).ok_or_else(|| {
+            Error::InvalidCatalog(format!(
+                "cannot derive an end for readonly segment {} at base {}",
+                entry.id, entry.base
+            ))
+        })?;
+        if end_record_index < entry.base {
+            return Err(Error::InvalidCatalog(format!(
+                "readonly segment {} at base {} extends past following base {next_base}",
+                entry.id, entry.base
+            )));
+        }
+        segments.push(SegmentDescriptor {
+            id: entry.id.clone(),
+            base_record_index: entry.base,
+            end_record_index,
+            crc32c: entry.crc32c,
+            copies: 0,
+            finalized_copies: 0,
+            seal_pending: record.seal_id.as_deref() == Some(entry.id.as_str()),
+        });
+    }
+    Ok(segments)
+}
+
+async fn refresh_readonly_manifest(
+    manifest: &mut Manifest,
+    poll_interval: Duration,
+) -> Result<ManifestRecord, Error> {
+    loop {
+        match manifest.refreshed_existing_record().await {
+            Ok(Some(record)) => return Ok(record),
+            Ok(None) => return Err(Error::Uninitialized),
+            Err(ProtocolError::ManifestUnavailable) => {
+                tokio::time::sleep(poll_interval).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn spawn_readonly_manifest_poller(
+    mut manifest: Manifest,
+    poll_interval: Duration,
+) -> (
+    tokio::sync::watch::Receiver<Result<ManifestRecord, Error>>,
+    ReadOnlyManifestTask,
+) {
+    let (updates, receiver) = tokio::sync::watch::channel(Ok(manifest.record().clone()));
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            let update = refresh_readonly_manifest(&mut manifest, poll_interval).await;
+            let terminal = update.is_err();
+            if updates.send(update).is_err() || terminal {
+                break;
+            }
+        }
+    });
+    (receiver, ReadOnlyManifestTask(task))
 }
 
 fn replicas_for(factories: &[Arc<dyn ReplicaFactory>], object: &str) -> Vec<Arc<dyn Replica>> {

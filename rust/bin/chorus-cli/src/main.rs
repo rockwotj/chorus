@@ -2,6 +2,7 @@ mod benchmark;
 
 use anyhow::{bail, Context, Result};
 use benchmark::append::AppendArgs;
+use benchmark::readonly::ReadOnlyArgs;
 use benchmark::recovery::RecoveryArgs;
 use chorus_client::{
     BearerAuth, ClientConfig, GrpcReplicaFactory, RefreshingAuthConfig, SegmentedVolume,
@@ -60,6 +61,8 @@ enum BenchmarkCommand {
     Append(AppendArgs),
     /// Measure recovery phases after populating a separate WAL.
     Recovery(RecoveryArgs),
+    /// Measure writer throughput and readonly commit-to-subscribe latency.
+    Readonly(ReadOnlyArgs),
 }
 
 impl Command {
@@ -70,6 +73,9 @@ impl Command {
             } => args.worker_threads(),
             Self::Benchmark {
                 command: BenchmarkCommand::Recovery(args),
+            } => args.worker_threads(),
+            Self::Benchmark {
+                command: BenchmarkCommand::Readonly(args),
             } => args.worker_threads(),
             _ => std::thread::available_parallelism()
                 .map(usize::from)
@@ -84,6 +90,9 @@ impl Command {
             } => args.validate(),
             Self::Benchmark {
                 command: BenchmarkCommand::Recovery(args),
+            } => args.validate(),
+            Self::Benchmark {
+                command: BenchmarkCommand::Readonly(args),
             } => args.validate(),
             _ => Ok(()),
         }
@@ -255,6 +264,9 @@ async fn run(args: Args) -> Result<()> {
         Command::Benchmark {
             command: BenchmarkCommand::Recovery(benchmark_args),
         } => benchmark::recovery::run(storage, prefix, benchmark_args).await?,
+        Command::Benchmark {
+            command: BenchmarkCommand::Readonly(benchmark_args),
+        } => benchmark::readonly::run(storage, prefix, benchmark_args).await?,
     }
     Ok(())
 }

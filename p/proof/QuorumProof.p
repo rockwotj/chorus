@@ -4,6 +4,7 @@ event eMaintenanceStep;
 event eRecordStep;
 event eManifestStep;
 event eRotationGateStep;
+event eReadonlyStep;
 
 machine SegmentChainProofModel {
     var creator0: int;
@@ -25,7 +26,8 @@ machine SegmentChainProofModel {
     start state Running {
         entry { send this, eChainStep; }
         on eChainStep do ChooseOperation;
-        ignore eRecoveryStep, eMaintenanceStep, eRecordStep, eManifestStep;
+        ignore eRecoveryStep, eMaintenanceStep, eRecordStep, eManifestStep,
+            eRotationGateStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -103,7 +105,8 @@ machine RecoveryProofModel {
     start state Running {
         entry { send this, eRecoveryStep; }
         on eRecoveryStep do ChooseOperation;
-        ignore eChainStep, eMaintenanceStep, eRecordStep, eManifestStep;
+        ignore eChainStep, eMaintenanceStep, eRecordStep, eManifestStep,
+            eRotationGateStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -156,7 +159,8 @@ machine SealedMaintenanceProofModel {
     start state Running {
         entry { send this, eMaintenanceStep; }
         on eMaintenanceStep do ChooseOperation;
-        ignore eChainStep, eRecoveryStep, eRecordStep, eManifestStep;
+        ignore eChainStep, eRecoveryStep, eRecordStep, eManifestStep,
+            eRotationGateStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -202,7 +206,8 @@ machine RecordStartupReplayTruncationProofModel {
     start state Running {
         entry { send this, eRecordStep; }
         on eRecordStep do ChooseOperation;
-        ignore eChainStep, eRecoveryStep, eMaintenanceStep, eManifestStep;
+        ignore eChainStep, eRecoveryStep, eMaintenanceStep, eManifestStep,
+            eRotationGateStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -282,7 +287,8 @@ machine ManifestProofModel {
     start state Running {
         entry { send this, eManifestStep; }
         on eManifestStep do ChooseOperation;
-        ignore eChainStep, eRecoveryStep, eMaintenanceStep, eRecordStep;
+        ignore eChainStep, eRecoveryStep, eMaintenanceStep, eRecordStep,
+            eRotationGateStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -356,7 +362,7 @@ machine RotationGateProofModel {
         entry { send this, eRotationGateStep; }
         on eRotationGateStep do ChooseOperation;
         ignore eChainStep, eRecoveryStep, eMaintenanceStep, eRecordStep,
-            eManifestStep;
+            eManifestStep, eReadonlyStep;
     }
 
     fun ChooseOperation() {
@@ -376,6 +382,109 @@ machine RotationGateProofModel {
             }
         }
         send this, eRotationGateStep;
+    }
+}
+
+// Reduced readonly follower. Each zone grows an immutable byte/record prefix;
+// quorumEnd is the largest prefix visible on at least two zones. Publishing
+// moves a subset of that prefix into the sealed directory, while the follower
+// may also load directly below quorumEnd from the active tail. Since zone
+// prefixes and quorumEnd only grow, any emitted active record remains in every
+// later recovery quorum intersection. The readonly role has no transition that
+// writes the manifest or claims an epoch.
+machine ReadonlyFollowerProofModel {
+    var durable0: int;
+    var durable1: int;
+    var durable2: int;
+    var quorumEnd: int;
+    var publishedEnd: int;
+    var floor: int;
+    var next: int;
+    var snapshotEnd: int;
+    var snapshotFloor: int;
+    var loaded: bool;
+    var loadedActive: bool;
+    var loadedOffset: int;
+    var emitted: int;
+    var lagged: bool;
+    var manifestWrites: int;
+    var epochClaims: int;
+
+    start state Running {
+        entry { send this, eReadonlyStep; }
+        on eReadonlyStep do ChooseOperation;
+        ignore eChainStep, eRecoveryStep, eMaintenanceStep, eRecordStep,
+            eManifestStep, eRotationGateStep;
+    }
+
+    fun ChooseOperation() {
+        if ($) {
+            if (durable0 < 3) {
+                durable0 = durable0 + 1;
+                RefreshQuorumEnd();
+            }
+        } else if ($) {
+            if (durable1 < 3) {
+                durable1 = durable1 + 1;
+                RefreshQuorumEnd();
+            }
+        } else if ($) {
+            if (durable2 < 3) {
+                durable2 = durable2 + 1;
+                RefreshQuorumEnd();
+            }
+        } else if ($) {
+            if (publishedEnd < quorumEnd) {
+                publishedEnd = publishedEnd + 1;
+            }
+        } else if ($) {
+            if (!loaded) {
+                snapshotEnd = publishedEnd;
+                snapshotFloor = floor;
+            }
+        } else if ($) {
+            if (floor < publishedEnd) {
+                floor = floor + 1;
+            }
+        } else if ($) {
+            if (!lagged && !loaded &&
+                snapshotFloor <= next && next < snapshotEnd) {
+                loaded = true;
+                loadedActive = false;
+                loadedOffset = next;
+            }
+        } else if ($) {
+            if (!lagged && !loaded &&
+                snapshotFloor <= next && next >= snapshotEnd &&
+                next < quorumEnd) {
+                loaded = true;
+                loadedActive = true;
+                loadedOffset = next;
+            }
+        } else if ($) {
+            if (!lagged && !loaded && floor > next) {
+                lagged = true;
+            }
+        } else {
+            if (!lagged && loaded) {
+                next = next + 1;
+                emitted = emitted + 1;
+                loaded = false;
+                loadedActive = false;
+            }
+        }
+        send this, eReadonlyStep;
+    }
+
+    fun RefreshQuorumEnd() {
+        var candidate: int;
+        var support: int;
+        candidate = quorumEnd + 1;
+        support = 0;
+        if (durable0 >= candidate) { support = support + 1; }
+        if (durable1 >= candidate) { support = support + 1; }
+        if (durable2 >= candidate) { support = support + 1; }
+        if (support >= 2) { quorumEnd = candidate; }
     }
 }
 
@@ -411,6 +520,15 @@ init-condition forall (m: ManifestProofModel) ::
 
 init-condition forall (g: RotationGateProofModel) ::
     g.currentSeal == 0 && g.finalizedQuorum == 0 && g.nextSeal == 0;
+
+init-condition forall (r: ReadonlyFollowerProofModel) ::
+    r.durable0 == 0 && r.durable1 == 0 && r.durable2 == 0 &&
+    r.quorumEnd == 0 && r.publishedEnd == 0 &&
+    r.floor == 0 && r.next == 0 &&
+    r.snapshotEnd == 0 && r.snapshotFloor == 0 &&
+    !r.loaded && !r.loadedActive &&
+    r.loadedOffset == 0 && r.emitted == 0 &&
+    !r.lagged && r.manifestWrites == 0 && r.epochClaims == 0;
 
 Lemma reduced_quorum_wal_inductive {
     invariant at_most_one_creator_quorum:
@@ -580,6 +698,64 @@ Lemma reduced_quorum_wal_inductive {
 
     invariant manifest_delete_after_committed_floor:
         forall (m: ManifestProofModel) :: m.deleted ==> m.floor != 0;
+
+    // ---- readonly follower ----
+
+    invariant readonly_cursor_is_exact_emitted_prefix:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.next == r.emitted &&
+            r.next >= 0 && r.next <= r.quorumEnd;
+
+    invariant readonly_quorum_end_has_majority_support:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.quorumEnd >= 0 && r.quorumEnd <= 3 &&
+            ((r.durable0 >= r.quorumEnd &&
+              r.durable1 >= r.quorumEnd) ||
+             (r.durable0 >= r.quorumEnd &&
+              r.durable2 >= r.quorumEnd) ||
+             (r.durable1 >= r.quorumEnd &&
+              r.durable2 >= r.quorumEnd));
+
+    invariant readonly_durable_prefixes_are_bounded:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.durable0 >= 0 && r.durable0 <= 3 &&
+            r.durable1 >= 0 && r.durable1 <= 3 &&
+            r.durable2 >= 0 && r.durable2 <= 3;
+
+    invariant readonly_floor_is_published:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.floor >= 0 && r.floor <= r.publishedEnd;
+
+    invariant readonly_publication_is_quorum_visible:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.publishedEnd >= 0 &&
+            r.publishedEnd <= r.quorumEnd;
+
+    invariant readonly_snapshot_is_a_published_prefix:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.snapshotFloor >= 0 &&
+            r.snapshotFloor <= r.snapshotEnd &&
+            r.snapshotEnd <= r.publishedEnd;
+
+    invariant readonly_load_is_snapshot_bound:
+        forall (r: ReadonlyFollowerProofModel) :: r.loaded ==>
+            !r.lagged &&
+            r.loadedOffset == r.next &&
+            r.snapshotFloor <= r.loadedOffset &&
+            ((r.loadedActive &&
+              r.snapshotEnd <= r.loadedOffset &&
+              r.loadedOffset < r.quorumEnd) ||
+             (!r.loadedActive &&
+              r.loadedOffset < r.snapshotEnd &&
+              r.snapshotEnd <= r.publishedEnd));
+
+    invariant readonly_lag_is_overtaking_floor:
+        forall (r: ReadonlyFollowerProofModel) :: r.lagged ==>
+            !r.loaded && r.floor > r.next;
+
+    invariant readonly_never_coordinates_with_writer:
+        forall (r: ReadonlyFollowerProofModel) ::
+            r.manifestWrites == 0 && r.epochClaims == 0;
 }
 
 Proof {

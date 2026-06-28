@@ -48,6 +48,17 @@ pub struct ReplicaSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Byte range observed through the provider's bidirectional object-read path.
+pub struct ReplicaRangeRead {
+    /// Replica zone.
+    pub zone: usize,
+    /// Object generation returned with the read.
+    pub generation: i64,
+    /// Requested bytes currently visible at the open object's durable tail.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// State for one live zonal append stream, generation-bound once resumed.
 ///
 /// This is not a distributed ownership record. Logical writer identity comes
@@ -127,8 +138,9 @@ pub enum TransportCode {
     /// A precondition failed; on append/open this is a terminal writer fence,
     /// including both takeover revocation and finalized-object rejection.
     FailedPrecondition,
-    /// GCS redirected or aborted an operation. Rich zonal write redirects are
-    /// consumed by the gRPC transport before reaching protocol code.
+    /// GCS redirected or aborted an operation. Rich zonal bidirectional
+    /// redirects are consumed by the gRPC transport before reaching protocol
+    /// code.
     Aborted,
     /// Requested offset lies outside the provider's accepted range.
     OutOfRange,
@@ -218,6 +230,20 @@ pub trait Replica: Send + Sync {
     /// not derive `persisted_size` from provider metadata that hides appends.
     async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError>;
 
+    /// Read the currently visible suffix of an appendable object starting at
+    /// `offset` through the provider's bidirectional range-read API.
+    ///
+    /// The default keeps non-production test doubles source-compatible. A
+    /// readonly follower requires an implementation and treats this error as a
+    /// missing replica observation.
+    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
+        Err(TransportError {
+            zone: 0,
+            code: TransportCode::Unimplemented,
+            message: format!("bidirectional range reads are unavailable at offset {offset}"),
+        })
+    }
+
     /// Read object metadata only, without the content read. Metadata reads are
     /// content-blind: they succeed even when the stored bytes are rotted, so
     /// repair can learn the generation of a copy whose `snapshot` fails with
@@ -260,9 +286,9 @@ pub trait Replica: Send + Sync {
 
     /// Re-learn the durable tail after a lane disturbance by resuming the
     /// append session (with its handle when available, else a guarded fresh
-    /// open). Never reads object bytes: the live service hides unfinalized
-    /// appendable content from reads, and `state_lookup` on the session is
-    /// the authoritative tail.
+    /// open). This remains the authoritative writer-lane tail even though
+    /// readonly followers can independently observe flushed bytes through
+    /// bidirectional reads.
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError>;
 
     /// Open a fresh, handle-free append stream guarded by the observed object.

@@ -104,6 +104,52 @@ The database remains responsible for its checkpoint. Call
 `WalHandle::truncate_before` only after the database has durably incorporated
 all records below that boundary.
 
+## Readonly followers
+
+`SegmentedVolume::open_readonly` opens a non-coordinating follower for a read
+replica process. The returned `ReadOnlyFollower` is an ordered stream that
+remains pending when caught up and automatically polls the active tail and
+later seals:
+
+```rust,ignore
+use chorus_client::{ReadOnlyConfig, WalSeqNo};
+use futures::TryStreamExt;
+use std::time::Duration;
+
+let mut follower = volume
+    .open_readonly_with_config(
+        WalSeqNo::record(load_replica_checkpoint()?),
+        ReadOnlyConfig {
+            poll_interval: Duration::from_millis(100),
+        },
+    )
+    .await?;
+
+while let Some(record) = follower.try_next().await? {
+    apply_to_read_replica(record.payload.as_ref())?;
+    persist_replica_checkpoint(record.next_seqno())?;
+}
+```
+
+Readonly open never creates the manifest, claims a writer epoch, opens append
+streams, repairs data, or changes the truncation floor. It reads only immutable
+segments already published in the manifest directory plus the manifest-selected
+active appendable object through GCS `BidiReadObject`. A complete active frame
+is emitted only when identical bytes are visible on a strict majority, so a
+minority-only or partial suffix is never exposed. The follower keeps one
+`BidiReadObject` RPC open per zone for the current active object, sends a new
+range message on each poll, and returns as soon as the first matching strict
+majority responds; a slow remaining request stays in flight for a later poll.
+Manifest refresh runs independently and does not delay active-tail delivery.
+Freshness is therefore the configured poll interval plus the fastest matching
+majority's bidirectional-read and decoding latency; segment rotation is not
+required.
+
+Followers do not register with the writer. Retain WAL history long enough for
+every replica to advance its own durable checkpoint. If truncation overtakes a
+follower, the stream returns `Error::ReadOnlyLagged` rather than skipping
+records; resnapshot that replica before reopening it at a newer checkpoint.
+
 ## Storage setup
 
 A typical volume uses:

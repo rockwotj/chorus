@@ -7,6 +7,8 @@ service Storage {
   rpc GetObject(GetObjectRequest) returns (Object);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ReadObject(ReadObjectRequest) returns (stream ReadObjectResponse);
+  rpc BidiReadObject(stream BidiReadObjectRequest)
+      returns (stream BidiReadObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (Object);
   rpc WriteObject(stream WriteObjectRequest) returns (WriteObjectResponse);
   rpc BidiWriteObject(stream BidiWriteObjectRequest)
@@ -89,6 +91,45 @@ message ChecksummedData {
 message ReadObjectResponse {
   optional ChecksummedData checksummed_data = 1;
   optional Object metadata = 4;
+}
+
+message BidiReadHandle {
+  bytes handle = 1;
+}
+
+message BidiReadObjectSpec {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_generation_match = 4;
+  optional int64 if_generation_not_match = 5;
+  optional int64 if_metageneration_match = 6;
+  optional int64 if_metageneration_not_match = 7;
+  optional BidiReadHandle read_handle = 13;
+  optional string routing_token = 14;
+}
+
+message ReadRange {
+  int64 read_offset = 1;
+  int64 read_length = 2;
+  int64 read_id = 3;
+}
+
+message BidiReadObjectRequest {
+  optional BidiReadObjectSpec read_object_spec = 1;
+  repeated ReadRange read_ranges = 8;
+}
+
+message ObjectRangeData {
+  optional ChecksummedData checksummed_data = 1;
+  optional ReadRange read_range = 2;
+  bool range_end = 3;
+}
+
+message BidiReadObjectResponse {
+  repeated ObjectRangeData object_data_ranges = 6;
+  optional Object metadata = 4;
+  optional BidiReadHandle read_handle = 7;
 }
 
 message UpdateObjectRequest {
