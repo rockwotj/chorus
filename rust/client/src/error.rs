@@ -33,6 +33,9 @@ pub enum Error {
     /// The configured identity provider could not issue a token.
     #[error("access-token source failed: {0}")]
     TokenSource(String),
+    /// The WAL manifest does not exist yet.
+    #[error("WAL is not initialized")]
+    Uninitialized,
     /// A bearer token cannot be represented in an ASCII gRPC header.
     #[error("access token cannot be encoded as gRPC metadata")]
     InvalidToken,
@@ -59,6 +62,17 @@ pub enum Error {
         current: WalSeqNo,
         /// Regressing checkpoint supplied by the caller.
         requested: WalSeqNo,
+    },
+    /// A readonly follower fell behind the committed truncation floor.
+    #[error(
+        "readonly follower at {next:?} was overtaken by truncation floor {truncation_floor:?}"
+    )]
+    #[non_exhaustive]
+    ReadOnlyLagged {
+        /// First record the follower still needed.
+        next: WalSeqNo,
+        /// First record still retained by the writer.
+        truncation_floor: WalSeqNo,
     },
     /// Finalized bytes or inferred segment bounds disagree with record framing.
     #[error("invalid sealed segment data: {0}")]

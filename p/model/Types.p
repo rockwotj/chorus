@@ -273,6 +273,35 @@ event eSegmentDeleted: (
 event eReplayOpened: (reader: int, startOffset: int, endOffset: int);
 event eReplayRecord: (reader: int, offset: int);
 event eReplayClosed: int;
+event eReadonlyOpened: (reader: int, nextOffset: int);
+event eReadonlySnapshot: (
+    reader: int,
+    nextOffset: int,
+    trunc: int,
+    publishedEnd: int,
+    segmentBase: int,
+    segmentId: int,
+    segmentEnd: int
+);
+event eReadonlyActiveSnapshot: (
+    reader: int,
+    nextOffset: int,
+    trunc: int,
+    segmentBase: int,
+    segmentId: int
+);
+event eReadonlyRecord: (
+    reader: int,
+    record: tRecord,
+    segmentId: int
+);
+event eReadonlyLagged: (reader: int, nextOffset: int, trunc: int);
+event eReadonlyPoll;
+event eReadonlyPollDone: (
+    reader: int, nextOffset: int, emitted: int, lagged: bool
+);
+event eReadonlySnapshotPaused;
+event eReadonlyContinue;
 event eGetSizeObserved: (zone: int, size: int, finalized: bool);
 event eReplayDone;
 event eProgressRequested: int;

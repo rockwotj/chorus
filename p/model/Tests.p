@@ -117,3 +117,27 @@ test tcPendingSegmentRotation [main=PendingSegmentRotationDriver]:
     (union { PendingSegmentWriter }, { PendingChainRecovery },
         { ZonalBucket }, { ManifestRegister },
         { PendingSegmentRotationDriver });
+
+test tcReadonlyFollower [main=ReadonlyFollowerDriver]:
+    assert QuorumLinearizability, SingleWriterPerSegment,
+        SealAndPrefixSafety, ManifestSafety, RotationGateSafety,
+        DirectoryStructure, DirectoryEnforcement,
+        ReadonlyFollowerSafety in
+    (union { ReadonlyFollower }, { DirectoryRotation }, { WriterProcess },
+        { ZonalBucket }, { ManifestRegister }, { ReadonlyFollowerDriver });
+
+test tcReadonlyActiveTail [main=ReadonlyActiveTailDriver]:
+    assert QuorumLinearizability, SingleWriterPerSegment,
+        SealAndPrefixSafety, ManifestSafety,
+        ReadonlyFollowerSafety in
+    (union { ReadonlyFollower }, { WriterProcess },
+        { ZonalBucket }, { ManifestRegister },
+        { ReadonlyActiveTailDriver });
+
+test tcReadonlyTruncationRace [main=ReadonlyTruncationRaceDriver]:
+    assert QuorumLinearizability, SingleWriterPerSegment,
+        SealAndPrefixSafety, ManifestSafety,
+        ReadonlyFollowerSafety in
+    (union { ReadonlyFollower }, { DirectoryRotation },
+        { DirectoryCleanupCoordinator }, { ZonalBucket },
+        { ManifestRegister }, { ReadonlyTruncationRaceDriver });

@@ -444,6 +444,153 @@ spec StartupReplayAndTruncation observes eRecordFormed,
     }
 }
 
+// A readonly follower is a non-coordinating observer of sealed directory
+// entries and the manifest-selected active tail. Sealed records come from the
+// published immutable prefix. Active records must be complete, identical
+// observations on a strict majority, which makes that prefix recovery-stable
+// by quorum intersection even if writer acknowledgment has not yet run.
+spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
+    eEpochClaimed, eReadonlyOpened, eReadonlySnapshot,
+    eReadonlyActiveSnapshot, eReadonlyRecord, eReadonlyLagged {
+    var support: map[(offset: int, value: int, segment: int), set[int]];
+    var committed: map[int, tRecord];
+    var next: map[int, int];
+    var readers: set[int];
+    var lagged: set[int];
+    var snapshotEnd: map[int, int];
+    var snapshotTrunc: map[int, int];
+    var snapshotSegmentBase: map[int, int];
+    var snapshotSegmentId: map[int, int];
+    var snapshotSegmentEnd: map[int, int];
+    var snapshotActive: map[int, bool];
+
+    start state Observing {
+        on eRecordPersisted do (payload: (
+            zone: int, writerId: int, record: tRecord, gen: int
+        )) {
+            var key: (offset: int, value: int, segment: int);
+            key = RecordKey(payload.record);
+            if (!(key in support)) {
+                support[key] = default(set[int]);
+            }
+            support[key] += (payload.zone);
+        }
+
+        on eRecordCommitted do (payload: (
+            writerId: int, record: tRecord
+        )) {
+            committed[payload.record.offset] = payload.record;
+        }
+
+        on eEpochClaimed do (payload: (epoch: int, writerId: int)) {
+            assert !(payload.writerId in readers),
+                "readonly follower claimed a writer epoch";
+        }
+
+        on eReadonlyOpened do (payload: (
+            reader: int, nextOffset: int
+        )) {
+            assert !(payload.reader in readers),
+                "readonly follower opened twice";
+            readers += (payload.reader);
+            next[payload.reader] = payload.nextOffset;
+        }
+
+        on eReadonlySnapshot do (payload: (
+            reader: int,
+            nextOffset: int,
+            trunc: int,
+            publishedEnd: int,
+            segmentBase: int,
+            segmentId: int,
+            segmentEnd: int
+        )) {
+            assert payload.reader in readers &&
+                !(payload.reader in lagged) &&
+                payload.nextOffset == next[payload.reader],
+                "readonly snapshot did not start at the follower cursor";
+            snapshotEnd[payload.reader] = payload.publishedEnd;
+            snapshotTrunc[payload.reader] = payload.trunc;
+            snapshotSegmentBase[payload.reader] = payload.segmentBase;
+            snapshotSegmentId[payload.reader] = payload.segmentId;
+            snapshotSegmentEnd[payload.reader] = payload.segmentEnd;
+            snapshotActive[payload.reader] = false;
+        }
+
+        on eReadonlyActiveSnapshot do (payload: (
+            reader: int,
+            nextOffset: int,
+            trunc: int,
+            segmentBase: int,
+            segmentId: int
+        )) {
+            assert payload.reader in readers &&
+                !(payload.reader in lagged) &&
+                payload.nextOffset == next[payload.reader],
+                "readonly active snapshot did not start at the follower cursor";
+            snapshotTrunc[payload.reader] = payload.trunc;
+            snapshotSegmentBase[payload.reader] = payload.segmentBase;
+            snapshotSegmentId[payload.reader] = payload.segmentId;
+            snapshotActive[payload.reader] = true;
+        }
+
+        on eReadonlyRecord do (payload: (
+            reader: int,
+            record: tRecord,
+            segmentId: int
+        )) {
+            var key: (offset: int, value: int, segment: int);
+            assert payload.reader in readers &&
+                !(payload.reader in lagged) &&
+                payload.record.offset == next[payload.reader],
+                "readonly follower skipped or duplicated a record";
+            assert payload.reader in snapshotActive &&
+                payload.reader in snapshotTrunc &&
+                snapshotTrunc[payload.reader] <= payload.record.offset &&
+                payload.segmentId == snapshotSegmentId[payload.reader],
+                "readonly follower emitted outside its manifest-selected segment";
+            if (snapshotActive[payload.reader]) {
+                key = RecordKey(payload.record);
+                assert payload.record.segment ==
+                    snapshotSegmentBase[payload.reader] &&
+                    key in support && sizeof(support[key]) >= 2,
+                    "readonly follower emitted an active record without majority support";
+            } else {
+                assert payload.record.offset in committed &&
+                    committed[payload.record.offset] == payload.record,
+                    "readonly follower emitted a changed sealed record";
+                assert payload.reader in snapshotEnd &&
+                    snapshotSegmentBase[payload.reader] <=
+                        payload.record.offset &&
+                    payload.record.offset <=
+                        snapshotSegmentEnd[payload.reader] &&
+                    snapshotSegmentEnd[payload.reader] <
+                        snapshotEnd[payload.reader],
+                    "readonly follower emitted outside its published sealed segment";
+            }
+            next[payload.reader] = payload.record.offset + 1;
+        }
+
+        on eReadonlyLagged do (payload: (
+            reader: int, nextOffset: int, trunc: int
+        )) {
+            assert payload.reader in readers &&
+                !(payload.reader in lagged) &&
+                payload.nextOffset == next[payload.reader] &&
+                payload.trunc > payload.nextOffset,
+                "readonly follower reported lag without an overtaking floor";
+            lagged += (payload.reader);
+        }
+    }
+
+    fun RecordKey(record: tRecord): (
+        offset: int, value: int, segment: int
+    ) {
+        return (offset=record.offset, value=record.value,
+            segment=record.segment);
+    }
+}
+
 spec GetSizeExcludesOpenTail observes eGetSizeObserved {
     start state Observing {
         on eGetSizeObserved do (payload: (
