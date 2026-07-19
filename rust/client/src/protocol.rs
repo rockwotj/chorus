@@ -489,14 +489,10 @@ impl AdmittedPrefix {
                 let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Arc<[Bytes]>>();
                 let task = tokio::spawn(async move {
                     while let Some(chunks) = receiver.recv().await {
-                        hasher = tokio::task::spawn_blocking(move || {
-                            for chunk in chunks.iter() {
-                                hasher.update(chunk);
-                            }
-                            hasher
-                        })
-                        .await
-                        .expect("ordered digest task failed");
+                        for chunk in chunks.iter() {
+                            hasher.update(chunk);
+                        }
+                        tokio::task::yield_now().await;
                     }
                     hasher
                 });
