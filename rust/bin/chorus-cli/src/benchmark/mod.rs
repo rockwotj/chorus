@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use chorus_client::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 
 pub(crate) mod append;
+pub(crate) mod readonly;
 pub(crate) mod recovery;
 
 #[derive(Default)]
@@ -31,13 +32,19 @@ impl BenchMetrics {
             .map(|gauge| gauge.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
+
+    pub(crate) fn rotation_count(&self) -> usize {
+        self.counter("chorus.wal.rotation.completed") as usize
+    }
 }
 
-struct BenchCounter(Arc<AtomicU64>);
+struct BenchCounter {
+    counter: Arc<AtomicU64>,
+}
 
 impl CounterFn for BenchCounter {
     fn increment(&self, value: u64) {
-        self.0.fetch_add(value, Ordering::Relaxed);
+        self.counter.fetch_add(value, Ordering::SeqCst);
     }
 }
 
@@ -73,7 +80,7 @@ impl MetricsRecorder for BenchMetrics {
             .entry(name.to_string())
             .or_default()
             .clone();
-        Arc::new(BenchCounter(metric))
+        Arc::new(BenchCounter { counter: metric })
     }
 
     fn register_gauge(
@@ -109,5 +116,21 @@ impl MetricsRecorder for BenchMetrics {
         _boundaries: &[f64],
     ) -> Arc<dyn HistogramFn> {
         Arc::new(NoopMetric)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_metrics_count_rotations() {
+        let metrics = BenchMetrics::default();
+        let rotations = metrics.register_counter("chorus.wal.rotation.completed", "test", &[]);
+
+        rotations.increment(1);
+        rotations.increment(1);
+
+        assert_eq!(metrics.rotation_count(), 2);
     }
 }

@@ -564,6 +564,44 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// Read an existing register without creating it when absent.
+    ///
+    /// This is the readonly-open path. It deliberately has no write fallback:
+    /// a caller using it can only observe a register initialized by a writer.
+    pub(crate) async fn open_existing(
+        store: Arc<dyn ManifestStore>,
+        config: ClientConfig,
+        metrics: Arc<Metrics>,
+        replica_count: usize,
+        bucket_names: Vec<String>,
+    ) -> Result<Option<Self>, ProtocolError> {
+        validate_bucket_names(&bucket_names)?;
+        if replica_count != bucket_names.len() {
+            return Err(ProtocolError::InvalidManifest(format!(
+                "volume has {replica_count} replica factories but {} bucket identities",
+                bucket_names.len()
+            )));
+        }
+        let max_directory_bytes = store.max_directory_bytes();
+        let initial = ManifestRecord::initial(bucket_names.clone());
+        initial.validate()?;
+        let mut manifest = Self {
+            store,
+            config,
+            owner: incarnation_id(),
+            epoch: 0,
+            bucket_names,
+            max_directory_bytes,
+            cache: (ManifestVersion(0), initial),
+            metrics,
+        };
+        if manifest.refresh_existing().await? {
+            Ok(Some(manifest))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn validate_configuration(&self, record: &ManifestRecord) -> Result<(), ProtocolError> {
         if record.buckets.len() != self.bucket_names.len() {
             return Err(ProtocolError::InvalidManifest(format!(
@@ -605,6 +643,24 @@ impl Manifest {
                         Err(error) => return Err(error.into()),
                     }
                 }
+                Err(ManifestStoreError::Unavailable(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            retry_sleep(&self.config, attempt).await;
+        }
+        Err(ProtocolError::ManifestUnavailable)
+    }
+
+    async fn refresh_existing(&mut self) -> Result<bool, ProtocolError> {
+        for attempt in 0..=self.config.max_retries {
+            match self.store.read().await {
+                Ok(Some(state)) => {
+                    let record = ManifestRecord::decode(&state.fields)?;
+                    self.validate_configuration(&record)?;
+                    self.install_cache(state.version, record);
+                    return Ok(true);
+                }
+                Ok(None) => return Ok(false),
                 Err(ManifestStoreError::Unavailable(_)) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -1062,6 +1118,17 @@ impl Manifest {
     pub async fn refreshed_record(&mut self) -> Result<ManifestRecord, ProtocolError> {
         self.refresh().await?;
         Ok(self.record().clone())
+    }
+
+    /// Re-read an existing register without ever creating a missing one.
+    pub(crate) async fn refreshed_existing_record(
+        &mut self,
+    ) -> Result<Option<ManifestRecord>, ProtocolError> {
+        if self.refresh_existing().await? {
+            Ok(Some(self.record().clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Re-read the register and confirm this process still holds the epoch.

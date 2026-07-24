@@ -69,6 +69,7 @@ fn zonal_latency(seed: u64) -> LatencyProfile {
         .with_operation(Operation::Get, fast)
         .with_operation(Operation::List, fast)
         .with_operation(Operation::Read, fast)
+        .with_operation(Operation::BidiRead, fast)
         .with_operation(Operation::Update, mutation)
         .with_operation(
             Operation::BidiCreate,
@@ -364,6 +365,7 @@ async fn wait_for_repair_passes(metrics: &TestMetricsRecorder, minimum: u64) {
 
 mod engine;
 mod maintenance;
+mod readonly;
 mod recovery;
 mod topology;
 mod transport;

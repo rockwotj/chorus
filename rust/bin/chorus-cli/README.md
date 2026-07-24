@@ -126,3 +126,24 @@ runtime, DNS, TLS, or provider caches.
 Set `--target-sealed-segments 0` to keep one large active segment.
 `--replay-records 0` measures no replay; a value at or above
 `--populate-records` replays the full log.
+
+`benchmark readonly` runs a writer and an independent readonly client against
+the same prefix while keeping the workload in one active appendable segment.
+It reports writer throughput, subscriber catch-up throughput, and per-record
+commit-to-subscribe latency through quorum `BidiReadObject` polls:
+
+```sh
+cargo run --release -p chorus-cli --bin chorus -- \
+  --endpoints https://storage.googleapis.com,https://storage.googleapis.com,https://storage.googleapis.com \
+  --buckets projects/_/buckets/zone-a,projects/_/buckets/zone-b,projects/_/buckets/zone-c \
+  --manifest-endpoint https://storage.googleapis.com \
+  --manifest-bucket projects/_/buckets/regional-control \
+  --prefix benchmarks/readonly-001 \
+  benchmark readonly \
+  --records 4096 \
+  --poll-interval-ms 100 \
+  --payload-bytes 4096
+```
+
+The prefix must be unused. The benchmark fails if the workload rotates, ensuring
+the reported latency is active-tail delivery rather than sealed-segment replay.
