@@ -106,26 +106,6 @@ pub struct RecoveryTimings {
     /// Duration of directory adoption, committed-seal enforcement, and the
     /// appendable-candidate takeover walk.
     pub prepare: Duration,
-    /// How that prepare duration divides between its two regions.
-    pub phases: PreparePhases,
-}
-
-/// The two regions that `prepare` is made of, which cost very different
-/// amounts depending on what the previous writer left behind. Together they
-/// account for nearly all of `prepare`; the remainder is manifest bookkeeping
-/// already covered by `chorus.wal.manifest.cas_latency_seconds`.
-///
-/// Per-operation attribution within a region comes from the recovery
-/// histograms — candidate takeover, segment provisioning, and seal
-/// enforcement — since a region runs a variable number of each.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PreparePhases {
-    /// Recovering and re-quorumizing the already-sealed directory chain.
-    pub sealed_chain: Duration,
-    /// Walking the appendable candidates: taking over the tail, then the
-    /// pending segment, and provisioning replacements for whichever cannot be
-    /// reused.
-    pub candidate_walk: Duration,
 }
 
 /// Startup recovery stream and capability to resume from a fenced frontier.
@@ -227,7 +207,6 @@ pub(crate) struct DeadSegmentSweepReport {
 /// Everything `prepare_recovery` learns and decides: the enforced sealed
 /// chain, the replay boundary, and the identity the writer starts from.
 struct RecoveredWriterState {
-    phases: PreparePhases,
     sealed_segments: Vec<SegmentDescriptor>,
     base_record_index: u64,
     checkpoint_floor: u64,
@@ -259,12 +238,7 @@ impl RecoveredPredecessor {
         let Some(seal) = self.deferred_seal.take() else {
             return Ok(());
         };
-        let started = tokio::time::Instant::now();
-        let enforced = seal.volume.enforce_seal(seal.tail.canonical()).await;
-        metrics
-            .recovery_seal_enforcement
-            .record_duration(started.elapsed());
-        enforced?;
+        seal.volume.enforce_seal(seal.tail.canonical()).await?;
         metrics.segments_sealed.increment();
         Ok(())
     }
@@ -818,7 +792,6 @@ mod recovery {
                 timings: RecoveryTimings {
                     epoch_claim,
                     prepare,
-                    phases: writer_state.phases,
                 },
                 volume: self.clone(),
                 manifest,
@@ -954,7 +927,6 @@ mod recovery {
             // has already durably applied
             let checkpoint_floor = adopted.trunc.max(checkpoint.record_index);
             let mut sealed_segments = Vec::with_capacity(chain.len() + 1);
-            let sealed_chain_started = tokio::time::Instant::now();
             for (id, base, end, crc32c) in &chain {
                 // The most recent seal may still have enforcement in flight, so
                 // recover and enforce it against the committed digest. Older
@@ -997,9 +969,6 @@ mod recovery {
                 }
             }
 
-            let sealed_chain = sealed_chain_started.elapsed();
-
-            let candidate_walk_started = tokio::time::Instant::now();
             // Walk the only two admissible appendable candidates in manifest
             // order. Every size observation follows a takeover fence. The first
             // empty candidate is the write frontier; non-empty predecessors are
@@ -1326,7 +1295,6 @@ mod recovery {
                     }
                 }
             }
-            let candidate_walk = candidate_walk_started.elapsed();
             let (active_id, active_writer) =
                 active.expect("recovery always establishes an empty frontier");
             if checkpoint.record_index > next_record_index {
@@ -1339,10 +1307,6 @@ mod recovery {
                 .recovery_segments_adopted
                 .add(sealed_segments.len() as u64);
             Ok(RecoveredWriterState {
-                phases: PreparePhases {
-                    sealed_chain,
-                    candidate_walk,
-                },
                 sealed_segments,
                 base_record_index: next_record_index,
                 checkpoint_floor,
@@ -1361,8 +1325,6 @@ mod recovery {
             mut manifest: Manifest,
         ) -> Result<SegmentedWriter, Error> {
             let RecoveredWriterState {
-                // Diagnostics only; the writer has no use for them.
-                phases: _,
                 sealed_segments,
                 base_record_index,
                 checkpoint_floor,
@@ -1655,8 +1617,7 @@ mod recovery {
         }
 
         async fn provision_segment(&self, id: String) -> Result<(String, Writer), Error> {
-            let started = tokio::time::Instant::now();
-            let provisioned = provision_spare(
+            provision_spare(
                 self.factories.clone(),
                 self.prefix.clone(),
                 self.client_config.clone(),
@@ -1665,11 +1626,7 @@ mod recovery {
                 id,
                 Arc::clone(&self.metrics),
             )
-            .await;
-            self.metrics
-                .recovery_segment_provision
-                .record_duration(started.elapsed());
-            provisioned
+            .await
         }
 
         async fn recover_manifest_candidate(
@@ -1679,12 +1636,7 @@ mod recovery {
         ) -> Result<RecoveredManifestCandidate, Error> {
             let object = self.segment_object(&id);
             let volume = self.volume_for(&object)?;
-            let started = tokio::time::Instant::now();
-            let candidate = volume.recover_candidate(None).await;
-            self.metrics
-                .recovery_candidate_takeover
-                .record_duration(started.elapsed());
-            match candidate? {
+            match volume.recover_candidate(None).await? {
                 RecoveryCandidate::Absent => Ok(RecoveredManifestCandidate::Absent),
                 RecoveryCandidate::Empty { reusable_writer } => {
                     Ok(RecoveredManifestCandidate::Empty { reusable_writer })

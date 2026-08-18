@@ -7,6 +7,8 @@ service Storage {
   rpc GetObject(GetObjectRequest) returns (Object);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ReadObject(ReadObjectRequest) returns (stream ReadObjectResponse);
+  rpc BidiReadObject(stream BidiReadObjectRequest)
+      returns (stream BidiReadObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (Object);
   rpc WriteObject(stream WriteObjectRequest) returns (WriteObjectResponse);
   rpc BidiWriteObject(stream BidiWriteObjectRequest)
@@ -169,4 +171,38 @@ message BidiWriteObjectResponse {
     Object resource = 2;
   }
   optional BidiWriteHandle write_handle = 3;
+}
+
+// Field numbers match google.storage.v2 exactly: the client encodes with the
+// real generated types, so the fake must decode the same wire format.
+message BidiReadObjectSpec {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  optional int64 if_generation_match = 4;
+  optional int64 if_generation_not_match = 5;
+  optional int64 if_metageneration_match = 6;
+  optional int64 if_metageneration_not_match = 7;
+}
+
+message ReadRange {
+  int64 read_offset = 1;
+  int64 read_length = 2;
+  int64 read_id = 3;
+}
+
+message BidiReadObjectRequest {
+  BidiReadObjectSpec read_object_spec = 1;
+  repeated ReadRange read_ranges = 8;
+}
+
+message ObjectRangeData {
+  ChecksummedData checksummed_data = 1;
+  ReadRange read_range = 2;
+  bool range_end = 3;
+}
+
+message BidiReadObjectResponse {
+  Object metadata = 4;
+  repeated ObjectRangeData object_data_ranges = 6;
 }
