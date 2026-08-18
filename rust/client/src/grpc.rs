@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     bidi_write_object_request, bidi_write_object_response, storage_client::StorageClient,
-    write_object_request, write_object_response, AppendObjectSpec, BidiWriteHandle,
-    BidiWriteObjectRedirectedError, BidiWriteObjectRequest, BidiWriteObjectResponse,
-    ChecksummedData, DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, Object,
-    ReadObjectRequest, UpdateObjectRequest, WriteObjectRequest, WriteObjectSpec,
+    write_object_request, write_object_response, AppendObjectSpec, BidiReadObjectRequest,
+    BidiReadObjectSpec, BidiWriteHandle, BidiWriteObjectRedirectedError, BidiWriteObjectRequest,
+    BidiWriteObjectResponse, ChecksummedData, DeleteObjectRequest, GetObjectRequest,
+    ListObjectsRequest, Object, ReadObjectRequest, ReadRange, UpdateObjectRequest,
+    WriteObjectRequest, WriteObjectSpec,
 };
 use prost::Message as _;
 use tokio::sync::{mpsc, watch, Mutex as SessionMutex};
@@ -248,6 +249,62 @@ impl AppendSessionHandle {
 }
 
 impl GrpcReplica {
+    /// Read the same generation over `BidiReadObject`, returning how long the
+    /// first response took and how many bytes arrived. Errors are returned as
+    /// text rather than propagated: this is a measurement, and it must never
+    /// be able to fail a recovery.
+    async fn shadow_bidi_read(
+        &self,
+        generation: i64,
+    ) -> Result<(std::time::Duration, usize), String> {
+        let spec = BidiReadObjectSpec {
+            bucket: self.bucket.clone(),
+            object: self.object.clone(),
+            generation,
+            ..Default::default()
+        };
+        let open = BidiReadObjectRequest {
+            read_object_spec: Some(spec),
+            // Offset and size zero requests the whole object.
+            read_ranges: vec![ReadRange {
+                read_offset: 0,
+                read_length: 0,
+                read_id: 1,
+            }],
+        };
+        let request = self
+            .request(tokio_stream::once(open))
+            .map_err(|error| format!("{error:?}"))?;
+        let started = std::time::Instant::now();
+        let mut stream = self
+            .client
+            .clone()
+            .bidi_read_object(request)
+            .await
+            .map_err(|status| status.code().to_string())?
+            .into_inner();
+        let mut bytes = 0usize;
+        let mut first = None;
+        while let Some(response) = stream
+            .message()
+            .await
+            .map_err(|status| status.code().to_string())?
+        {
+            if first.is_none() {
+                first = Some(started.elapsed());
+            }
+            for range in response.object_data_ranges {
+                if let Some(data) = range.checksummed_data {
+                    bytes += data.content.len();
+                }
+            }
+            if bytes > 0 {
+                break;
+            }
+        }
+        Ok((first.unwrap_or_else(|| started.elapsed()), bytes))
+    }
+
     fn live_session(&self) -> Result<Arc<AppendSessionHandle>, TransportError> {
         self.session.current.load_full().ok_or_else(|| {
             self.error(
@@ -1210,6 +1267,14 @@ impl Replica for GrpcReplica {
             ..Default::default()
         };
         let request = self.request(read)?;
+        // Shadow BidiReadObject, raced alongside the authoritative read rather
+        // than replacing it. ReadObject stalls a fixed ~5.1s opening its stream
+        // on one zonal bucket, for any object and any size, while GetObject on
+        // the same object takes 35ms — so the question is whether the newer
+        // zonal read API takes a different path. Its result is discarded and
+        // it runs concurrently, so this measures without risking either
+        // correctness or latency.
+        let shadow = self.shadow_bidi_read(object.generation);
         let open_started = std::time::Instant::now();
         let mut stream = self
             .client
@@ -1244,6 +1309,7 @@ impl Replica for GrpcReplica {
         // the phases separated: GetObject, opening the ReadObject stream, and
         // draining it are three different explanations.
         let drain = drain_started.elapsed();
+        let shadow = shadow.await;
         if started.elapsed() >= SLOW_READ_LOG_THRESHOLD {
             tracing::warn!(
                 bucket = %self.bucket,
@@ -1255,6 +1321,9 @@ impl Replica for GrpcReplica {
                 read_object_open_ms = stream_open.as_secs_f64() * 1_000.0,
                 read_object_drain_ms = drain.as_secs_f64() * 1_000.0,
                 total_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                bidi_open_ms = shadow.as_ref().ok().map(|(open, _)| open.as_secs_f64() * 1_000.0),
+                bidi_bytes = shadow.as_ref().ok().map(|(_, bytes)| *bytes),
+                bidi_error = shadow.as_ref().err().map(|message| message.as_str()),
                 "slow object read"
             );
         }
