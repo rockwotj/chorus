@@ -168,6 +168,11 @@ pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
 /// Per-response progress timeout for the persistent session. The session
 /// itself has no overall deadline (it lives for the segment), but a server
 /// that stops acknowledging flushed appends must fail the lane.
+/// A read slower than this is logged with its phase breakdown. Healthy reads
+/// of these objects complete in roughly 100ms, so this fires only on the
+/// pathological case and stays silent in normal operation.
+const SLOW_READ_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
 const SESSION_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_LIST_PAGES: usize = 10_000;
@@ -1181,6 +1186,7 @@ impl Replica for GrpcReplica {
     }
 
     async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError> {
+        let started = std::time::Instant::now();
         let get = GetObjectRequest {
             bucket: self.bucket.clone(),
             object: self.object.clone(),
@@ -1194,6 +1200,7 @@ impl Replica for GrpcReplica {
             .await
             .map_err(|status| self.status(status))?
             .into_inner();
+        let metadata_read = started.elapsed();
 
         let read = ReadObjectRequest {
             bucket: self.bucket.clone(),
@@ -1203,6 +1210,7 @@ impl Replica for GrpcReplica {
             ..Default::default()
         };
         let request = self.request(read)?;
+        let open_started = std::time::Instant::now();
         let mut stream = self
             .client
             .clone()
@@ -1210,6 +1218,8 @@ impl Replica for GrpcReplica {
             .await
             .map_err(|status| self.status(status))?
             .into_inner();
+        let stream_open = open_started.elapsed();
+        let drain_started = std::time::Instant::now();
         let mut bytes = Vec::new();
         while let Some(response) = stream
             .message()
@@ -1228,6 +1238,25 @@ impl Replica for GrpcReplica {
                 }
                 bytes.extend_from_slice(&data.content);
             }
+        }
+        // A read that takes seconds is a provider-side anomaly, not a client
+        // condition, and the only way to raise it is with the object named and
+        // the phases separated: GetObject, opening the ReadObject stream, and
+        // draining it are three different explanations.
+        let drain = drain_started.elapsed();
+        if started.elapsed() >= SLOW_READ_LOG_THRESHOLD {
+            tracing::warn!(
+                bucket = %self.bucket,
+                object = %self.object,
+                zone = self.zone,
+                generation = object.generation,
+                bytes = bytes.len(),
+                get_object_ms = metadata_read.as_secs_f64() * 1_000.0,
+                read_object_open_ms = stream_open.as_secs_f64() * 1_000.0,
+                read_object_drain_ms = drain.as_secs_f64() * 1_000.0,
+                total_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                "slow object read"
+            );
         }
         Ok(self.snapshot_from_object(object, bytes))
     }
