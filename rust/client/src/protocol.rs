@@ -1159,9 +1159,6 @@ impl QuorumVolume {
                 .map(|replica| snapshot_with_retry(replica, &self.config)),
         )
         .await;
-        self.metrics
-            .recovery_seal_witness_reads
-            .record_duration(reads_started.elapsed());
         let mut witnesses: Vec<ReplicaSnapshot> = Vec::new();
         let mut missing: Vec<usize> = Vec::new();
         for (zone, read) in reads.into_iter().enumerate() {
@@ -1189,6 +1186,13 @@ impl QuorumVolume {
                 Err(error) => return Err(error.into()),
             }
         }
+        // Stopped here rather than after the fan-out above: classifying a
+        // DATA_LOSS reply issues its own sequential `stat` per zone, and
+        // leaving that outside every phase would drop it from the accounting
+        // exactly when copies are rotted.
+        self.metrics
+            .recovery_seal_witness_reads
+            .record_duration(reads_started.elapsed());
         // shortest matching prefix first: the best copy is rewritten last
         witnesses.sort_by_key(|snapshot| {
             let shared = snapshot
@@ -1229,14 +1233,23 @@ impl QuorumVolume {
                 Err(error) => return Err(error),
             }
         }
-        for zone in missing {
+        // Absent zones hold nothing, so none of them is the best copy and no
+        // ordering constrains them. They ran in series, which is the same
+        // per-zone retry chain that made witness enforcement slow, and it is
+        // the path taken when replicas are least healthy.
+        let repairs = join_all(missing.into_iter().map(|zone| {
             let replica = Arc::clone(&self.replicas[zone]);
-            let Ok(created) =
-                create_with_retry(&replica, self.metadata.clone(), &self.config).await
-            else {
-                continue;
-            };
-            match self.enforce_witness(created, &data).await {
+            let data = data.clone();
+            async move {
+                let created = create_with_retry(&replica, self.metadata.clone(), &self.config)
+                    .await
+                    .ok()?;
+                Some(self.enforce_witness(created, &data).await)
+            }
+        }))
+        .await;
+        for repair in repairs.into_iter().flatten() {
+            match repair {
                 Ok(true) => finalized += 1,
                 Ok(false) => {}
                 Err(error) => return Err(error),
@@ -1256,12 +1269,18 @@ impl QuorumVolume {
     ) -> Result<bool, ProtocolError> {
         let zone = snapshot.zone;
         let replica = Arc::clone(&self.replicas[zone]);
+        // Correct already: nothing is enforced, so nothing is timed. Recording
+        // it would fill the histogram with zero-length samples on an idempotent
+        // re-seal and bury the one zone that is genuinely slow.
+        if snapshot.finalized && snapshot.bytes == data[..] {
+            return Ok(true);
+        }
         let _timer = WitnessTimer {
             metrics: &self.metrics,
             started: tokio::time::Instant::now(),
         };
         for _ in 0..=self.config.max_retries {
-            self.metrics.recovery_seal_witness_attempts.increment();
+            self.metrics.record_seal_witness_attempt(zone);
             if snapshot.finalized {
                 if snapshot.bytes == data[..] {
                     return Ok(true);

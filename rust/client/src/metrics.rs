@@ -143,6 +143,15 @@ impl Counter {
         Self(recorder.register_counter(name, description, &[]))
     }
 
+    fn register_with_labels(
+        recorder: &dyn MetricsRecorder,
+        name: &str,
+        description: &str,
+        labels: &[(&str, &str)],
+    ) -> Self {
+        Self(recorder.register_counter(name, description, labels))
+    }
+
     pub(crate) fn increment(&self) {
         self.add(1);
     }
@@ -298,7 +307,7 @@ pub(crate) struct Metrics {
     pub(crate) recovery_seal_enforcement: Histogram,
     pub(crate) recovery_seal_witness_reads: Histogram,
     pub(crate) recovery_seal_witness: Histogram,
-    pub(crate) recovery_seal_witness_attempts: Counter,
+    zone_seal_witness_attempts: Vec<Counter>,
     pub(crate) orphan_objects_deleted: Counter,
     pub(crate) orphan_sweeps_deferred: Counter,
     pub(crate) truncation_cycles: Counter,
@@ -343,6 +352,18 @@ impl Metrics {
                 Histogram::register(recorder, $name, $description)
             };
         }
+
+        let zone_seal_witness_attempts = (0..replica_count)
+            .map(|zone| {
+                let zone = zone.to_string();
+                Counter::register_with_labels(
+                    recorder,
+                    "chorus.wal.recovery.seal_witness_attempts",
+                    "Retry passes spent enforcing this zone's copy, one per pass",
+                    &[("zone", zone.as_str())],
+                )
+            })
+            .collect();
 
         let zone_durable_lag = (0..replica_count)
             .map(|zone| {
@@ -454,10 +475,6 @@ impl Metrics {
                 "chorus.wal.recovery.seal_witness_seconds",
                 "Forcing one replica's copy to match the canonical prefix"
             ),
-            recovery_seal_witness_attempts: counter!(
-                "chorus.wal.recovery.seal_witness_attempts",
-                "Retry iterations spent enforcing witnesses, one per pass"
-            ),
             recovery_segments_adopted: counter!(
                 "chorus.wal.recovery.segments_adopted",
                 "Sealed segments adopted by recovery"
@@ -516,6 +533,7 @@ impl Metrics {
                 "Appends waiting across the admission channel and engine queue"
             ),
             zone_durable_lag,
+            zone_seal_witness_attempts,
             rotation_state: gauge!(
                 "chorus.wal.rotation.state",
                 "Rotation gate state: 0 idle, 1 due, 2 draining, 3 sealing, 4 disabled"
@@ -542,6 +560,15 @@ impl Metrics {
                 "chorus.wal.seal.duration_seconds",
                 "Seconds to finalize a swapped-out segment"
             ),
+        }
+    }
+
+    /// One retry pass enforcing `zone`'s copy. Labelled per zone so a single
+    /// spinning replica is distinguishable from every zone retrying evenly —
+    /// the two have different causes and different fixes.
+    pub(crate) fn record_seal_witness_attempt(&self, zone: usize) {
+        if let Some(counter) = self.zone_seal_witness_attempts.get(zone) {
+            counter.increment();
         }
     }
 
