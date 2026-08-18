@@ -1152,12 +1152,16 @@ impl QuorumVolume {
     /// are fixed by the committed decision.
     pub async fn enforce_seal(&self, canonical: &CanonicalPrefix) -> Result<(), ProtocolError> {
         let data = Bytes::from(canonical.bytes.clone());
+        let reads_started = tokio::time::Instant::now();
         let reads = join_all(
             self.replicas
                 .iter()
                 .map(|replica| snapshot_with_retry(replica, &self.config)),
         )
         .await;
+        self.metrics
+            .recovery_seal_witness_reads
+            .record_duration(reads_started.elapsed());
         let mut witnesses: Vec<ReplicaSnapshot> = Vec::new();
         let mut missing: Vec<usize> = Vec::new();
         for (zone, read) in reads.into_iter().enumerate() {
@@ -1199,7 +1203,26 @@ impl QuorumVolume {
                 + shared
         });
         let mut finalized = 0usize;
-        for snapshot in witnesses {
+        // The sort leaves the best copy last, and it stays last: a crash part
+        // way through must never find every good copy already replaced. The
+        // strictly worse copies have no such constraint, so they go together —
+        // sequential enforcement made recovery pay one full retry chain per
+        // zone, and those chains dominate a takeover from a live writer.
+        let best = witnesses.pop();
+        let others = join_all(
+            witnesses
+                .into_iter()
+                .map(|snapshot| self.enforce_witness(snapshot, &data)),
+        )
+        .await;
+        for outcome in others {
+            match outcome {
+                Ok(true) => finalized += 1,
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(snapshot) = best {
             match self.enforce_witness(snapshot, &data).await {
                 Ok(true) => finalized += 1,
                 Ok(false) => {}
@@ -1233,7 +1256,12 @@ impl QuorumVolume {
     ) -> Result<bool, ProtocolError> {
         let zone = snapshot.zone;
         let replica = Arc::clone(&self.replicas[zone]);
+        let _timer = WitnessTimer {
+            metrics: &self.metrics,
+            started: tokio::time::Instant::now(),
+        };
         for _ in 0..=self.config.max_retries {
+            self.metrics.recovery_seal_witness_attempts.increment();
             if snapshot.finalized {
                 if snapshot.bytes == data[..] {
                     return Ok(true);
@@ -1284,6 +1312,23 @@ impl QuorumVolume {
             }
         }
         Ok(false)
+    }
+}
+
+/// Records one witness's enforcement on every exit path. `enforce_witness`
+/// returns from a dozen places — early success, transient give-up, and several
+/// error arms — so a guard is the only way to time all of them without
+/// restructuring the retry loop.
+struct WitnessTimer<'a> {
+    metrics: &'a Metrics,
+    started: tokio::time::Instant,
+}
+
+impl Drop for WitnessTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .recovery_seal_witness
+            .record_duration(self.started.elapsed());
     }
 }
 

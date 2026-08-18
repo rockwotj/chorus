@@ -296,6 +296,9 @@ pub(crate) struct Metrics {
     pub(crate) recovery_candidate_takeover: Histogram,
     pub(crate) recovery_segment_provision: Histogram,
     pub(crate) recovery_seal_enforcement: Histogram,
+    pub(crate) recovery_seal_witness_reads: Histogram,
+    pub(crate) recovery_seal_witness: Histogram,
+    pub(crate) recovery_seal_witness_attempts: Counter,
     pub(crate) orphan_objects_deleted: Counter,
     pub(crate) orphan_sweeps_deferred: Counter,
     pub(crate) truncation_cycles: Counter,
@@ -442,6 +445,18 @@ impl Metrics {
             recovery_seal_enforcement: histogram!(
                 "chorus.wal.recovery.seal_enforcement_seconds",
                 "Enforcing a deferred seal on a recovered predecessor"
+            ),
+            recovery_seal_witness_reads: histogram!(
+                "chorus.wal.recovery.seal_witness_reads_seconds",
+                "Reading every replica's copy before seal enforcement begins"
+            ),
+            recovery_seal_witness: histogram!(
+                "chorus.wal.recovery.seal_witness_seconds",
+                "Forcing one replica's copy to match the canonical prefix"
+            ),
+            recovery_seal_witness_attempts: counter!(
+                "chorus.wal.recovery.seal_witness_attempts",
+                "Retry iterations spent enforcing witnesses, one per pass"
             ),
             recovery_segments_adopted: counter!(
                 "chorus.wal.recovery.segments_adopted",
