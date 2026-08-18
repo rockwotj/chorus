@@ -852,6 +852,18 @@ impl QuorumVolume {
         if !SUPPORTED_REPLICA_COUNTS.contains(&replicas.len()) {
             return Err(ProtocolError::ReplicaCount);
         }
+        // Wrapped here because it is the one place that holds both the
+        // replicas and the recorder, so every provider RPC on the quorum path
+        // is timed without a single call site knowing about it.
+        let replicas: Vec<Arc<dyn Replica>> = replicas
+            .into_iter()
+            .map(|replica| {
+                Arc::new(crate::transport::TimedReplica::new(
+                    replica,
+                    Arc::clone(&metrics),
+                )) as Arc<dyn Replica>
+            })
+            .collect();
         Ok(Self {
             replicas,
             config,

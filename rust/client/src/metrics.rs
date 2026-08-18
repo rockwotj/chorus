@@ -238,6 +238,26 @@ impl UpDownCounter {
 
 /// Prometheus-style latency buckets in seconds, wide enough to span a fast
 /// zonal append acknowledgment and a slow regional seal alike.
+/// Every `TransportCode`, so a failure counter exists for each and a code that
+/// never fires is visibly zero rather than absent.
+const TRANSPORT_FAILURE_CODES: &[&str] = &[
+    "NotFound",
+    "AlreadyExists",
+    "InvalidArgument",
+    "FailedPrecondition",
+    "Aborted",
+    "OutOfRange",
+    "ResourceExhausted",
+    "Unimplemented",
+    "DataLoss",
+    "Ambiguous",
+    "Unauthenticated",
+    "PermissionDenied",
+    "Unavailable",
+    "DeadlineExceeded",
+    "Internal",
+];
+
 const LATENCY_SECONDS_BOUNDARIES: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
@@ -308,6 +328,10 @@ pub(crate) struct Metrics {
     pub(crate) recovery_seal_witness_reads: Histogram,
     pub(crate) recovery_seal_witness: Histogram,
     zone_seal_witness_attempts: Vec<Counter>,
+    /// Per-operation latency of individual provider RPCs, and the codes they
+    /// fail with. Phase timings say which part of recovery is slow; these say
+    /// which storage call is, which is the form a provider can act on.
+    pub(crate) rpc: TransportRpcMetrics,
     pub(crate) orphan_objects_deleted: Counter,
     pub(crate) orphan_sweeps_deferred: Counter,
     pub(crate) truncation_cycles: Counter,
@@ -328,6 +352,72 @@ pub(crate) struct Metrics {
     pub(crate) append_commit_latency: Histogram,
     pub(crate) manifest_cas_latency: Histogram,
     pub(crate) seal_duration: Histogram,
+}
+
+/// One histogram per provider operation, plus failures keyed by the code the
+/// provider returned. `ResourceExhausted` in particular is a per-object
+/// mutation-rate limit rather than a client fault, and is invisible in a
+/// latency figure alone.
+pub(crate) struct TransportRpcMetrics {
+    pub(crate) snapshot: Histogram,
+    pub(crate) stat: Histogram,
+    pub(crate) create_appendable: Histogram,
+    pub(crate) create_append_session: Histogram,
+    pub(crate) create_register: Histogram,
+    pub(crate) update_register: Histogram,
+    pub(crate) resume_tail: Histogram,
+    pub(crate) takeover: Histogram,
+    pub(crate) replace_appendable: Histogram,
+    pub(crate) finalize: Histogram,
+    pub(crate) delete: Histogram,
+    failures: Vec<(&'static str, Counter)>,
+}
+
+impl TransportRpcMetrics {
+    fn register(recorder: &dyn MetricsRecorder) -> Self {
+        let rpc = |op: &str| {
+            Histogram(recorder.register_histogram(
+                "chorus.wal.transport.rpc_seconds",
+                "Latency of one provider RPC",
+                &[("op", op)],
+                LATENCY_SECONDS_BOUNDARIES,
+            ))
+        };
+        let failures = TRANSPORT_FAILURE_CODES
+            .iter()
+            .map(|code| {
+                (
+                    *code,
+                    Counter::register_with_labels(
+                        recorder,
+                        "chorus.wal.transport.rpc_failures",
+                        "Provider RPCs that returned an error, by provider code",
+                        &[("code", code)],
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            snapshot: rpc("snapshot"),
+            stat: rpc("stat"),
+            create_appendable: rpc("create_appendable"),
+            create_append_session: rpc("create_append_session"),
+            create_register: rpc("create_register"),
+            update_register: rpc("update_register"),
+            resume_tail: rpc("resume_tail"),
+            takeover: rpc("takeover"),
+            replace_appendable: rpc("replace_appendable"),
+            finalize: rpc("finalize"),
+            delete: rpc("delete"),
+            failures,
+        }
+    }
+
+    pub(crate) fn record_failure(&self, code: &str) {
+        if let Some((_, counter)) = self.failures.iter().find(|(name, _)| *name == code) {
+            counter.increment();
+        }
+    }
 }
 
 impl Metrics {
@@ -534,6 +624,7 @@ impl Metrics {
             ),
             zone_durable_lag,
             zone_seal_witness_attempts,
+            rpc: TransportRpcMetrics::register(recorder),
             rotation_state: gauge!(
                 "chorus.wal.rotation.state",
                 "Rotation gate state: 0 idle, 1 due, 2 draining, 3 sealing, 4 disabled"
