@@ -20,9 +20,9 @@ use proto::bidi_write_object_request::{Data, FirstMessage};
 use proto::bidi_write_object_response::WriteStatus;
 use proto::storage_server::{Storage, StorageServer};
 use proto::{
-    BidiWriteObjectRequest, BidiWriteObjectResponse, DeleteObjectRequest, Empty, GetObjectRequest,
-    ListObjectsRequest, ListObjectsResponse, Object, ReadObjectRequest, ReadObjectResponse,
-    Timestamp, UpdateObjectRequest,
+    BidiReadObjectRequest, BidiReadObjectResponse, BidiWriteObjectRequest, BidiWriteObjectResponse,
+    DeleteObjectRequest, Empty, GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object,
+    ReadObjectRequest, ReadObjectResponse, Timestamp, UpdateObjectRequest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1226,6 +1226,7 @@ impl<T> Drop for TaskResponseStream<T> {
 impl Storage for FakeGcs {
     type ReadObjectStream = ResponseStream<ReadObjectResponse>;
     type BidiWriteObjectStream = ResponseStream<BidiWriteObjectResponse>;
+    type BidiReadObjectStream = ResponseStream<BidiReadObjectResponse>;
 
     async fn delete_object(
         &self,
@@ -1374,6 +1375,78 @@ impl Storage for FakeGcs {
                 content: object.bytes[start..end].to_vec(),
                 crc32c: Some(crc32c::crc32c(&object.bytes[start..end])),
             }),
+            metadata: Some(object.to_proto()),
+        };
+        Ok(Response::new(Box::pin(tokio_stream::iter([Ok(response)]))))
+    }
+
+    /// Serves the same bytes as `read_object` under the same guards. Chorus
+    /// reads over this API because `ReadObject` stalls opening its stream
+    /// against real appendable objects, so the fake has to implement it or the
+    /// recovery tests exercise a path production no longer takes.
+    async fn bidi_read_object(
+        &self,
+        request: Request<tonic::Streaming<BidiReadObjectRequest>>,
+    ) -> Result<Response<Self::BidiReadObjectStream>, Status> {
+        self.before(Operation::Read).await?;
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("empty bidi read stream"))?;
+        let spec = first
+            .read_object_spec
+            .ok_or_else(|| Status::invalid_argument("first message must set read_object_spec"))?;
+        let state = self.inner.lock().await;
+        let object = state
+            .objects
+            .get(&object_key(&spec.bucket, &spec.object))
+            .ok_or_else(|| Status::not_found("object"))?;
+        check_name(object, &spec.bucket, &spec.object)?;
+        if crc32c::crc32c(&object.bytes) != object.integrity_crc32c {
+            return Err(Status::data_loss("stored object CRC32C mismatch"));
+        }
+        if spec.generation != 0 && spec.generation != object.generation {
+            return Err(Status::failed_precondition("generation mismatch"));
+        }
+        if spec
+            .if_generation_match
+            .is_some_and(|value| value != object.generation)
+        {
+            return Err(Status::failed_precondition("generation mismatch"));
+        }
+        if spec
+            .if_metageneration_match
+            .is_some_and(|value| value != object.metageneration)
+        {
+            return Err(Status::failed_precondition("metageneration mismatch"));
+        }
+        // A zero offset and length requests the whole object, which is the only
+        // shape chorus asks for.
+        let range = first.read_ranges.first().copied().unwrap_or_default();
+        let start = usize::try_from(range.read_offset.max(0)).unwrap_or(usize::MAX);
+        if start > object.bytes.len() {
+            return Err(Status::out_of_range("read offset"));
+        }
+        let limit = if range.read_length <= 0 {
+            object.bytes.len() - start
+        } else {
+            usize::try_from(range.read_length).unwrap_or(usize::MAX)
+        };
+        let end = object.bytes.len().min(start.saturating_add(limit));
+        let response = BidiReadObjectResponse {
+            object_data_ranges: vec![proto::ObjectRangeData {
+                checksummed_data: Some(proto::ChecksummedData {
+                    content: object.bytes[start..end].to_vec(),
+                    crc32c: Some(crc32c::crc32c(&object.bytes[start..end])),
+                }),
+                read_range: Some(proto::ReadRange {
+                    read_offset: range.read_offset,
+                    read_length: (end - start) as i64,
+                    read_id: range.read_id,
+                }),
+                range_end: true,
+            }],
             metadata: Some(object.to_proto()),
         };
         Ok(Response::new(Box::pin(tokio_stream::iter([Ok(response)]))))

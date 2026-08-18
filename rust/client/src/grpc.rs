@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use googleapis_tonic_google_storage_v2::google::storage::v2::{
     bidi_write_object_request, bidi_write_object_response, storage_client::StorageClient,
-    write_object_request, write_object_response, AppendObjectSpec, BidiWriteHandle,
-    BidiWriteObjectRedirectedError, BidiWriteObjectRequest, BidiWriteObjectResponse,
-    ChecksummedData, DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, Object,
-    ReadObjectRequest, UpdateObjectRequest, WriteObjectRequest, WriteObjectSpec,
+    write_object_request, write_object_response, AppendObjectSpec, BidiReadObjectRequest,
+    BidiReadObjectSpec, BidiWriteHandle, BidiWriteObjectRedirectedError, BidiWriteObjectRequest,
+    BidiWriteObjectResponse, ChecksummedData, DeleteObjectRequest, GetObjectRequest,
+    ListObjectsRequest, Object, ReadRange, UpdateObjectRequest, WriteObjectRequest,
+    WriteObjectSpec,
 };
 use prost::Message as _;
 use tokio::sync::{mpsc, watch, Mutex as SessionMutex};
@@ -243,6 +244,68 @@ impl AppendSessionHandle {
 }
 
 impl GrpcReplica {
+    /// Read one generation in full over `BidiReadObject`.
+    ///
+    /// Preferred over `ReadObject`, which stalls a fixed ~5.1s opening its
+    /// stream against these appendable objects — measured across two zones and
+    /// three objects from 26KB to 198KB, while `GetObject` on the same objects
+    /// took 35ms and the drain under 2ms. Bidi returned the identical byte
+    /// count in 53ms. Same bytes, same generation guard, same per-chunk CRC
+    /// check; only the API differs.
+    ///
+    /// Errors carry the provider code, so the surrounding retry and quorum
+    /// logic classifies a bidi failure exactly as it classified a `ReadObject`
+    /// one — transient codes retry, `NotFound` and `DataLoss` keep their
+    /// meaning to recovery.
+    async fn bidi_read(&self, generation: i64) -> Result<Vec<u8>, TransportError> {
+        let spec = BidiReadObjectSpec {
+            bucket: self.bucket.clone(),
+            object: self.object.clone(),
+            generation,
+            if_generation_match: Some(generation),
+            ..Default::default()
+        };
+        let open = BidiReadObjectRequest {
+            read_object_spec: Some(spec),
+            // Offset and size zero requests the whole object.
+            read_ranges: vec![ReadRange {
+                read_offset: 0,
+                read_length: 0,
+                read_id: 1,
+            }],
+        };
+        let request = self.request(tokio_stream::once(open))?;
+        let mut stream = self
+            .client
+            .clone()
+            .bidi_read_object(request)
+            .await
+            .map_err(|status| self.status(status))?
+            .into_inner();
+        let mut bytes = Vec::new();
+        while let Some(response) = stream
+            .message()
+            .await
+            .map_err(|status| self.status(status))?
+        {
+            for range in response.object_data_ranges {
+                if let Some(data) = range.checksummed_data {
+                    if data
+                        .crc32c
+                        .is_some_and(|expected| expected != crc32c::crc32c(&data.content))
+                    {
+                        return Err(self.error(
+                            TransportCode::DataLoss,
+                            "BidiReadObject response CRC32C mismatch",
+                        ));
+                    }
+                    bytes.extend_from_slice(&data.content);
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     fn live_session(&self) -> Result<Arc<AppendSessionHandle>, TransportError> {
         self.session.current.load_full().ok_or_else(|| {
             self.error(
@@ -1195,40 +1258,10 @@ impl Replica for GrpcReplica {
             .map_err(|status| self.status(status))?
             .into_inner();
 
-        let read = ReadObjectRequest {
-            bucket: self.bucket.clone(),
-            object: self.object.clone(),
-            generation: object.generation,
-            if_generation_match: Some(object.generation),
-            ..Default::default()
-        };
-        let request = self.request(read)?;
-        let mut stream = self
-            .client
-            .clone()
-            .read_object(request)
-            .await
-            .map_err(|status| self.status(status))?
-            .into_inner();
-        let mut bytes = Vec::new();
-        while let Some(response) = stream
-            .message()
-            .await
-            .map_err(|status| self.status(status))?
-        {
-            if let Some(data) = response.checksummed_data {
-                if data
-                    .crc32c
-                    .is_some_and(|expected| expected != crc32c::crc32c(&data.content))
-                {
-                    return Err(self.error(
-                        TransportCode::DataLoss,
-                        "ReadObject response CRC32C mismatch",
-                    ));
-                }
-                bytes.extend_from_slice(&data.content);
-            }
-        }
+        // Content comes over BidiReadObject. ReadObject stalls a fixed ~5.1s
+        // opening its stream against these appendable objects, independent of
+        // zone, object and size, while bidi returned the same bytes in 53ms.
+        let bytes = self.bidi_read(object.generation).await?;
         Ok(self.snapshot_from_object(object, bytes))
     }
 
