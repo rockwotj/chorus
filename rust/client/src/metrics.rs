@@ -293,6 +293,9 @@ pub(crate) struct Metrics {
     pub(crate) repair_failures: Counter,
     pub(crate) recoveries_run: Counter,
     pub(crate) recovery_segments_adopted: Counter,
+    pub(crate) recovery_candidate_takeover: Histogram,
+    pub(crate) recovery_segment_provision: Histogram,
+    pub(crate) recovery_seal_enforcement: Histogram,
     pub(crate) orphan_objects_deleted: Counter,
     pub(crate) orphan_sweeps_deferred: Counter,
     pub(crate) truncation_cycles: Counter,
@@ -428,6 +431,18 @@ impl Metrics {
                 "Repair passes aborted by an error"
             ),
             recoveries_run: counter!("chorus.wal.recovery.runs", "Recovery attempts started"),
+            recovery_candidate_takeover: histogram!(
+                "chorus.wal.recovery.candidate_takeover_seconds",
+                "Fencing takeover and tail observation for one appendable candidate"
+            ),
+            recovery_segment_provision: histogram!(
+                "chorus.wal.recovery.segment_provision_seconds",
+                "Creating one segment object and opening its append lanes"
+            ),
+            recovery_seal_enforcement: histogram!(
+                "chorus.wal.recovery.seal_enforcement_seconds",
+                "Enforcing a deferred seal on a recovered predecessor"
+            ),
             recovery_segments_adopted: counter!(
                 "chorus.wal.recovery.segments_adopted",
                 "Sealed segments adopted by recovery"
