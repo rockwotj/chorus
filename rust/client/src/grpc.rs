@@ -249,18 +249,23 @@ impl AppendSessionHandle {
 }
 
 impl GrpcReplica {
-    /// Read the same generation over `BidiReadObject`, returning how long the
-    /// first response took and how many bytes arrived. Errors are returned as
-    /// text rather than propagated: this is a measurement, and it must never
-    /// be able to fail a recovery.
-    async fn shadow_bidi_read(
-        &self,
-        generation: i64,
-    ) -> Result<(std::time::Duration, usize), String> {
+    /// Read one generation in full over `BidiReadObject`.
+    ///
+    /// Preferred over `ReadObject`, which stalls a fixed ~5.1s opening its
+    /// stream against these appendable objects — measured across two zones and
+    /// three objects from 26KB to 198KB, while `GetObject` on the same objects
+    /// took 35ms and the drain under 2ms. Bidi returned the identical byte
+    /// count in 53ms. Same bytes, same generation guard, same per-chunk CRC
+    /// check; only the API differs.
+    ///
+    /// Errors are returned as text so the caller can fall back to `ReadObject`
+    /// rather than fail a recovery over a read-path choice.
+    async fn bidi_read(&self, generation: i64) -> Result<Vec<u8>, String> {
         let spec = BidiReadObjectSpec {
             bucket: self.bucket.clone(),
             object: self.object.clone(),
             generation,
+            if_generation_match: Some(generation),
             ..Default::default()
         };
         let open = BidiReadObjectRequest {
@@ -275,7 +280,6 @@ impl GrpcReplica {
         let request = self
             .request(tokio_stream::once(open))
             .map_err(|error| format!("{error:?}"))?;
-        let started = std::time::Instant::now();
         let mut stream = self
             .client
             .clone()
@@ -283,26 +287,25 @@ impl GrpcReplica {
             .await
             .map_err(|status| status.code().to_string())?
             .into_inner();
-        let mut bytes = 0usize;
-        let mut first = None;
+        let mut bytes = Vec::new();
         while let Some(response) = stream
             .message()
             .await
             .map_err(|status| status.code().to_string())?
         {
-            if first.is_none() {
-                first = Some(started.elapsed());
-            }
             for range in response.object_data_ranges {
                 if let Some(data) = range.checksummed_data {
-                    bytes += data.content.len();
+                    if data
+                        .crc32c
+                        .is_some_and(|expected| expected != crc32c::crc32c(&data.content))
+                    {
+                        return Err("BidiReadObject response CRC32C mismatch".to_string());
+                    }
+                    bytes.extend_from_slice(&data.content);
                 }
             }
-            if bytes > 0 {
-                break;
-            }
         }
-        Ok((first.unwrap_or_else(|| started.elapsed()), bytes))
+        Ok(bytes)
     }
 
     fn live_session(&self) -> Result<Arc<AppendSessionHandle>, TransportError> {
@@ -1267,14 +1270,39 @@ impl Replica for GrpcReplica {
             ..Default::default()
         };
         let request = self.request(read)?;
-        // Shadow BidiReadObject, raced alongside the authoritative read rather
-        // than replacing it. ReadObject stalls a fixed ~5.1s opening its stream
-        // on one zonal bucket, for any object and any size, while GetObject on
-        // the same object takes 35ms — so the question is whether the newer
-        // zonal read API takes a different path. Its result is discarded and
-        // it runs concurrently, so this measures without risking either
-        // correctness or latency.
-        let shadow = self.shadow_bidi_read(object.generation);
+        // BidiReadObject first. ReadObject stalls a fixed ~5.1s opening its
+        // stream against these appendable objects, independent of zone, object
+        // and size, while bidi returned the same bytes in 53ms. A bidi failure
+        // falls through to ReadObject below, so the slow path stays available
+        // and a read-path choice can never fail a recovery.
+        let bidi_started = std::time::Instant::now();
+        match self.bidi_read(object.generation).await {
+            Ok(bytes) => {
+                if bidi_started.elapsed() >= SLOW_READ_LOG_THRESHOLD {
+                    tracing::warn!(
+                        bucket = %self.bucket,
+                        object = %self.object,
+                        zone = self.zone,
+                        generation = object.generation,
+                        bytes = bytes.len(),
+                        total_ms = bidi_started.elapsed().as_secs_f64() * 1_000.0,
+                        "slow object read over bidi"
+                    );
+                }
+                return Ok(self.snapshot_from_object(object, bytes));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    bucket = %self.bucket,
+                    object = %self.object,
+                    zone = self.zone,
+                    generation = object.generation,
+                    %error,
+                    "bidi read failed; falling back to ReadObject"
+                );
+            }
+        }
+
         let open_started = std::time::Instant::now();
         let mut stream = self
             .client
@@ -1309,7 +1337,6 @@ impl Replica for GrpcReplica {
         // the phases separated: GetObject, opening the ReadObject stream, and
         // draining it are three different explanations.
         let drain = drain_started.elapsed();
-        let shadow = shadow.await;
         if started.elapsed() >= SLOW_READ_LOG_THRESHOLD {
             tracing::warn!(
                 bucket = %self.bucket,
@@ -1321,9 +1348,6 @@ impl Replica for GrpcReplica {
                 read_object_open_ms = stream_open.as_secs_f64() * 1_000.0,
                 read_object_drain_ms = drain.as_secs_f64() * 1_000.0,
                 total_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                bidi_open_ms = shadow.as_ref().ok().map(|(open, _)| open.as_secs_f64() * 1_000.0),
-                bidi_bytes = shadow.as_ref().ok().map(|(_, bytes)| *bytes),
-                bidi_error = shadow.as_ref().err().map(|message| message.as_str()),
                 "slow object read"
             );
         }
