@@ -857,10 +857,12 @@ impl QuorumVolume {
         // is timed without a single call site knowing about it.
         let replicas: Vec<Arc<dyn Replica>> = replicas
             .into_iter()
-            .map(|replica| {
+            .enumerate()
+            .map(|(zone, replica)| {
                 Arc::new(crate::transport::TimedReplica::new(
                     replica,
                     Arc::clone(&metrics),
+                    zone,
                 )) as Arc<dyn Replica>
             })
             .collect();

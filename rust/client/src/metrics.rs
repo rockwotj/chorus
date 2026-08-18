@@ -331,7 +331,7 @@ pub(crate) struct Metrics {
     /// Per-operation latency of individual provider RPCs, and the codes they
     /// fail with. Phase timings say which part of recovery is slow; these say
     /// which storage call is, which is the form a provider can act on.
-    pub(crate) rpc: TransportRpcMetrics,
+    rpc_by_zone: Vec<TransportRpcMetrics>,
     pub(crate) orphan_objects_deleted: Counter,
     pub(crate) orphan_sweeps_deferred: Counter,
     pub(crate) truncation_cycles: Counter,
@@ -374,12 +374,12 @@ pub(crate) struct TransportRpcMetrics {
 }
 
 impl TransportRpcMetrics {
-    fn register(recorder: &dyn MetricsRecorder) -> Self {
+    fn register(recorder: &dyn MetricsRecorder, zone: &str) -> Self {
         let rpc = |op: &str| {
             Histogram(recorder.register_histogram(
                 "chorus.wal.transport.rpc_seconds",
                 "Latency of one provider RPC",
-                &[("op", op)],
+                &[("op", op), ("zone", zone)],
                 LATENCY_SECONDS_BOUNDARIES,
             ))
         };
@@ -392,7 +392,7 @@ impl TransportRpcMetrics {
                         recorder,
                         "chorus.wal.transport.rpc_failures",
                         "Provider RPCs that returned an error, by provider code",
-                        &[("code", code)],
+                        &[("code", code), ("zone", zone)],
                     ),
                 )
             })
@@ -624,7 +624,9 @@ impl Metrics {
             ),
             zone_durable_lag,
             zone_seal_witness_attempts,
-            rpc: TransportRpcMetrics::register(recorder),
+            rpc_by_zone: (0..replica_count)
+                .map(|zone| TransportRpcMetrics::register(recorder, &zone.to_string()))
+                .collect(),
             rotation_state: gauge!(
                 "chorus.wal.rotation.state",
                 "Rotation gate state: 0 idle, 1 due, 2 draining, 3 sealing, 4 disabled"
@@ -661,6 +663,12 @@ impl Metrics {
         if let Some(counter) = self.zone_seal_witness_attempts.get(zone) {
             counter.increment();
         }
+    }
+
+    /// RPC handles for one replica zone. A slow provider call is only
+    /// actionable once you know whether one zone is slow or all of them are.
+    pub(crate) fn rpc(&self, zone: usize) -> Option<&TransportRpcMetrics> {
+        self.rpc_by_zone.get(zone)
     }
 
     pub(crate) fn adjust_zone_durable_lag(&self, zone: usize, delta: i64) {

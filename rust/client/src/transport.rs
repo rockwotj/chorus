@@ -394,34 +394,36 @@ impl TransportCode {
 pub(crate) struct TimedReplica {
     inner: Arc<dyn Replica>,
     metrics: Arc<crate::metrics::Metrics>,
+    zone: usize,
 }
 
 impl TimedReplica {
-    pub(crate) fn new(inner: Arc<dyn Replica>, metrics: Arc<crate::metrics::Metrics>) -> Self {
-        Self { inner, metrics }
-    }
-
-    fn record<T>(
-        &self,
-        histogram: &crate::metrics::Histogram,
-        started: std::time::Instant,
-        outcome: Result<T, TransportError>,
-    ) -> Result<T, TransportError> {
-        histogram.record_duration(started.elapsed());
-        if let Err(error) = &outcome {
-            self.metrics
-                .rpc
-                .record_failure(error.code.as_metric_label());
+    pub(crate) fn new(
+        inner: Arc<dyn Replica>,
+        metrics: Arc<crate::metrics::Metrics>,
+        zone: usize,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            zone,
         }
-        outcome
     }
 }
 
+/// Records into this replica's zone handles. A zone outside the registered
+/// range falls through untimed rather than failing an operation over a metric.
 macro_rules! timed_rpc {
     ($self:ident, $op:ident, $call:expr) => {{
         let started = std::time::Instant::now();
         let outcome = $call.await;
-        $self.record(&$self.metrics.rpc.$op, started, outcome)
+        if let Some(rpc) = $self.metrics.rpc($self.zone) {
+            rpc.$op.record_duration(started.elapsed());
+            if let Err(error) = &outcome {
+                rpc.record_failure(error.code.as_metric_label());
+            }
+        }
+        outcome
     }};
 }
 
