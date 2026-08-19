@@ -19,8 +19,16 @@ pub struct ListedObject {
     pub name: String,
     /// Immutable provider generation used for guarded deletion.
     pub generation: i64,
+    /// Object length reported by the listing. Only a finalized object has a
+    /// meaningful length here: providers hide flushed appendable bytes from
+    /// object metadata until finalization.
+    pub size: i64,
     /// Whether the provider reports the object as finalized.
     pub finalized: bool,
+    /// Provider-computed CRC32C of the complete object, when supplied. This is
+    /// the same durable checksum a `stat` returns, so a listing alone decides
+    /// whether a sealed copy matches the manifest's committed digest.
+    pub crc32c: Option<u32>,
     /// Custom metadata containing the object format marker.
     pub metadata: HashMap<String, String>,
 }

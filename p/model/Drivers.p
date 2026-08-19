@@ -190,9 +190,9 @@ machine SealedRepairDriver {
 }
 
 // An older sealed segment has one manifest-checksum-valid copy, one corrupt
-// reachable copy, and one unavailable copy. Startup must restore the corrupt
-// live zone before it declares the historical directory safe.
-machine HistoricalRecoveryRepairDriver {
+// reachable copy, and one unavailable copy. Background repair must restore the
+// corrupt live zone rather than leaving the entry on a single copy.
+machine HistoricalMaintenanceRepairDriver {
     start state Init {
         entry {
             var buckets: seq[ZonalBucket];
@@ -226,7 +226,7 @@ machine HistoricalRecoveryRepairDriver {
             assert stopped.committed && stopped.sealed;
 
             // Commit a later seal so directory[0] is historical rather than
-            // the current seal whose enforcement already runs synchronously.
+            // the current seal, which recovery still enforces synchronously.
             send manifest, eManifestRead, (caller=this,);
             receive { case eManifestReadResponse: (r: tManifestReadResponse) {
                 readResponse = r;
@@ -255,7 +255,7 @@ machine HistoricalRecoveryRepairDriver {
                 historical.id != next.sealId;
 
             // Synchronizing probes ensure the corruption and crash have been
-            // applied before the startup repair coordinator reads the zones.
+            // applied before the repair coordinator reads the zones.
             send buckets[1], eCorruptRecord, (offset=0,);
             send buckets[1], eRead, (
                 caller=this, segment=historical.base, gen=-1);
@@ -271,7 +271,7 @@ machine HistoricalRecoveryRepairDriver {
             } }
             assert objectResponse.status == STATUS_TRANSIENT;
 
-            new HistoricalRecoveryCoordinator((
+            new HistoricalMaintenanceCoordinator((
                 buckets=buckets,
                 directoryEntry=historical,
                 expectedChecksum=77,

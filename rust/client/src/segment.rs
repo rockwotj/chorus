@@ -23,7 +23,9 @@ use crate::protocol::{
     ProtocolError, QuorumVolume, RecoveredTail, RecoveryCandidate, Writer,
 };
 use crate::record::RecordFrame;
-use crate::transport::{Replica, ReplicaFactory, ReplicaSnapshot, TransportCode, TransportError};
+use crate::transport::{
+    ListedObject, Replica, ReplicaFactory, ReplicaSnapshot, TransportCode, TransportError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Quorum-derived state of one opaque segment-object id across replicas.
@@ -42,9 +44,11 @@ pub(crate) struct SegmentDescriptor {
     pub end_record_index: u64,
     /// Full-object CRC32C committed in the manifest directory.
     pub crc32c: u32,
-    /// Number of zones where listing observed the object.
+    /// Number of zones where the most recent metadata observation found the
+    /// object. Zero for an entry adopted straight from the committed manifest
+    /// directory, which recovery accepts without touching storage.
     pub copies: usize,
-    /// Number of observed copies finalized by GCS.
+    /// Number of observed copies finalized by GCS, under the same convention.
     pub finalized_copies: usize,
     /// The fold CAS committed this seal, but the maintenance task has not
     /// finalized the object yet. Repair skips it — there is no finalized
@@ -95,8 +99,8 @@ pub struct SegmentedVolume {
 
 /// Wall-clock cost of the recovery phases that finish before the replay stream
 /// is handed back. `epoch_claim` is the manifest CAS that fences prior writers;
-/// `prepare` covers directory adoption and repair, committed-seal enforcement,
-/// and the appendable-candidate takeover walk. Replay and [`Recovery::start`]
+/// `prepare` covers directory adoption, committed-seal enforcement, and the
+/// appendable-candidate takeover walk. Replay and [`Recovery::start`]
 /// are timed by the caller. This is diagnostic only and is never read on the
 /// correctness path.
 #[derive(Clone, Copy, Debug, Default)]
@@ -104,7 +108,8 @@ pub struct RecoveryTimings {
     /// Duration of the manifest claim CAS that fences prior writers.
     pub epoch_claim: Duration,
     /// Duration of directory adoption, committed-seal enforcement, and the
-    /// appendable-candidate takeover walk.
+    /// appendable-candidate takeover walk. Bounded by the write frontier: it
+    /// does not grow with the amount of sealed history the volume retains.
     pub prepare: Duration,
 }
 
@@ -112,6 +117,9 @@ pub struct RecoveryTimings {
 ///
 /// Recovery claims an epoch, adopts the directory, and walks the manifest's
 /// ordered `[tail, pending?]` candidates with takeover-before-size fencing.
+/// Adoption is a manifest-only step: the committed directory names each
+/// retained segment's range and CRC32C, so restoring a sealed segment's zonal
+/// copies belongs to background maintenance, not to startup.
 /// This stream then emits the fixed range `[from, end)`. Consume it through
 /// `None` before calling [`start`](Self::start), which resumes the takeover
 /// handle for the first empty frontier or conditionally creates the bootstrap
@@ -424,8 +432,14 @@ pub struct RepairReport {
     pub objects_repaired: usize,
     /// Zonal copies already matching the immutable sealed source.
     pub objects_already_healthy: usize,
-    /// Transiently unavailable targets left for a later pass.
+    /// Transiently unavailable targets left for a later pass, including copies
+    /// in a zone that did not answer its listing.
     pub transient_failures: usize,
+    /// Segments whose committed bytes could not be assembled from any reachable
+    /// copy, so their damaged copies stay damaged. Nothing else observes sealed
+    /// history, so a nonzero count is the only signal that committed history has
+    /// fallen below a finalized quorum.
+    pub segments_without_source: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -749,10 +763,11 @@ mod recovery {
         /// Recover the committed chain and repair immutable sealed segment copies.
         ///
         /// This volume-level primitive is intended for diagnostic and maintenance
-        /// tools that need a detailed [`RepairReport`]. Applications should run the
-        /// WAL engine, which performs the same repair automatically in the
-        /// background. The operation claims the WAL writer epoch and creates the
-        /// next active segment, just like normal recovery startup.
+        /// tools that need a detailed [`RepairReport`] on demand. Applications
+        /// should run the WAL engine, which performs the same repair in the
+        /// background; recovery itself never inspects sealed history. The
+        /// operation claims the WAL writer epoch and creates the next active
+        /// segment, just like normal recovery startup.
         pub async fn repair_sealed_segments(&self) -> Result<RepairReport, Error> {
             let mut recovery = self.recover_from_committed_floor().await?;
             while let Some(record) = recovery.next().await {
@@ -928,14 +943,26 @@ mod recovery {
             let checkpoint_floor = adopted.trunc.max(checkpoint.record_index);
             let mut sealed_segments = Vec::with_capacity(chain.len() + 1);
             for (id, base, end, crc32c) in &chain {
-                // The most recent seal may still have enforcement in flight, so
-                // recover and enforce it against the committed digest. Older
-                // entries once reached a finalized quorum, but may since have
-                // lost replicas. Before startup continues, use the directory
-                // CRC32C to find any surviving canonical copy, repair reachable
-                // missing or divergent copies, and require a restored quorum.
-                // This closes the window where startup could admit new commits
-                // while old committed history survived on only one zone.
+                // Startup cost is bounded by the write frontier, never by
+                // retained history. The committed directory is the chain
+                // authority: it already names every retained entry's range and
+                // full-object CRC32C, so adopting one costs a vector push and
+                // no object access. Zonal copies of old history may since have
+                // been lost or diverged; proving otherwise means touching every
+                // retained object, which is the cost this path must not pay.
+                // Old entries therefore enter the catalog unverified, and the
+                // background repair pass owns restoring their finalized quorum
+                // from the same committed CRC32C.
+                //
+                // The most recent seal differs in kind, not degree. The engine
+                // gates its next rotation on a seal reaching a finalized
+                // quorum, so `seal_id` is the one entry whose enforcement can
+                // still be in flight when a writer dies: its bytes may exist
+                // only as unfinalized appendable content, which no reader can
+                // consume. Replay and every later rotation depend on that one
+                // committed decision, so recovery finishes it here.
+                // `finalized_segment_descriptor` settles the healthy case from
+                // `stat` metadata alone, and there is only ever one such entry.
                 if adopted.seal_id.as_deref() == Some(id.as_str()) {
                     let expected_digest = (adopted.seal_base == Some(*base))
                         .then(|| adopted.seal_digest.clone())
@@ -952,7 +979,7 @@ mod recovery {
                         .await?;
                     sealed_segments.push(sealed);
                 } else {
-                    let mut sealed = SegmentDescriptor {
+                    sealed_segments.push(SegmentDescriptor {
                         id: id.clone(),
                         base_record_index: *base,
                         end_record_index: *end,
@@ -960,12 +987,7 @@ mod recovery {
                         copies: 0,
                         finalized_copies: 0,
                         seal_pending: false,
-                    };
-                    let healthy =
-                        restore_sealed_quorum(&self.factories, &self.prefix, &sealed).await?;
-                    sealed.copies = healthy;
-                    sealed.finalized_copies = healthy;
-                    sealed_segments.push(sealed);
+                    });
                 }
             }
 
@@ -1003,9 +1025,9 @@ mod recovery {
                     } => {
                         let active_id = fresh_id();
                         let pending_id = fresh_id();
-                        let (_, active_writer) = self.provision_segment(active_id.clone()).await?;
-                        let (_, pending_writer) =
-                            self.provision_segment(pending_id.clone()).await?;
+                        let (active_writer, pending_writer) = self
+                            .provision_frontier(active_id.clone(), pending_id.clone())
+                            .await?;
                         manifest
                             .replace_empty_frontier(
                                 Some(&tail_id),
@@ -1040,9 +1062,9 @@ mod recovery {
                     RecoveredManifestCandidate::Absent => {
                         let active_id = fresh_id();
                         let pending_id = fresh_id();
-                        let (_, active_writer) = self.provision_segment(active_id.clone()).await?;
-                        let (_, pending_writer) =
-                            self.provision_segment(pending_id.clone()).await?;
+                        let (active_writer, pending_writer) = self
+                            .provision_frontier(active_id.clone(), pending_id.clone())
+                            .await?;
                         manifest
                             .replace_empty_frontier(
                                 Some(&tail_id),
@@ -1085,10 +1107,11 @@ mod recovery {
                             | RecoveredManifestCandidate::Absent => {
                                 let active_id = fresh_id();
                                 let replacement_pending_id = fresh_id();
-                                let (_, active_writer) =
-                                    self.provision_segment(active_id.clone()).await?;
-                                let (_, pending_writer) = self
-                                    .provision_segment(replacement_pending_id.clone())
+                                let (active_writer, pending_writer) = self
+                                    .provision_frontier(
+                                        active_id.clone(),
+                                        replacement_pending_id.clone(),
+                                    )
                                     .await?;
                                 manifest
                                     .replace_empty_frontier(
@@ -1153,10 +1176,11 @@ mod recovery {
                             predecessor.enforce_seal(&self.metrics).await?;
                             let active_id = fresh_id();
                             let replacement_pending_id = fresh_id();
-                            let (_, active_writer) =
-                                self.provision_segment(active_id.clone()).await?;
-                            let (_, pending_writer) = self
-                                .provision_segment(replacement_pending_id.clone())
+                            let (active_writer, pending_writer) = self
+                                .provision_frontier(
+                                    active_id.clone(),
+                                    replacement_pending_id.clone(),
+                                )
                                 .await?;
                             manifest
                                 .fold_pending(&PendingFold {
@@ -1189,10 +1213,11 @@ mod recovery {
                                     .expect("non-empty tail produced one predecessor");
                                 let active_id = fresh_id();
                                 let replacement_pending_id = fresh_id();
-                                let (_, active_writer) =
-                                    self.provision_segment(active_id.clone()).await?;
-                                let (_, pending_writer) = self
-                                    .provision_segment(replacement_pending_id.clone())
+                                let (active_writer, pending_writer) = self
+                                    .provision_frontier(
+                                        active_id.clone(),
+                                        replacement_pending_id.clone(),
+                                    )
                                     .await?;
                                 manifest
                                     .fold_pending(&PendingFold {
@@ -1614,6 +1639,22 @@ mod recovery {
 
         fn segment_object(&self, id: &str) -> String {
             format!("{}{id}", self.segments_prefix())
+        }
+
+        /// Create both frontier objects at once. Each create already fans out
+        /// across the zones, so issuing the pair together leaves recovery's
+        /// object provisioning one round trip deep instead of two.
+        async fn provision_frontier(
+            &self,
+            active_id: String,
+            pending_id: String,
+        ) -> Result<(Writer, Writer), Error> {
+            let ((_, active), (_, pending)) = futures::future::try_join(
+                self.provision_segment(active_id),
+                self.provision_segment(pending_id),
+            )
+            .await?;
+            Ok((active, pending))
         }
 
         async fn provision_segment(&self, id: String) -> Result<(String, Writer), Error> {
@@ -2450,10 +2491,90 @@ mod maintenance {
         })
     }
 
-    /// One repair pass over `segments` at the committed `floor`: stat-precheck
-    /// every copy, re-replicate from a healthy finalized source only when a copy
-    /// is missing, rotted, or divergent. Free of writer state so the background
-    /// maintenance task can run it concurrently with appends.
+    /// Metadata-only health picture of one WAL prefix's segment objects, built
+    /// from one strongly consistent listing per zone.
+    ///
+    /// A listing costs the same one round trip per zone whatever the retained
+    /// history, and it carries everything a health decision needs: presence,
+    /// finalization, the format marker, and the provider's durable CRC32C. That
+    /// is the same checksum a `stat` returns, so a listing decides every copy of
+    /// every segment without a per-object metadata read and without a content
+    /// read.
+    struct SealedCopyIndex {
+        /// One entry per zone, in factory order. `None` marks a zone whose
+        /// listing failed: its copies are unknown for this pass, so repair
+        /// leaves them alone rather than rewriting from a guess.
+        zones: Vec<Option<HashMap<String, ListedObject>>>,
+    }
+
+    /// Health of one zonal copy as the listing describes it.
+    enum CopyHealth {
+        /// Present, finalized, well-formed, and carrying the committed CRC32C.
+        Healthy,
+        /// Absent, unfinalized, or carrying a different CRC32C.
+        Damaged,
+        /// The zone did not answer its listing.
+        Unknown,
+    }
+
+    impl SealedCopyIndex {
+        async fn build(factories: &[Arc<dyn ReplicaFactory>], prefix: &str) -> Self {
+            let objects_prefix = format!("{prefix}/segments/");
+            let listings = join_all(
+                factories
+                    .iter()
+                    .map(|factory| factory.list(&objects_prefix)),
+            )
+            .await;
+            let zones = listings
+                .into_iter()
+                .map(|listing| {
+                    listing.ok().map(|objects| {
+                        objects
+                            .into_iter()
+                            .map(|object| (object.name.clone(), object))
+                            .collect()
+                    })
+                })
+                .collect();
+            Self { zones }
+        }
+
+        fn health(&self, zone: usize, object: &str, expected_crc32c: u32) -> CopyHealth {
+            let Some(Some(listed)) = self.zones.get(zone) else {
+                return CopyHealth::Unknown;
+            };
+            match listed.get(object) {
+                Some(found)
+                    if found.finalized
+                        && valid_format(&found.metadata)
+                        && found.crc32c == Some(expected_crc32c) =>
+                {
+                    CopyHealth::Healthy
+                }
+                _ => CopyHealth::Damaged,
+            }
+        }
+    }
+
+    /// One repair pass over `segments` at the committed `floor`: assess every
+    /// copy from the zonal listings, then read bytes and re-replicate only for a
+    /// segment that actually has a damaged or missing copy. Free of writer state
+    /// so the background maintenance task can run it concurrently with appends.
+    ///
+    /// The pass is the sole owner of sealed-history durability: recovery adopts
+    /// the committed directory without touching storage, so nothing else ever
+    /// notices that an old segment dropped below a finalized quorum. One damaged
+    /// segment therefore must not end the pass — the entries after it need the
+    /// same attention — so a segment with no readable source is counted and the
+    /// walk continues.
+    ///
+    /// A listing (like a `stat`) reports the checksum the provider recorded at
+    /// write time. It identifies a missing, unfinalized, or divergent copy, and
+    /// it cannot identify a copy whose stored bytes rotted underneath an intact
+    /// recorded checksum. Such a copy fails its content read instead, which is
+    /// where replay skips it and where [`repair_sealed_copy`] recognizes it as a
+    /// target.
     pub(crate) async fn repair_sealed_pass(
         factories: &[Arc<dyn ReplicaFactory>],
         prefix: &str,
@@ -2461,6 +2582,7 @@ mod maintenance {
         floor: u64,
     ) -> Result<RepairReport, Error> {
         let mut report = RepairReport::default();
+        let index = SealedCopyIndex::build(factories, prefix).await;
         for segment in segments {
             if segment.end_record_index < floor {
                 continue;
@@ -2476,21 +2598,13 @@ mod maintenance {
             let object = segment_object(prefix, &segment.id);
             let expected_crc32c = segment.crc32c;
 
-            // Health pre-check by stat only. The committed CRC32C independently
-            // identifies every healthy copy without a content read.
             let replicas = replicas_for(factories, &object);
-            let stats = join_all(replicas.iter().map(|replica| replica.stat())).await;
             let mut targets = Vec::new();
-            for (replica, stat) in replicas.iter().zip(stats) {
-                let healthy = stat.is_ok_and(|stat| {
-                    stat.finalized
-                        && valid_format(&stat.metadata)
-                        && stat.crc32c == Some(expected_crc32c)
-                });
-                if healthy {
-                    report.objects_already_healthy += 1;
-                } else {
-                    targets.push(Arc::clone(replica));
+            for (zone, replica) in replicas.iter().enumerate() {
+                match index.health(zone, &object, expected_crc32c) {
+                    CopyHealth::Healthy => report.objects_already_healthy += 1,
+                    CopyHealth::Unknown => report.transient_failures += 1,
+                    CopyHealth::Damaged => targets.push(Arc::clone(replica)),
                 }
             }
             if targets.is_empty() {
@@ -2498,9 +2612,23 @@ mod maintenance {
             }
 
             // `seal_pending` already filtered the only segment that legitimately
-            // has no finalized copy, so a missing read quorum here is real loss
-            // and aborts the pass loudly.
-            let bytes = read_one_sealed_source(factories, &object, segment).await?;
+            // has no finalized copy, so failing to assemble a verified source
+            // here is either real loss or an unreachable quorum. Both are
+            // reported rather than silently tolerated, and neither stops the
+            // remaining entries from being repaired.
+            let bytes = match read_one_sealed_source(factories, &object, segment).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        segment_base = segment.base_record_index,
+                        segment_id = %segment.id,
+                        "sealed segment has no verifiable source to repair from"
+                    );
+                    report.segments_without_source += 1;
+                    continue;
+                }
+            };
             // a rewritten copy carries the constant creation metadata: the
             // format marker only, like every segment object
             let metadata = crate::protocol::protocol_metadata();
@@ -2521,80 +2649,6 @@ mod maintenance {
             }
         }
         Ok(report)
-    }
-
-    /// Restore one manifest-owned historical segment to a finalized quorum.
-    ///
-    /// Startup needs this stronger gate before it can admit new work, but it
-    /// need not wait for an unreachable minority once a quorum is healthy.
-    /// The manifest CRC32C identifies a surviving canonical source. Recovery
-    /// reads every reachable copy because a metadata stat can still report the
-    /// original provider checksum when the content read detects storage rot;
-    /// only finalized, well-formed bytes whose computed CRC matches count.
-    /// Each successful repair is finalized and checksum-verified before
-    /// counting.
-    pub(crate) async fn restore_sealed_quorum(
-        factories: &[Arc<dyn ReplicaFactory>],
-        prefix: &str,
-        segment: &SegmentDescriptor,
-    ) -> Result<usize, Error> {
-        let quorum = majority(factories.len());
-        let expected_crc32c = segment.crc32c;
-        let object = segment_object(prefix, &segment.id);
-        let replicas = replicas_for(factories, &object);
-        let expected_records = segment
-            .end_record_index
-            .checked_sub(segment.base_record_index)
-            .and_then(|span| span.checked_add(1))
-            .ok_or_else(|| {
-                Error::InvalidCatalog(format!(
-                    "sealed segment {} has no valid committed end",
-                    segment.base_record_index
-                ))
-            })?;
-        let snapshots = join_all(replicas.iter().map(|replica| replica.snapshot())).await;
-        let mut healthy = 0;
-        let mut repair_targets = Vec::new();
-        let mut canonical = None;
-        for (replica, snapshot) in replicas.iter().zip(snapshots) {
-            match snapshot {
-                Ok(snapshot)
-                    if snapshot.crc32c == Some(expected_crc32c)
-                        && crc32c::crc32c(&snapshot.bytes) == expected_crc32c
-                        && decoded_sealed_snapshot(&snapshot, expected_records).is_some() =>
-                {
-                    healthy += 1;
-                    canonical.get_or_insert(snapshot.bytes);
-                }
-                _ => repair_targets.push(Arc::clone(replica)),
-            }
-        }
-        if healthy >= quorum {
-            return Ok(healthy);
-        }
-
-        let bytes = canonical.ok_or(Error::NoReadQuorum)?;
-        let metadata = crate::protocol::protocol_metadata();
-        for replica in repair_targets {
-            match repair_sealed_copy(
-                &replica,
-                Bytes::from(bytes.clone()),
-                metadata.clone(),
-                expected_crc32c,
-            )
-            .await
-            {
-                Ok(_) => {
-                    healthy += 1;
-                    if healthy >= quorum {
-                        return Ok(healthy);
-                    }
-                }
-                Err(error) if error.code.transient() => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(Error::NoReadQuorum)
     }
 
     /// One floor-committed truncation pass, free of writer state so the
@@ -2930,8 +2984,8 @@ mod maintenance {
 }
 
 pub(crate) use maintenance::{
-    cleanup_tombstones_pass, enforce_committed_seal, repair_sealed_pass, restore_sealed_quorum,
-    sweep_dead_segments, truncate_pass,
+    cleanup_tombstones_pass, enforce_committed_seal, repair_sealed_pass, sweep_dead_segments,
+    truncate_pass,
 };
 
 fn replay_records(

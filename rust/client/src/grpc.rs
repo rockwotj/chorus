@@ -1198,12 +1198,19 @@ impl ReplicaFactory for GrpcReplicaFactory {
                 .await
                 .map_err(|status| replica.status(status))?
                 .into_inner();
-            listed.extend(response.objects.into_iter().map(|object| ListedObject {
-                zone: self.zone,
-                name: object.name,
-                generation: object.generation,
-                finalized: object.finalize_time.is_some(),
-                metadata: object.metadata,
+            listed.extend(response.objects.into_iter().map(|object| {
+                ListedObject {
+                    zone: self.zone,
+                    name: object.name,
+                    generation: object.generation,
+                    size: object.size,
+                    finalized: object.finalize_time.is_some(),
+                    crc32c: object
+                        .checksums
+                        .as_ref()
+                        .and_then(|checksums| checksums.crc32c),
+                    metadata: object.metadata,
+                }
             }));
             if response.next_page_token.is_empty() {
                 return Ok(listed);

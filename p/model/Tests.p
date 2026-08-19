@@ -43,13 +43,13 @@ test tcImmutableSealedRepair [main=SealedRepairDriver]:
     (union { WriterProcess }, { SealedRepairCoordinator }, { ZonalBucket },
         { ManifestRegister }, { SealedRepairDriver });
 
-test tcHistoricalRecoveryRepair [main=HistoricalRecoveryRepairDriver]:
+test tcHistoricalMaintenanceRepair [main=HistoricalMaintenanceRepairDriver]:
     assert QuorumLinearizability, SingleWriterPerSegment, SealAndPrefixSafety,
         ManifestSafety, PendingRegistrationSafety, DirectoryStructure,
-        DirectoryEnforcement, HistoricalRecoveryQuorum in
-    (union { WriterProcess }, { HistoricalRecoveryCoordinator },
+        DirectoryEnforcement, HistoricalMaintenanceQuorum in
+    (union { WriterProcess }, { HistoricalMaintenanceCoordinator },
         { ZonalBucket }, { ManifestRegister },
-        { HistoricalRecoveryRepairDriver });
+        { HistoricalMaintenanceRepairDriver });
 
 test tcGetSizeExcludesOpenTail [main=GetSizeDriver]:
     assert QuorumLinearizability, SingleWriterPerSegment,
