@@ -356,6 +356,189 @@ pub trait Replica: Send + Sync {
     async fn shutdown(&self) {}
 }
 
+impl TransportCode {
+    /// Stable label for the failure counter. Matches the variant name so a
+    /// metric reads the same as the code in a log line.
+    pub(crate) fn as_metric_label(&self) -> &'static str {
+        match self {
+            TransportCode::NotFound => "NotFound",
+            TransportCode::AlreadyExists => "AlreadyExists",
+            TransportCode::InvalidArgument => "InvalidArgument",
+            TransportCode::FailedPrecondition => "FailedPrecondition",
+            TransportCode::Aborted => "Aborted",
+            TransportCode::OutOfRange => "OutOfRange",
+            TransportCode::ResourceExhausted => "ResourceExhausted",
+            TransportCode::Unimplemented => "Unimplemented",
+            TransportCode::DataLoss => "DataLoss",
+            TransportCode::Ambiguous => "Ambiguous",
+            TransportCode::Unauthenticated => "Unauthenticated",
+            TransportCode::PermissionDenied => "PermissionDenied",
+            TransportCode::Unavailable => "Unavailable",
+            TransportCode::DeadlineExceeded => "DeadlineExceeded",
+            TransportCode::Internal => "Internal",
+        }
+    }
+}
+
+/// Wraps a replica so every provider RPC reports its latency and, on failure,
+/// the code the provider returned.
+///
+/// Phase timings locate the slow part of recovery; they cannot say which
+/// storage call is slow, which is the only form a storage provider can act on.
+/// Applied once where a `QuorumVolume` is built, so no call site changes and no
+/// operation can be forgotten.
+///
+/// The lane methods (`lane_send`, `lane_send_packed`, `lane_durable_change`,
+/// `append`) delegate untimed: they run per chunk on the append hot path,
+/// where their cost is already covered by `chorus.wal.append.commit_latency`.
+pub(crate) struct TimedReplica {
+    inner: Arc<dyn Replica>,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl TimedReplica {
+    pub(crate) fn new(inner: Arc<dyn Replica>, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        Self { inner, metrics }
+    }
+
+    fn record<T>(
+        &self,
+        histogram: &crate::metrics::Histogram,
+        started: std::time::Instant,
+        outcome: Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        histogram.record_duration(started.elapsed());
+        if let Err(error) = &outcome {
+            self.metrics
+                .rpc
+                .record_failure(error.code.as_metric_label());
+        }
+        outcome
+    }
+}
+
+macro_rules! timed_rpc {
+    ($self:ident, $op:ident, $call:expr) => {{
+        let started = std::time::Instant::now();
+        let outcome = $call.await;
+        $self.record(&$self.metrics.rpc.$op, started, outcome)
+    }};
+}
+
+#[async_trait]
+impl Replica for TimedReplica {
+    async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(self, snapshot, self.inner.snapshot())
+    }
+
+    async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(self, stat, self.inner.stat())
+    }
+
+    async fn create_appendable(
+        &self,
+        metadata: HashMap<String, String>,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(
+            self,
+            create_appendable,
+            self.inner.create_appendable(metadata)
+        )
+    }
+
+    async fn create_append_session(
+        &self,
+        metadata: HashMap<String, String>,
+    ) -> Result<AppendToken, TransportError> {
+        timed_rpc!(
+            self,
+            create_append_session,
+            self.inner.create_append_session(metadata)
+        )
+    }
+
+    async fn create_register(
+        &self,
+        metadata: HashMap<String, String>,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(self, create_register, self.inner.create_register(metadata))
+    }
+
+    async fn update_register(
+        &self,
+        metageneration: i64,
+        metadata: HashMap<String, String>,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(
+            self,
+            update_register,
+            self.inner.update_register(metageneration, metadata)
+        )
+    }
+
+    async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
+        timed_rpc!(self, resume_tail, self.inner.resume_tail(token))
+    }
+
+    async fn takeover(&self, observed: &ReplicaSnapshot) -> Result<AppendToken, TransportError> {
+        timed_rpc!(self, takeover, self.inner.takeover(observed))
+    }
+
+    async fn replace_appendable(
+        &self,
+        observed: &ReplicaSnapshot,
+        data: Bytes,
+        metadata: HashMap<String, String>,
+    ) -> Result<AppendToken, TransportError> {
+        timed_rpc!(
+            self,
+            replace_appendable,
+            self.inner.replace_appendable(observed, data, metadata)
+        )
+    }
+
+    async fn append(
+        &self,
+        token: &AppendToken,
+        write_offset: i64,
+        data: Vec<u8>,
+    ) -> Result<i64, TransportError> {
+        self.inner.append(token, write_offset, data).await
+    }
+
+    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
+        self.inner.lane_send(write_offset, chunks).await
+    }
+
+    async fn lane_send_packed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.inner.lane_send_packed(write_offset, packed).await
+    }
+
+    async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError> {
+        self.inner.lane_durable_change(seen).await
+    }
+
+    async fn delete(&self, generation: i64) -> Result<(), TransportError> {
+        timed_rpc!(self, delete, self.inner.delete(generation))
+    }
+
+    async fn finalize(
+        &self,
+        token: &mut AppendToken,
+        write_offset: i64,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        timed_rpc!(self, finalize, self.inner.finalize(token, write_offset))
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TransportCode;
