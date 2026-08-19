@@ -956,11 +956,13 @@ machine SealedRepairCoordinator {
     }
 }
 
-// Startup repair for one historical manifest-directory entry. The production
+// Background repair for one historical manifest-directory entry. The production
 // directory carries a CRC32C; `expectedChecksum` is its equality-only model
-// surrogate. Recovery may source repair from one exact checksum match, but
-// readiness still requires a restored quorum.
-machine HistoricalRecoveryCoordinator {
+// surrogate. Repair may source from one exact checksum match, but it must leave
+// a restored quorum behind. Production decides which entries reach this point
+// from object metadata alone; the model reads content because it has no
+// metadata-checksum surrogate.
+machine HistoricalMaintenanceCoordinator {
     start state Run {
         entry (payload: (
             buckets: seq[ZonalBucket],
@@ -1023,7 +1025,7 @@ machine HistoricalRecoveryCoordinator {
                     }
                 }
             }
-            announce eHistoricalRecoveryReady, (
+            announce eHistoricalMaintenanceRepaired, (
                 segment=payload.directoryEntry.base,
                 checksum=payload.expectedChecksum,
                 healthyZones=healthy);

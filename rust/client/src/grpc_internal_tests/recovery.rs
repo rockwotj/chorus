@@ -260,12 +260,12 @@ async fn recovery_repairs_a_lagging_prior_segment_before_the_active_segment() {
 }
 
 #[tokio::test]
-async fn recovery_repairs_historical_segment_to_quorum_before_returning() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
+async fn recovery_adopts_a_historical_segment_without_reading_it() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(
         factories.clone(),
         manifest_factory.clone(),
-        "startup-historical-repair-wal",
+        "startup-historical-adopt-wal",
     );
     let mut writer = volume.recover_writer().await.unwrap();
     append_one(&mut writer, b"historical").await;
@@ -279,29 +279,36 @@ async fn recovery_repairs_historical_segment_to_quorum_before_returning() {
         writer.catalog().last().map(|segment| segment.id.as_str()),
         "the test must damage an older directory entry, not the current seal"
     );
-    let object = segment_object("startup-historical-repair-wal", &historical.id);
-    let missing = factories[1].replica(&object);
-    let generation = missing.snapshot().await.unwrap().generation;
-    missing.delete(generation).await.unwrap();
-    servers[0].service.set_crashed(true).await;
+    // Every copy of the oldest entry disappears. The committed directory still
+    // names its range and CRC32C, so recovery has everything it needs to adopt
+    // the chain; a startup that consulted storage instead could not proceed.
+    let object = segment_object("startup-historical-adopt-wal", &historical.id);
+    for factory in &factories {
+        let replica = factory.replica(&object);
+        let generation = replica.snapshot().await.unwrap().generation;
+        replica.delete(generation).await.unwrap();
+    }
     drop(writer);
 
-    let recovered = volume.recover_writer().await.unwrap();
+    let recovered = volume
+        .recover_writer_from(WalSeqNo::record(2))
+        .await
+        .unwrap();
     assert_eq!(recovered.active_segment_base(), 2);
-
-    let repaired = missing.snapshot().await.unwrap();
-    assert!(repaired.finalized);
-    assert_eq!(repaired.crc32c, historical.crc32c);
-    assert_eq!(crc32c::crc32c(&repaired.bytes), historical.crc32c.unwrap());
+    assert_eq!(
+        recovered.catalog()[0].id,
+        historical.id,
+        "the unreadable entry stays in the chain for background repair"
+    );
 }
 
 #[tokio::test]
-async fn recovery_repairs_bit_rotted_historical_segment_before_returning() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let volume = volume(
+async fn maintenance_restores_a_historical_segment_recovery_left_damaged() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let (volume, metrics) = volume_with_metrics(
         factories.clone(),
         manifest_factory.clone(),
-        "startup-historical-rot-repair-wal",
+        "startup-historical-repair-wal",
     );
     let mut writer = volume.recover_writer().await.unwrap();
     append_one(&mut writer, b"historical").await;
@@ -310,23 +317,74 @@ async fn recovery_repairs_bit_rotted_historical_segment_before_returning() {
     writer.rotate().await.unwrap();
 
     let historical = writer.catalog()[0].clone();
-    let object = segment_object("startup-historical-rot-repair-wal", &historical.id);
+    let object = segment_object("startup-historical-repair-wal", &historical.id);
+    let missing = factories[1].replica(&object);
+    let generation = missing.snapshot().await.unwrap().generation;
+    missing.delete(generation).await.unwrap();
+    drop(writer);
+
+    let recovered = volume.recover_writer().await.unwrap();
+    assert_eq!(recovered.active_segment_base(), 2);
+    assert_eq!(
+        missing.snapshot().await.unwrap_err().code,
+        TransportCode::NotFound,
+        "recovery must not spend startup time restoring sealed history"
+    );
+
+    let handle = WalEngine::start(
+        recovered,
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    wait_for_repair_passes(&metrics, 1).await;
+    assert_eq!(metrics.counter("chorus.wal.repair.objects_repaired"), 1);
+    assert_eq!(
+        metrics.counter("chorus.wal.repair.segments_without_source"),
+        0
+    );
+
+    let repaired = missing.snapshot().await.unwrap();
+    assert!(repaired.finalized);
+    assert_eq!(repaired.crc32c, historical.crc32c);
+    assert_eq!(crc32c::crc32c(&repaired.bytes), historical.crc32c.unwrap());
+    shutdown_engine(handle).await;
+}
+
+#[tokio::test]
+async fn replay_reads_past_a_rotted_historical_copy() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "startup-historical-rot-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"historical").await;
+    writer.rotate().await.unwrap();
+    append_one(&mut writer, b"current-seal").await;
+    writer.rotate().await.unwrap();
+
+    let historical = writer.catalog()[0].clone();
+    let object = segment_object("startup-historical-rot-wal", &historical.id);
+    // Rot leaves the recorded checksum intact and fails the content read, so no
+    // listing or stat can see it. The read path is what notices: it verifies
+    // every copy it consumes against the committed CRC32C and takes the next
+    // one.
     assert!(
         servers[1]
             .service
             .corrupt_byte_for("projects/_/buckets/zone-1", &object, 0)
             .await
     );
-    servers[0].service.set_crashed(true).await;
     drop(writer);
 
-    let recovered = volume.recover_writer().await.unwrap();
-    assert_eq!(recovered.active_segment_base(), 2);
-
-    let repaired = factories[1].replica(&object).snapshot().await.unwrap();
-    assert!(repaired.finalized);
-    assert_eq!(repaired.crc32c, historical.crc32c);
-    assert_eq!(crc32c::crc32c(&repaired.bytes), historical.crc32c.unwrap());
+    let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
+    assert_eq!(end, WalSeqNo::record(2));
+    assert_eq!(records[0].payload, b"historical".as_slice());
+    assert_eq!(records[1].payload, b"current-seal".as_slice());
 }
 
 #[tokio::test]
@@ -362,7 +420,7 @@ async fn rejoined_zone_receives_only_immutable_sealed_segment_repair() {
 }
 
 #[tokio::test]
-async fn repair_uses_stat_crc32c_to_target_same_size_divergence() {
+async fn repair_uses_the_listing_crc32c_to_target_same_size_divergence() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(
         factories.clone(),
@@ -403,6 +461,12 @@ async fn repair_uses_stat_crc32c_to_target_same_size_divergence() {
     assert_eq!(servers[0].service.operation_count(Operation::Read).await, 1);
     assert_eq!(servers[1].service.operation_count(Operation::Read).await, 0);
     assert!(servers[2].service.operation_count(Operation::Read).await >= 1);
+    // One listing per zone answers the health question for the whole chain, so
+    // an untouched copy costs no per-object metadata read at all.
+    for server in &servers[..3] {
+        assert_eq!(server.service.operation_count(Operation::List).await, 1);
+    }
+    assert_eq!(servers[1].service.operation_count(Operation::Get).await, 0);
 
     let repaired = factories[2]
         .replica(&sealed_object)
@@ -411,6 +475,84 @@ async fn repair_uses_stat_crc32c_to_target_same_size_divergence() {
         .unwrap();
     assert_eq!(repaired.bytes, canonical.bytes);
     assert_eq!(repaired.crc32c, segment.crc32c);
+}
+
+#[tokio::test]
+async fn repair_lists_each_zone_once_regardless_of_retained_history() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "repair-listing-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    for payload in [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+    ] {
+        append_one(&mut writer, payload).await;
+        writer.rotate().await.unwrap();
+    }
+    // three sealed entries plus the open frontier the last rotation installed
+    assert_eq!(writer.catalog().len(), 4);
+    let damaged = writer.catalog()[1].clone();
+    let object = segment_object("repair-listing-wal", &damaged.id);
+    let missing = factories[2].replica(&object);
+    let generation = missing.snapshot().await.unwrap().generation;
+    missing.delete(generation).await.unwrap();
+
+    for server in &servers[..3] {
+        server.service.reset_operation_counts().await;
+    }
+    let report = writer.repair_sealed_segments().await.unwrap();
+    assert_eq!(report.segments_examined, 3);
+    assert_eq!(report.objects_repaired, 1);
+    assert_eq!(report.objects_already_healthy, 8);
+    assert_eq!(report.segments_without_source, 0);
+    for server in &servers[..3] {
+        assert_eq!(server.service.operation_count(Operation::List).await, 1);
+    }
+    // Only the one segment that needs a source is read at all, and a zone whose
+    // copies are all intact answers no per-object question whatsoever.
+    assert_eq!(servers[0].service.operation_count(Operation::Read).await, 1);
+    assert_eq!(servers[1].service.operation_count(Operation::Read).await, 0);
+    assert_eq!(servers[1].service.operation_count(Operation::Get).await, 0);
+}
+
+#[tokio::test]
+async fn repair_reports_a_segment_with_no_verifiable_copy_and_keeps_going() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "repair-lost-segment-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    for payload in [b"lost".as_slice(), b"kept".as_slice()] {
+        append_one(&mut writer, payload).await;
+        writer.rotate().await.unwrap();
+    }
+    let lost = writer.catalog()[0].clone();
+    let kept = writer.catalog()[1].clone();
+    let lost_object = segment_object("repair-lost-segment-wal", &lost.id);
+    for factory in &factories {
+        let replica = factory.replica(&lost_object);
+        let generation = replica.snapshot().await.unwrap().generation;
+        replica.delete(generation).await.unwrap();
+    }
+    let kept_object = segment_object("repair-lost-segment-wal", &kept.id);
+    let missing = factories[2].replica(&kept_object);
+    let generation = missing.snapshot().await.unwrap().generation;
+    missing.delete(generation).await.unwrap();
+
+    // Nothing else inspects sealed history, so an unrecoverable entry must be
+    // counted rather than swallowed, and must not stop the entries after it
+    // from being restored.
+    let report = writer.repair_sealed_segments().await.unwrap();
+    assert_eq!(report.segments_without_source, 1);
+    assert_eq!(report.objects_repaired, 1);
+    assert!(missing.snapshot().await.unwrap().finalized);
 }
 
 /// Maintenance runs on its own task; poll until `minimum` passes complete.

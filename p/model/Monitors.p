@@ -597,16 +597,19 @@ spec DirectoryEnforcement observes eSealQuorumEnforced, eDirectoryAdopted,
     }
 }
 
-// Recovery may trust one finalized historical copy only because the manifest
-// checksum identifies its exact bytes. It must copy those bytes to another
-// reachable zone and restore a quorum before admitting new work.
-spec HistoricalRecoveryQuorum observes eHistoricalRecoveryReady {
+// Repair may trust one finalized historical copy only because the manifest
+// checksum identifies its exact bytes. Whenever it acts on a directory entry it
+// must copy those bytes to another reachable zone and leave a restored quorum
+// behind. Recovery does not observe this: sealed history is repaired by
+// background maintenance, and a startup that waited on it would pay a cost
+// proportional to retained history.
+spec HistoricalMaintenanceQuorum observes eHistoricalMaintenanceRepaired {
     start state Observing {
-        on eHistoricalRecoveryReady do (payload: (
+        on eHistoricalMaintenanceRepaired do (payload: (
             segment: int, checksum: int, healthyZones: set[int]
         )) {
             assert sizeof(payload.healthyZones) >= 2,
-                "startup completed with historical data on fewer than two zones";
+                "repair finished with historical data on fewer than two zones";
         }
     }
 }

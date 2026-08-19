@@ -328,6 +328,7 @@ pub(crate) struct Metrics {
     pub(crate) repair_passes: Counter,
     pub(crate) repair_objects_repaired: Counter,
     pub(crate) repair_transient_skips: Counter,
+    pub(crate) repair_segments_without_source: Counter,
     pub(crate) repair_failures: Counter,
     pub(crate) recoveries_run: Counter,
     pub(crate) recovery_segments_adopted: Counter,
@@ -530,6 +531,10 @@ impl Metrics {
             repair_transient_skips: counter!(
                 "chorus.wal.repair.transient_skips",
                 "Repair targets skipped after transient failures"
+            ),
+            repair_segments_without_source: counter!(
+                "chorus.wal.repair.segments_without_source",
+                "Sealed segments left unrepaired because no reachable copy verified"
             ),
             repair_failures: counter!(
                 "chorus.wal.repair.failures",
