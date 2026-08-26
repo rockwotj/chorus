@@ -16,7 +16,7 @@ exclude = ["src/grpc_internal_tests.rs", "src/grpc_internal_tests/**", "tests/**
 [features]
 default = []
 probe-support = []
-# Internal capacity introspection used by the deterministic simulation harness.
+# Internal capacity introspection and event counters for deterministic simulation.
 dst-support = []
 
 [dependencies]

@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn maintenance_sweeps_dead_spares_without_failing_recovery() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
-    let (volume, metrics) = volume_with_metrics(
+    let volume = volume(
         factories.clone(),
         manifest_factory.clone(),
         "spare-sweep-wal",
@@ -62,8 +62,21 @@ async fn maintenance_sweeps_dead_spares_without_failing_recovery() {
         })
         .await
         .expect("orphan deletion failure must not fail recovery");
-    wait_for_counter(&metrics, "chorus.wal.orphan.sweeps_deferred", 1).await;
-    wait_for_counter(&metrics, "chorus.wal.orphan.objects_deleted", 3).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for factory in &factories {
+            let replica = factory.replica(&segment_object("spare-sweep-wal", &dead_spare));
+            loop {
+                match replica.stat().await {
+                    Err(error) if error.code == TransportCode::NotFound => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected spare stat failure: {error}"),
+                }
+            }
+        }
+    })
+    .await
+    .expect("the dead spare was not swept after the injected delete failure");
+    assert_eq!(servers[0].service.observed_fault_count().await, 1);
 
     for factory in &factories {
         assert_eq!(

@@ -79,9 +79,6 @@ async fn caller_numbered_appends_admit_in_order_and_refill_the_pipeline() {
         assert_eq!(receipt.next_seqno(), WalSeqNo::record(seqno as u64 + 1));
     }
     assert_eq!(metrics.counter("chorus.wal.append.committed_records"), 64);
-    // No refill-count assertion: the engine drains completion bursts and
-    // refills in batches, so a small fast pipeline may never refill while
-    // records are still outstanding.
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -169,15 +166,10 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
             );
         }
         panic!(
-            "latency pipeline timed out: completed={completed}/{RECORDS} rate={records_per_second:.1}/s rotation_state={} rotations={} max_inflight={} provision_attempts={} provision_failures={} operation_failures={} manifest_cas={} manifest_conflicts={}",
-            metrics.gauge("chorus.wal.rotation.state"),
-            metrics.counter("chorus.wal.rotation.completed"),
-            metrics.gauge("chorus.wal.pipeline.max_inflight_records"),
-            metrics.counter("chorus.wal.rotation.spare_provisioning_attempts"),
-            metrics.counter("chorus.wal.rotation.spare_provisioning_failures"),
-            metrics.counter("chorus.wal.operation.failures"),
-            metrics.counter("chorus.wal.manifest.cas_attempts"),
-            metrics.counter("chorus.wal.manifest.cas_conflicts"),
+            "latency pipeline timed out: completed={completed}/{RECORDS} rate={records_per_second:.1}/s queue_depth={} seals={} append_failures={}",
+            metrics.gauge("chorus.wal.pipeline.queue_depth"),
+            metrics.counter("chorus.wal.seal.segments"),
+            metrics.counter("chorus.wal.append.failures"),
         );
     }
     let creates = servers[0]
@@ -186,12 +178,7 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
         .await;
     let folds = servers[3].service.operation_count(Operation::Update).await;
     eprintln!(
-        "latency pipeline: records={RECORDS} elapsed={elapsed:?} rate={records_per_second:.1}/s max_inflight={} creates_per_zone={creates} manifest_updates={folds}",
-        metrics.gauge("chorus.wal.pipeline.max_inflight_records"),
-    );
-    assert!(
-        metrics.gauge("chorus.wal.pipeline.max_inflight_records") >= 32,
-        "commit path did not fill a healthy pipeline"
+        "latency pipeline: records={RECORDS} elapsed={elapsed:?} rate={records_per_second:.1}/s creates_per_zone={creates} manifest_updates={folds}"
     );
     assert!(
         records_per_second >= OFFERED_RATE * 0.75,
@@ -199,13 +186,13 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
     );
     shutdown_engine(handle).await;
     assert!(
-        metrics.counter("chorus.wal.rotation.completed") >= 2,
+        metrics.counter("chorus.wal.seal.segments") >= 2,
         "loaded run did not complete multiple rotations"
     );
     assert_eq!(
-        metrics.counter("chorus.wal.operation.failures"),
+        metrics.counter("chorus.wal.append.failures"),
         0,
-        "loaded run encountered an internal operation failure"
+        "loaded run encountered an append failure"
     );
 }
 
@@ -242,9 +229,7 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
                 .await
                 .unwrap();
         }
-        while metrics.counter("chorus.wal.rotation.completed") < 2
-            || metrics.counter("chorus.wal.seal.segments") < 2
-        {
+        while metrics.counter("chorus.wal.seal.segments") < 2 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -252,27 +237,21 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
     if result.is_err() {
         let manifest_updates = servers[3].service.operation_count(Operation::Update).await;
         panic!(
-            "queue-depth-one append wedged under service latency: rotation_state={} rotations={} provisions={} failures={} manifest_updates={}",
-            metrics.gauge("chorus.wal.rotation.state"),
-            metrics.counter("chorus.wal.rotation.completed"),
-            metrics.counter("chorus.wal.rotation.spare_provisioning_attempts"),
-            metrics.counter("chorus.wal.rotation.spare_provisioning_failures"),
-            manifest_updates,
+            "queue-depth-one append wedged under service latency: seals={} queue_depth={} append_failures={} manifest_updates={manifest_updates}",
+            metrics.counter("chorus.wal.seal.segments"),
+            metrics.gauge("chorus.wal.pipeline.queue_depth"),
+            metrics.counter("chorus.wal.append.failures"),
         );
     }
     shutdown_engine(handle).await;
-    let rotations = metrics.counter("chorus.wal.rotation.completed");
+    let rotations = metrics.counter("chorus.wal.seal.segments");
     eprintln!(
-        "latency qd1: rotations={rotations} creates_per_zone={} manifest_updates={} operation_failures={} repair_failures={} seal_retries={} spare_failures={} append_failures={}",
+        "latency qd1: seals={rotations} creates_per_zone={} manifest_updates={} append_failures={}",
         servers[0]
             .service
             .operation_count(Operation::BidiCreate)
             .await,
         servers[3].service.operation_count(Operation::Update).await,
-        metrics.counter("chorus.wal.operation.failures"),
-        metrics.counter("chorus.wal.repair.failures"),
-        metrics.counter("chorus.wal.seal.enforcement_retries"),
-        metrics.counter("chorus.wal.rotation.spare_provisioning_failures"),
         metrics.counter("chorus.wal.append.failures"),
     );
     assert!(
@@ -280,9 +259,9 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
         "queue-depth-one run completed only {rotations} rotations"
     );
     assert_eq!(
-        metrics.counter("chorus.wal.operation.failures"),
+        metrics.counter("chorus.wal.append.failures"),
         0,
-        "queue-depth-one run encountered an internal operation failure"
+        "queue-depth-one run encountered an append failure"
     );
 }
 
@@ -542,7 +521,7 @@ async fn admission_requires_manifest_room_to_seal_the_active_segment() {
 #[tokio::test]
 async fn admission_waits_for_the_encoded_inflight_byte_budget() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
-    let (volume, metrics) = volume_with_metrics(factories, manifest_factory, "byte-budget-wal");
+    let volume = volume(factories, manifest_factory, "byte-budget-wal");
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
@@ -579,7 +558,6 @@ async fn admission_waits_for_the_encoded_inflight_byte_budget() {
     };
     first.await.unwrap();
     second.await.unwrap();
-    assert_eq!(metrics.gauge("chorus.wal.pipeline.max_inflight_bytes"), 9);
     shutdown_engine(handle).await;
 }
 
@@ -606,7 +584,7 @@ async fn queue_capacity_bounds_channel_and_engine_queue_together() {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while metrics.gauge("chorus.wal.pipeline.max_inflight_records") != 1 {
+        while metrics.labeled_gauge("chorus.wal.replica.durable_lag_bytes", &[("zone", "0")]) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -690,49 +668,6 @@ async fn lagging_replica_is_dropped_at_its_retained_byte_budget() {
 }
 
 #[tokio::test]
-async fn attempted_byte_metrics_include_transport_retries() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let (volume, metrics) =
-        volume_with_metrics(factories, manifest_factory.clone(), "attempted-bytes-wal");
-    let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
-    while recovery.try_next().await.unwrap().is_some() {}
-    let mut handle = recovery
-        .start(WalEngineConfig {
-            max_segment_bytes: 1,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    servers[0]
-        .service
-        .inject(Operation::BidiWrite, Code::Unavailable)
-        .await;
-    handle
-        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"retry"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
-
-    // The injected lane failure retries after a backoff on a zone the
-    // commit quorum never waited for; poll until the retried chunk's bytes
-    // are attempted. The wait is wall-clock-bounded like
-    // `wait_for_repair_passes`, not iteration-bounded.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while metrics.counter("chorus.wal.replica.bytes_attempted") < 9 * 4 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the zone 0 lane never attempted the retried chunk");
-    handle.truncate_before(WalSeqNo::ZERO).await.unwrap();
-    assert_eq!(metrics.counter("chorus.wal.append.encoded_bytes"), 9);
-    assert_eq!(metrics.counter("chorus.wal.replica.bytes_attempted"), 9 * 4);
-    assert!(metrics.counter("chorus.wal.lane.retries") >= 1);
-    shutdown_engine(handle).await;
-}
-
-#[tokio::test]
 async fn clean_rotation_avoids_followup_content_reads() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(factories, manifest_factory, "rotation-rpc-wal");
@@ -806,7 +741,7 @@ async fn rotation_refuses_to_cross_an_uncommitted_tail_gap() {
     }
     servers[0].service.permit_held_flushes(1).await;
     let pending = writer
-        .enqueue_records(vec![record(b"r1")], no_attempted_bytes())
+        .enqueue_records(vec![record(b"r1")])
         .await
         .unwrap()
         .remove(0);
@@ -1302,7 +1237,7 @@ async fn rotation_targets_repair_at_a_copy_missing_finalization() {
 
     // A crashed zone makes the rotation seal finalize only a quorum: the
     // engine must schedule a targeted repair pass for the one degraded
-    // copy (which records a transient skip while the zone stays down).
+    // copy even while the zone stays down.
     servers[2].service.set_crashed(true).await;
     handle
         .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"sealed"))
@@ -1317,7 +1252,6 @@ async fn rotation_targets_repair_at_a_copy_missing_finalization() {
     })
     .await
     .expect("the degraded rotation never scheduled its targeted repair pass");
-    assert!(metrics.counter("chorus.wal.repair.transient_skips") >= 1);
     assert_eq!(metrics.counter("chorus.wal.seal.segments"), 1);
 
     servers[2].service.set_crashed(false).await;
@@ -1330,7 +1264,7 @@ async fn transient_seal_enforcement_failure_retries_without_gating_rotation() {
     let metrics = Arc::new(TestMetricsRecorder::default());
     let metrics_recorder: Arc<dyn crate::MetricsRecorder> = metrics.clone();
     // The shared test config has zero backoff, which can exhaust all outer
-    // maintenance retries before this task observes the first retry counter.
+    // maintenance retries before this task observes the next storage attempt.
     // A small test-only delay leaves the retry in flight while quorum returns.
     let volume = SegmentedVolume::new_with_factories_and_metrics_recorder(
         factories,
@@ -1374,10 +1308,22 @@ async fn transient_seal_enforcement_failure_retries_without_gating_rotation() {
     .await
     .expect("background fold did not reach the manifest update");
     for zone in [0usize, 1] {
+        servers[zone].service.reset_operation_counts().await;
         servers[zone].service.set_crashed(true).await;
     }
 
-    wait_for_counter(&metrics, "chorus.wal.seal.enforcement_retries", 1).await;
+    // Each failed recovery exhausts max_retries + 1 identity reads. First
+    // Writer::seal exhausts its storage fallback, then maintenance exhausts
+    // its first enforcement attempt. The next read proves an outer retry
+    // actually started, without retaining a production retry counter.
+    let retry_read = 2 * (test_config().max_retries as u64 + 1) + 1;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while servers[0].service.operation_count(Operation::Get).await < retry_read {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed seal enforcement did not retry after losing quorum");
     for zone in [0usize, 1] {
         servers[zone].service.set_crashed(false).await;
     }
@@ -1426,31 +1372,14 @@ async fn recorder_receives_write_and_seal_metrics() {
     .await
     .expect("automatic rotation did not seal a segment");
 
-    assert_eq!(metrics.counter("chorus.wal.append.records"), 1);
-    assert_eq!(metrics.counter("chorus.wal.append.bytes"), 6);
     assert_eq!(metrics.counter("chorus.wal.append.committed_records"), 1);
-    assert_eq!(metrics.gauge("chorus.wal.append.committed_watermark"), 1);
-    assert_eq!(metrics.counter("chorus.wal.batch.sent"), 1);
-    assert!(
-        metrics.counter("chorus.wal.append.encoded_bytes")
-            > metrics.counter("chorus.wal.append.bytes")
-    );
-    assert_eq!(metrics.counter("chorus.wal.rotation.completed"), 1);
-    assert_eq!(metrics.counter("chorus.wal.seal.segments"), 1);
-    assert!(metrics.counter("chorus.wal.manifest.cas_attempts") >= 2);
-    assert_eq!(metrics.counter("chorus.wal.repair.passes"), 1);
-    assert_eq!(
-        metrics.up_down_counter("chorus.wal.catalog.open_segments"),
-        1
-    );
+    assert_eq!(metrics.counter("chorus.wal.append.committed_bytes"), 6);
+    assert_eq!(metrics.counter("chorus.wal.append.failures"), 0);
     assert_eq!(
         metrics.histogram_samples("chorus.wal.append.commit_latency_seconds"),
         1
     );
-    assert_eq!(
-        metrics.histogram_samples("chorus.wal.manifest.cas_latency_seconds"),
-        metrics.counter("chorus.wal.manifest.cas_attempts") as usize
-    );
+    assert!(metrics.histogram_samples("chorus.wal.manifest.cas_latency_seconds") >= 2);
     assert_eq!(
         metrics.histogram_samples("chorus.wal.seal.duration_seconds"),
         1

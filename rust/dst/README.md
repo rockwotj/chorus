@@ -14,6 +14,12 @@ recovery, segment rotation, repair, truncation, and admission logic remain the
 same implementation used with the production transport; only the transport
 adapter and service are replaced.
 
+The client dependency enables `dst-support`, which also exposes four diagnostic
+counters: `chorus.wal.lane.timeouts`, `chorus.wal.lane.capacity_drops`,
+`chorus.wal.repair.passes`, and `chorus.wal.seal.segments`. The harness uses them
+to schedule faults and check protocol coverage. Default production builds do not
+register or update these counters.
+
 The harness runs in turmoil's single-threaded virtual-time runtime. Seeded
 schedules cover:
 

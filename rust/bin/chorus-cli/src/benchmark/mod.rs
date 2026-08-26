@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chorus_client::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
@@ -10,7 +10,6 @@ pub(crate) mod recovery;
 #[derive(Default)]
 pub(crate) struct BenchMetrics {
     counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
-    gauges: Mutex<HashMap<String, Arc<AtomicI64>>>,
 }
 
 impl BenchMetrics {
@@ -20,15 +19,6 @@ impl BenchMetrics {
             .unwrap()
             .get(name)
             .map(|counter| counter.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn gauge(&self, name: &str) -> i64 {
-        self.gauges
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|gauge| gauge.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 }
@@ -41,15 +31,11 @@ impl CounterFn for BenchCounter {
     }
 }
 
-struct BenchGauge(Arc<AtomicI64>);
-
-impl GaugeFn for BenchGauge {
-    fn set(&self, value: i64) {
-        self.0.store(value, Ordering::Relaxed);
-    }
-}
-
 struct NoopMetric;
+
+impl GaugeFn for NoopMetric {
+    fn set(&self, _value: i64) {}
+}
 
 impl UpDownCounterFn for NoopMetric {
     fn increment(&self, _value: i64) {}
@@ -78,18 +64,11 @@ impl MetricsRecorder for BenchMetrics {
 
     fn register_gauge(
         &self,
-        name: &str,
+        _name: &str,
         _description: &str,
         _labels: &[(&str, &str)],
     ) -> Arc<dyn GaugeFn> {
-        let metric = self
-            .gauges
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_default()
-            .clone();
-        Arc::new(BenchGauge(metric))
+        Arc::new(NoopMetric)
     }
 
     fn register_up_down_counter(

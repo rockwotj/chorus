@@ -13,20 +13,16 @@
 //! by varying `--target-sealed-segments`. Output is JSON with per-phase latency
 //! percentiles across iterations.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use chorus_client::{
-    ClientConfig, MetricsRecorder, SegmentedVolume, WalEngineConfig, WalHandle, WalSeqNo,
-};
+use chorus_client::{ClientConfig, SegmentedVolume, WalEngineConfig, WalHandle, WalSeqNo};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hdrhistogram::Histogram;
 use tokio::time::Instant;
 
-use super::BenchMetrics;
 use crate::ConnectedStorage;
 
 #[derive(clap::Args, Debug)]
@@ -171,23 +167,17 @@ pub(crate) async fn run(
     let replay_records = args.replay_records.unwrap_or(args.populate_records);
     let checkpoint = args.populate_records.saturating_sub(replay_records);
 
-    let metrics = Arc::new(BenchMetrics::default());
-    let metrics_recorder: Arc<dyn MetricsRecorder> = metrics.clone();
-
     let mut phases = PhaseHistograms::new()?;
     let mut sealed_counts: Vec<u64> = Vec::new();
     let mut replayed_records: Vec<u64> = Vec::new();
-    let mut cas_attempts: Vec<u64> = Vec::new();
-    let mut segments_sealed: Vec<u64> = Vec::new();
 
     for iteration in 0..args.iterations {
         let prefix = format!("{prefix}/i{iteration:03}");
-        let volume = SegmentedVolume::new_with_metrics_recorder(
+        let volume = SegmentedVolume::new(
             storage.factories.clone(),
             storage.manifest_factory.clone(),
             &prefix,
             ClientConfig::default(),
-            metrics_recorder.clone(),
         )?;
 
         // --- populate -------------------------------------------------------
@@ -211,8 +201,6 @@ pub(crate) async fn run(
             .context("shutdown populated writer")?;
 
         // --- measure one recovery pass -------------------------------------
-        let cas_before = metrics.counter("chorus.wal.manifest.cas_attempts");
-        let sealed_before = metrics.counter("chorus.wal.seal.segments");
 
         let total_started = Instant::now();
         let mut recovery = volume
@@ -252,8 +240,6 @@ pub(crate) async fn run(
         record_us(&mut phases.total, total)?;
         sealed_counts.push(sealed_count);
         replayed_records.push(replay_span);
-        cas_attempts.push(metrics.counter("chorus.wal.manifest.cas_attempts") - cas_before);
-        segments_sealed.push(metrics.counter("chorus.wal.seal.segments") - sealed_before);
     }
 
     let avg = |v: &[u64]| -> f64 {
@@ -273,8 +259,6 @@ pub(crate) async fn run(
         "replay_records_target": replay_records,
         "replayed_records_avg": avg(&replayed_records),
         "checkpoint": checkpoint,
-        "manifest_cas_attempts_avg": avg(&cas_attempts),
-        "segments_sealed_avg": avg(&segments_sealed),
         "phase_latency_us": {
             "epoch_claim": summarize(&phases.epoch_claim),
             "prepare": summarize(&phases.prepare),

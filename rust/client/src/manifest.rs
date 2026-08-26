@@ -684,18 +684,12 @@ impl Manifest {
                 CasTransform::Update { record, value } => (*record, value),
             };
             next.validate()?;
-            self.metrics.manifest_cas_attempts.increment();
             match self.timed_update(version, next.encode()).await {
                 Ok(updated) => {
                     self.install_cache(updated, next);
                     return Ok(value);
                 }
-                Err(
-                    error @ (ManifestStoreError::Conflict | ManifestStoreError::Unavailable(_)),
-                ) => {
-                    if matches!(error, ManifestStoreError::Conflict) {
-                        self.metrics.manifest_cas_conflicts.increment();
-                    }
+                Err(ManifestStoreError::Conflict | ManifestStoreError::Unavailable(_)) => {
                     self.refresh().await?;
                 }
                 Err(error) => return Err(error.into()),

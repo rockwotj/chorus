@@ -354,6 +354,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chorus-client",
+ "chorus-fake-gcs",
  "clap",
  "futures",
  "hdrhistogram",

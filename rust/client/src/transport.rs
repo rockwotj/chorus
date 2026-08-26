@@ -388,17 +388,16 @@ impl TransportCode {
     }
 }
 
-/// Wraps a replica so every provider RPC reports its latency and, on failure,
-/// the code the provider returned.
+/// Reports latency and failure codes for quorum-path replica operations.
 ///
 /// Phase timings locate the slow part of recovery; they cannot say which
-/// storage call is slow, which is the only form a storage provider can act on.
-/// Applied once where a `QuorumVolume` is built, so no call site changes and no
-/// operation can be forgotten.
+/// storage operation is slow. Applied where a `QuorumVolume` is built; raw
+/// factory calls used by manifest storage, repair, and replay are not wrapped.
+/// An operation such as `snapshot` may perform more than one provider RPC.
 ///
 /// The lane methods (`lane_send`, `lane_send_packed`, `lane_durable_change`,
 /// `append`) delegate untimed: they run per chunk on the append hot path,
-/// where their cost is already covered by `chorus.wal.append.commit_latency`.
+/// where their cost is covered by `chorus.wal.append.commit_latency_seconds`.
 pub(crate) struct TimedReplica {
     inner: Arc<dyn Replica>,
     metrics: Arc<crate::metrics::Metrics>,
@@ -469,7 +468,7 @@ impl Replica for TimedReplica {
         &self,
         metadata: HashMap<String, String>,
     ) -> Result<ReplicaSnapshot, TransportError> {
-        timed_rpc!(self, create_register, self.inner.create_register(metadata))
+        self.inner.create_register(metadata).await
     }
 
     async fn update_register(
@@ -477,11 +476,7 @@ impl Replica for TimedReplica {
         metageneration: i64,
         metadata: HashMap<String, String>,
     ) -> Result<ReplicaSnapshot, TransportError> {
-        timed_rpc!(
-            self,
-            update_register,
-            self.inner.update_register(metageneration, metadata)
-        )
+        self.inner.update_register(metageneration, metadata).await
     }
 
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
@@ -531,7 +526,7 @@ impl Replica for TimedReplica {
     }
 
     async fn delete(&self, generation: i64) -> Result<(), TransportError> {
-        timed_rpc!(self, delete, self.inner.delete(generation))
+        self.inner.delete(generation).await
     }
 
     async fn finalize(

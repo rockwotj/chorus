@@ -161,10 +161,6 @@ fn record(payload: &[u8]) -> RecordFrame {
     }
 }
 
-fn no_attempted_bytes() -> crate::protocol::AttemptedBytes {
-    Arc::new(|_| {})
-}
-
 fn volume(
     factories: Vec<Arc<dyn ReplicaFactory>>,
     manifest_factory: Arc<dyn ReplicaFactory>,
@@ -194,7 +190,7 @@ fn volume_with_metrics(
 
 async fn append_one(writer: &mut SegmentedWriter, payload: &[u8]) -> u64 {
     writer
-        .enqueue_records(vec![record(payload)], no_attempted_bytes())
+        .enqueue_records(vec![record(payload)])
         .await
         .unwrap()
         .remove(0)

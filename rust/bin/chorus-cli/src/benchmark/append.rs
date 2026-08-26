@@ -292,19 +292,7 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
     let record_iops = completed_appends as f64 / elapsed;
     let committed_payload_bytes = metrics.counter("chorus.wal.append.committed_bytes");
     let committed_records = metrics.counter("chorus.wal.append.committed_records");
-    let batches_sent = metrics.counter("chorus.wal.batch.sent");
-    let replica_bytes_attempted = metrics.counter("chorus.wal.replica.bytes_attempted");
     let payload_mib = committed_payload_bytes as f64 / (1024.0 * 1024.0);
-    let records_per_persist = if batches_sent == 0 {
-        0.0
-    } else {
-        committed_records as f64 / batches_sent as f64
-    };
-    let write_amplification = if committed_payload_bytes == 0 {
-        0.0
-    } else {
-        replica_bytes_attempted as f64 / committed_payload_bytes as f64
-    };
     let report = serde_json::json!({
         "mode": mode,
         "arrival_rate_target": args.arrival_rate,
@@ -313,8 +301,6 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
         "completed_appends": completed_appends,
         "scheduled_appends": workload.scheduled_appends,
         "committed_records": committed_records,
-        "batches_sent": batches_sent,
-        "records_per_persist": records_per_persist,
         "drain_timed_out": workload.drain_timed_out,
         "undrained_appends": workload.undrained_appends,
         "outstanding_cap_waits": workload.outstanding_cap_waits,
@@ -322,14 +308,6 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
         "record_iops": record_iops,
         "payload_mib_per_second": payload_mib / elapsed,
         "payload_mib": payload_mib,
-        "wal_record_bytes": metrics.counter("chorus.wal.append.encoded_bytes"),
-        "replica_bytes_attempted": replica_bytes_attempted,
-        "write_amplification": write_amplification,
-        "max_inflight_records": metrics.gauge("chorus.wal.pipeline.max_inflight_records"),
-        "max_inflight_bytes": metrics.gauge("chorus.wal.pipeline.max_inflight_bytes"),
-        "lane_capacity_drops": metrics.counter("chorus.wal.lane.capacity_drops"),
-        "lane_timeouts": metrics.counter("chorus.wal.lane.timeouts"),
-        "pipeline_refills": metrics.counter("chorus.wal.pipeline.refills"),
         "latency_us": {
             "p50": latency.value_at_quantile(0.50),
             "p99": latency.value_at_quantile(0.99),

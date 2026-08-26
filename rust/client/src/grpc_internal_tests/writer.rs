@@ -189,10 +189,7 @@ async fn pipeline_returns_per_record_quorum_futures() {
         .inject_delay(Operation::BidiWrite, Duration::from_secs(1))
         .await;
     let pending = writer
-        .enqueue_records(
-            vec![record(b"a"), record(b"b"), record(b"c")],
-            no_attempted_bytes(),
-        )
+        .enqueue_records(vec![record(b"a"), record(b"b"), record(b"c")])
         .await
         .unwrap();
     let offsets = tokio::time::timeout(Duration::from_millis(250), async {

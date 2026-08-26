@@ -181,10 +181,6 @@ impl Gauge {
         self.0.set(value);
     }
 
-    pub(crate) fn set_u64(&self, value: u64) {
-        self.set(i64::try_from(value).unwrap_or(i64::MAX));
-    }
-
     pub(crate) fn set_usize(&self, value: usize) {
         self.set(i64::try_from(value).unwrap_or(i64::MAX));
     }
@@ -224,20 +220,6 @@ impl AggregateGauge {
     }
 }
 
-pub(crate) struct UpDownCounter(Arc<dyn UpDownCounterFn>);
-
-impl UpDownCounter {
-    fn register(recorder: &dyn MetricsRecorder, name: &str, description: &str) -> Self {
-        Self(recorder.register_up_down_counter(name, description, &[]))
-    }
-
-    pub(crate) fn add(&self, value: i64) {
-        self.0.increment(value);
-    }
-}
-
-/// Prometheus-style latency buckets in seconds, wide enough to span a fast
-/// zonal append acknowledgment and a slow regional seal alike.
 /// Every `TransportCode`, so a failure counter exists for each and a code that
 /// never fires is visibly zero rather than absent.
 const TRANSPORT_FAILURE_CODES: &[&str] = &[
@@ -258,6 +240,7 @@ const TRANSPORT_FAILURE_CODES: &[&str] = &[
     "Internal",
 ];
 
+/// Latency buckets spanning fast zonal acknowledgments and slow regional seals.
 const LATENCY_SECONDS_BOUNDARIES: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
@@ -283,74 +266,27 @@ impl Histogram {
     }
 }
 
-pub(crate) struct HighWaterGauge {
-    high_water: AtomicI64,
-    gauge: Gauge,
-}
-
-impl HighWaterGauge {
-    fn register(recorder: &dyn MetricsRecorder, name: &str, description: &str) -> Self {
-        Self {
-            high_water: AtomicI64::new(0),
-            gauge: Gauge::register(recorder, name, description),
-        }
-    }
-
-    pub(crate) fn update_max(&self, value: u64) {
-        let value = i64::try_from(value).unwrap_or(i64::MAX);
-        if self.high_water.fetch_max(value, Ordering::Relaxed) < value {
-            self.gauge.set(value);
-            let current = self.high_water.load(Ordering::Relaxed);
-            if current > value {
-                self.gauge.set(current);
-            }
-        }
-    }
-}
-
 /// Handles for all metrics emitted by one WAL volume.
+///
+/// Four event counters are available only to deterministic simulations and
+/// unit tests: they synchronize fault injection and check protocol coverage,
+/// rather than describing production health.
 pub(crate) struct Metrics {
-    pub(crate) append_records: Counter,
-    pub(crate) append_bytes: Counter,
     pub(crate) append_failures: Counter,
     pub(crate) committed_records: Counter,
     pub(crate) committed_bytes: Counter,
-    pub(crate) batches_sent: Counter,
-    pub(crate) lane_retries: Counter,
+    #[cfg(any(test, feature = "dst-support"))]
     pub(crate) lane_timeouts: Counter,
-    pub(crate) rotations_completed: Counter,
-    pub(crate) spare_provisioning_attempts: Counter,
-    pub(crate) spare_provisioning_failures: Counter,
+    #[cfg(any(test, feature = "dst-support"))]
     pub(crate) segments_sealed: Counter,
-    pub(crate) seal_enforcement_retries: Counter,
-    pub(crate) manifest_cas_attempts: Counter,
-    pub(crate) manifest_cas_conflicts: Counter,
+    #[cfg(any(test, feature = "dst-support"))]
     pub(crate) repair_passes: Counter,
-    pub(crate) repair_objects_repaired: Counter,
-    pub(crate) repair_transient_skips: Counter,
-    pub(crate) repair_segments_without_source: Counter,
-    pub(crate) repair_failures: Counter,
-    pub(crate) recoveries_run: Counter,
-    pub(crate) recovery_segments_adopted: Counter,
-    /// Per-operation latency of individual provider RPCs, and the codes they
-    /// fail with. Phase timings say which part of recovery is slow; these say
-    /// which storage call is, which is the form a provider can act on.
+    /// Latency and failure codes of timed quorum-path replica operations.
     pub(crate) rpc: TransportRpcMetrics,
-    pub(crate) orphan_objects_deleted: Counter,
-    pub(crate) orphan_sweeps_deferred: Counter,
-    pub(crate) truncation_cycles: Counter,
-    pub(crate) operation_failures: Counter,
-    pub(crate) max_inflight_records: HighWaterGauge,
-    pub(crate) max_inflight_bytes: HighWaterGauge,
-    pub(crate) pipeline_refills: Counter,
+    #[cfg(any(test, feature = "dst-support"))]
     pub(crate) lane_capacity_drops: Counter,
-    pub(crate) wal_record_bytes: Counter,
-    pub(crate) replica_bytes_attempted: Counter,
-    pub(crate) open_segments: UpDownCounter,
-    pub(crate) committed_records_watermark: Gauge,
     pub(crate) queue_depth: Gauge,
     zone_durable_lag: Vec<AggregateGauge>,
-    pub(crate) rotation_state: Gauge,
     maintenance_queue_depth: AggregateGauge,
     pub(crate) manifest_directory_bytes: Gauge,
     pub(crate) append_commit_latency: Histogram,
@@ -367,13 +303,10 @@ pub(crate) struct TransportRpcMetrics {
     pub(crate) stat: Histogram,
     pub(crate) create_appendable: Histogram,
     pub(crate) create_append_session: Histogram,
-    pub(crate) create_register: Histogram,
-    pub(crate) update_register: Histogram,
     pub(crate) resume_tail: Histogram,
     pub(crate) takeover: Histogram,
     pub(crate) replace_appendable: Histogram,
     pub(crate) finalize: Histogram,
-    pub(crate) delete: Histogram,
     failures: Vec<(&'static str, Counter)>,
 }
 
@@ -383,7 +316,7 @@ impl TransportRpcMetrics {
             Histogram::register_with_labels(
                 recorder,
                 "chorus.wal.transport.rpc_seconds",
-                "Latency of one provider RPC",
+                "Latency of one quorum-path replica operation",
                 &[("op", op)],
             )
         };
@@ -406,13 +339,10 @@ impl TransportRpcMetrics {
             stat: rpc("stat"),
             create_appendable: rpc("create_appendable"),
             create_append_session: rpc("create_append_session"),
-            create_register: rpc("create_register"),
-            update_register: rpc("update_register"),
             resume_tail: rpc("resume_tail"),
             takeover: rpc("takeover"),
             replace_appendable: rpc("replace_appendable"),
             finalize: rpc("finalize"),
-            delete: rpc("delete"),
             failures,
         }
     }
@@ -436,11 +366,6 @@ impl Metrics {
                 Gauge::register(recorder, $name, $description)
             };
         }
-        macro_rules! high_water {
-            ($name:literal, $description:literal) => {
-                HighWaterGauge::register(recorder, $name, $description)
-            };
-        }
         macro_rules! histogram {
             ($name:literal, $description:literal) => {
                 Histogram::register(recorder, $name, $description)
@@ -460,14 +385,6 @@ impl Metrics {
             .collect();
 
         Self {
-            append_records: counter!(
-                "chorus.wal.append.records",
-                "Application records admitted for append"
-            ),
-            append_bytes: counter!(
-                "chorus.wal.append.bytes",
-                "Application payload bytes admitted for append"
-            ),
             append_failures: counter!(
                 "chorus.wal.append.failures",
                 "Admitted appends that completed with an error"
@@ -480,119 +397,25 @@ impl Metrics {
                 "chorus.wal.append.committed_bytes",
                 "Application payload bytes committed in contiguous sequence order"
             ),
-            batches_sent: counter!(
-                "chorus.wal.batch.sent",
-                "Logical record batches submitted to replication"
-            ),
-            lane_retries: counter!(
-                "chorus.wal.lane.retries",
-                "Replica lane recovery or resend attempts"
-            ),
+            #[cfg(any(test, feature = "dst-support"))]
             lane_timeouts: counter!(
                 "chorus.wal.lane.timeouts",
                 "Replica lanes shed after making no durable progress before their timeout"
             ),
-            rotations_completed: counter!(
-                "chorus.wal.rotation.completed",
-                "Active-segment rotations completed"
-            ),
-            spare_provisioning_attempts: counter!(
-                "chorus.wal.rotation.spare_provisioning_attempts",
-                "Background spare provisioning attempts"
-            ),
-            spare_provisioning_failures: counter!(
-                "chorus.wal.rotation.spare_provisioning_failures",
-                "Background spare provisioning failures"
-            ),
+            #[cfg(any(test, feature = "dst-support"))]
             segments_sealed: counter!(
                 "chorus.wal.seal.segments",
                 "Segments whose committed seal was enforced"
             ),
-            seal_enforcement_retries: counter!(
-                "chorus.wal.seal.enforcement_retries",
-                "Committed-seal enforcement retry attempts started by maintenance"
-            ),
-            manifest_cas_attempts: counter!(
-                "chorus.wal.manifest.cas_attempts",
-                "Manifest compare-and-swap requests sent to storage"
-            ),
-            manifest_cas_conflicts: counter!(
-                "chorus.wal.manifest.cas_conflicts",
-                "Manifest compare-and-swap precondition conflicts"
-            ),
+            #[cfg(any(test, feature = "dst-support"))]
             repair_passes: counter!(
                 "chorus.wal.repair.passes",
                 "Sealed-segment repair passes completed or skipped after an error"
             ),
-            repair_objects_repaired: counter!(
-                "chorus.wal.repair.objects_repaired",
-                "Missing or divergent sealed objects repaired"
-            ),
-            repair_transient_skips: counter!(
-                "chorus.wal.repair.transient_skips",
-                "Repair targets skipped after transient failures"
-            ),
-            repair_segments_without_source: counter!(
-                "chorus.wal.repair.segments_without_source",
-                "Sealed segments left unrepaired because no reachable copy verified"
-            ),
-            repair_failures: counter!(
-                "chorus.wal.repair.failures",
-                "Repair passes aborted by an error"
-            ),
-            recoveries_run: counter!("chorus.wal.recovery.runs", "Recovery attempts started"),
-            recovery_segments_adopted: counter!(
-                "chorus.wal.recovery.segments_adopted",
-                "Sealed segments adopted by recovery"
-            ),
-            orphan_objects_deleted: counter!(
-                "chorus.wal.orphan.objects_deleted",
-                "Dead-incarnation segment-object copies deleted by maintenance"
-            ),
-            orphan_sweeps_deferred: counter!(
-                "chorus.wal.orphan.sweeps_deferred",
-                "Dead-incarnation sweeps deferred after transient or terminal storage failures"
-            ),
-            truncation_cycles: counter!(
-                "chorus.wal.truncation.cycles",
-                "Application-triggered truncation cycles completed"
-            ),
-            operation_failures: counter!(
-                "chorus.wal.operation.failures",
-                "Engine and maintenance operations completed with errors"
-            ),
-            max_inflight_records: high_water!(
-                "chorus.wal.pipeline.max_inflight_records",
-                "High-water mark of dispatched uncommitted records"
-            ),
-            max_inflight_bytes: high_water!(
-                "chorus.wal.pipeline.max_inflight_bytes",
-                "High-water mark of admitted unresolved encoded bytes"
-            ),
-            pipeline_refills: counter!(
-                "chorus.wal.pipeline.refills",
-                "Pipeline refills before all prior records completed"
-            ),
+            #[cfg(any(test, feature = "dst-support"))]
             lane_capacity_drops: counter!(
                 "chorus.wal.lane.capacity_drops",
                 "Replica lanes dropped after exceeding their retained-byte budget"
-            ),
-            wal_record_bytes: counter!(
-                "chorus.wal.append.encoded_bytes",
-                "Encoded durable record bytes generated before replication"
-            ),
-            replica_bytes_attempted: counter!(
-                "chorus.wal.replica.bytes_attempted",
-                "Encoded bytes handed to replica transports including retries"
-            ),
-            open_segments: UpDownCounter::register(
-                recorder,
-                "chorus.wal.catalog.open_segments",
-                "Active appendable segments owned by this client",
-            ),
-            committed_records_watermark: gauge!(
-                "chorus.wal.append.committed_watermark",
-                "Exclusive committed record boundary"
             ),
             queue_depth: gauge!(
                 "chorus.wal.pipeline.queue_depth",
@@ -600,10 +423,6 @@ impl Metrics {
             ),
             zone_durable_lag,
             rpc: TransportRpcMetrics::register(recorder),
-            rotation_state: gauge!(
-                "chorus.wal.rotation.state",
-                "Rotation gate state: 0 idle, 1 due, 2 draining, 3 sealing, 4 disabled"
-            ),
             maintenance_queue_depth: AggregateGauge::register(
                 recorder,
                 "chorus.wal.maintenance.queue_depth",
@@ -667,10 +486,6 @@ pub(crate) mod test_support {
 
         pub(crate) fn labeled_gauge(&self, name: &str, labels: &[(&str, &str)]) -> i64 {
             self.gauges.lock().unwrap()[&metric_key(name, labels)].load(Ordering::Relaxed)
-        }
-
-        pub(crate) fn up_down_counter(&self, name: &str) -> i64 {
-            self.up_down_counters.lock().unwrap()[name].load(Ordering::Relaxed)
         }
 
         pub(crate) fn histogram_samples(&self, name: &str) -> usize {

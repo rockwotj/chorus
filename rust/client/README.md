@@ -140,6 +140,31 @@ data remains in the zonal buckets.
 - A running `WalHandle` is the exclusive writer. Starting another writer
   requires recovery, which fences the previous writer incarnation.
 
+## Metrics
+
+The default build registers 12 metric names, all prefixed with `chorus.wal.`:
+
+| Kind | Names |
+| --- | --- |
+| Counter | `append.committed_records`, `append.committed_bytes`, `append.failures`, `transport.rpc_failures{code}` |
+| Gauge | `pipeline.queue_depth`, `maintenance.queue_depth`, `replica.durable_lag_bytes{zone}`, `manifest.directory_bytes` |
+| Histogram | `append.commit_latency_seconds`, `transport.rpc_seconds{op}`, `manifest.cas_latency_seconds`, `seal.duration_seconds` |
+
+Lifecycle events, repair outcomes, retries, and maintenance failures are logged.
+RPC timing covers quorum-path replica operations, not all storage calls; manifest
+CAS timing remains separate. An operation such as `snapshot` may contain multiple
+provider RPCs. Labelled metrics register one series per label value.
+
+The internal `dst-support` feature additionally registers `lane.timeouts`,
+`lane.capacity_drops`, `repair.passes`, and `seal.segments`. Simulations use these
+for fault scheduling and protocol coverage; they are not production metrics.
+Unit-test builds also enable these counters.
+
+CLI benchmarks retain append latency percentiles, throughput, and recovery phase
+timings. They no longer report batching, write amplification, in-flight high-water
+marks, lane event counts, or recovery CAS/seal operation counts. Configured limits
+and observed/replayed record and segment counts remain in benchmark output.
+
 ## More information
 
 - [Design overview](https://rockwotj.com/blog/chorus/)

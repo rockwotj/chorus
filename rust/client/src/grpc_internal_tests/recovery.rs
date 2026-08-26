@@ -8,7 +8,7 @@ async fn recovery_does_not_promote_a_tail_below_the_second_largest_size() {
     servers[1].service.set_crashed(true).await;
     servers[2].service.set_crashed(true).await;
     let pending = first
-        .enqueue_records(vec![record(b"maybe-committed")], no_attempted_bytes())
+        .enqueue_records(vec![record(b"maybe-committed")])
         .await
         .unwrap()
         .remove(0);
@@ -75,9 +75,7 @@ async fn takeover_seals_old_segment_and_deposes_old_writer() {
 
     let recovered = volume.recover_writer().await.unwrap();
     assert_eq!(recovered.active_segment_base(), 1);
-    let stale = first
-        .enqueue_records(vec![record(b"stale")], no_attempted_bytes())
-        .await;
+    let stale = first.enqueue_records(vec![record(b"stale")]).await;
     let error = match stale {
         Ok(mut pending) => pending.remove(0).wait().await.unwrap_err(),
         Err(error) => error,
@@ -127,7 +125,7 @@ async fn manifest_takeover_fences_background_pending_fold() {
     assert!(matches!(error, Error::Fenced(_)), "{error}");
 
     let stale_error = match stale
-        .enqueue_records(vec![record(b"stale-successor")], no_attempted_bytes())
+        .enqueue_records(vec![record(b"stale-successor")])
         .await
     {
         Ok(mut pending) => pending.remove(0).wait().await.unwrap_err(),
@@ -340,11 +338,6 @@ async fn maintenance_restores_a_historical_segment_recovery_left_damaged() {
     )
     .unwrap();
     wait_for_repair_passes(&metrics, 1).await;
-    assert_eq!(metrics.counter("chorus.wal.repair.objects_repaired"), 1);
-    assert_eq!(
-        metrics.counter("chorus.wal.repair.segments_without_source"),
-        0
-    );
 
     let repaired = missing.snapshot().await.unwrap();
     assert!(repaired.finalized);
@@ -521,6 +514,47 @@ async fn repair_lists_each_zone_once_regardless_of_retained_history() {
 }
 
 #[tokio::test]
+async fn repair_skips_failed_listings_without_blocking_other_zones() {
+    for code in [Code::Unavailable, Code::PermissionDenied] {
+        let (servers, factories, manifest_factory) = factory_cluster().await;
+        let prefix = "repair-failed-listing-wal";
+        let volume = volume(factories.clone(), manifest_factory, prefix);
+        let mut writer = volume.recover_writer().await.unwrap();
+        append_one(&mut writer, b"committed").await;
+        writer.rotate().await.unwrap();
+        let object = segment_object(prefix, &writer.catalog()[0].id);
+        for factory in &factories[1..] {
+            let replica = factory.replica(&object);
+            let generation = replica.stat().await.unwrap().generation;
+            replica.delete(generation).await.unwrap();
+        }
+        servers[1].service.reset_operation_counts().await;
+        servers[1].service.inject(Operation::List, code).await;
+
+        let report = writer.repair_sealed_segments().await.unwrap();
+        assert_eq!(report.objects_repaired, 1);
+        assert_eq!(report.objects_already_healthy, 1);
+        assert_eq!(report.transient_failures, 1);
+        assert_eq!(report.segments_without_source, 0);
+        assert_eq!(servers[1].service.operation_count(Operation::List).await, 1);
+        assert_eq!(servers[1].service.operation_count(Operation::Get).await, 0);
+        assert_eq!(servers[1].service.operation_count(Operation::Read).await, 0);
+        assert_eq!(
+            factories[1].replica(&object).stat().await.unwrap_err().code,
+            TransportCode::NotFound,
+        );
+        assert!(
+            factories[2]
+                .replica(&object)
+                .stat()
+                .await
+                .unwrap()
+                .finalized
+        );
+    }
+}
+
+#[tokio::test]
 async fn repair_reports_a_segment_with_no_verifiable_copy_and_keeps_going() {
     let (_servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(
@@ -559,7 +593,7 @@ async fn repair_reports_a_segment_with_no_verifiable_copy_and_keeps_going() {
 /// The wait is wall-clock-bounded, not iteration-bounded: the pass makes
 /// real loopback RPCs, so a slow machine needs time, not yields.
 #[tokio::test]
-async fn engine_start_repairs_rejoined_zone_and_reports_metrics() {
+async fn engine_start_repairs_rejoined_zone() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     servers[2].service.set_crashed(true).await;
     let (volume, metrics) = volume_with_metrics(
@@ -593,8 +627,6 @@ async fn engine_start_repairs_rejoined_zone_and_reports_metrics() {
 
     wait_for_repair_passes(&metrics, 1).await;
     assert_eq!(metrics.counter("chorus.wal.repair.passes"), 1);
-    assert_eq!(metrics.counter("chorus.wal.repair.objects_repaired"), 1);
-    assert_eq!(metrics.counter("chorus.wal.repair.failures"), 0);
     let repaired = factories[2]
         .replica(&sealed_object)
         .snapshot()
@@ -627,7 +659,6 @@ async fn repair_pass_failure_does_not_fail_appends() {
         .unwrap();
     wait_for_repair_passes(&metrics, 1).await;
     assert_eq!(metrics.counter("chorus.wal.repair.passes"), 1);
-    assert_eq!(metrics.counter("chorus.wal.repair.failures"), 1);
     assert_eq!(metrics.counter("chorus.wal.append.committed_records"), 1);
     shutdown_engine(handle).await;
 }
@@ -805,10 +836,7 @@ async fn startup_replay_preserves_record_order_and_sequence_numbers() {
     let volume = volume(factories, manifest_factory.clone(), "replay-wal");
     let mut writer = volume.recover_writer().await.unwrap();
     let pending = writer
-        .enqueue_records(
-            vec![record(b"a"), record(b"b"), record(b"c")],
-            no_attempted_bytes(),
-        )
+        .enqueue_records(vec![record(b"a"), record(b"b"), record(b"c")])
         .await
         .unwrap();
     for pending in pending {
