@@ -199,10 +199,6 @@ struct MaintenanceState {
     /// and restart recovery enforces it.
     sealed: HashSet<u64>,
     checkpoint_floor: u64,
-    // Conservative age: time since this task first observed an eligible sealed
-    // segment. Restarting resets the grace period, never shortens it.
-    #[cfg(feature = "slatedb")]
-    gc_eligible_since: BTreeMap<String, Instant>,
     /// Retained until every zone was listed and every eligible object was
     /// deleted or already absent. The keep set may be stale; its strict
     /// below-claimed-epoch guard is the safety fence.
@@ -229,8 +225,6 @@ async fn run(
         deleted: HashSet::new(),
         sealed: HashSet::new(),
         checkpoint_floor: config.checkpoint_floor,
-        #[cfg(feature = "slatedb")]
-        gc_eligible_since: BTreeMap::new(),
         dead_segment_sweep: Some(config.dead_segment_sweep),
         manifest: None,
         metrics,
@@ -950,10 +944,36 @@ impl MaintenanceState {
             .refreshed_record()
             .await
             .map_err(Error::from)?;
-        let now = Instant::now();
-        let mut eligible = HashSet::new();
+        // Authorize only copies already older than min_age. All replicas must
+        // answer: a repaired copy can be younger than the quorum's originals.
+        // A zero age explicitly disables this gate (and permits degraded-zone
+        // truncation); normal tombstone cleanup still retries committed deletes.
+        let mut too_young = HashSet::new();
+        let mut ages_known = true;
+        if !min_age.is_zero() {
+            let now = std::time::SystemTime::now();
+            let prefix = format!("{}/segments/", self.prefix);
+            let listings = futures::future::join_all(
+                self.factories.iter().map(|factory| factory.list(&prefix)),
+            )
+            .await;
+            for listing in listings {
+                match listing {
+                    Ok(objects) => {
+                        for object in objects {
+                            if !older_than(object.last_modified, now, min_age) {
+                                too_young.insert(object.name);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        ages_known = false;
+                        tracing::warn!(%error, "SlateDB WAL GC cannot verify replica ages; deferring new truncation");
+                    }
+                }
+            }
+        }
         let mut floor = record.trunc;
-        let mut prefix_open = true;
         for (index, entry) in record.segments.iter().enumerate() {
             let end = record
                 .segments
@@ -966,31 +986,14 @@ impl MaintenanceState {
                 .catalog
                 .iter()
                 .any(|segment| segment.id == entry.id && !segment.seal_pending);
-            if end > retain_from || !sealed {
-                prefix_open = false;
-                continue;
+            if end > retain_from
+                || !sealed
+                || !ages_known
+                || too_young.contains(&crate::segment::segment_object(&self.prefix, &entry.id))
+            {
+                break;
             }
-            eligible.insert(entry.id.clone());
-            // A dry run neither advances the floor nor starts an age timer.
-            let since = if dry_run {
-                self.gc_eligible_since
-                    .get(&entry.id)
-                    .copied()
-                    .unwrap_or(now)
-            } else {
-                *self
-                    .gc_eligible_since
-                    .entry(entry.id.clone())
-                    .or_insert(now)
-            };
-            if prefix_open && now.duration_since(since) >= min_age {
-                floor = end;
-            } else {
-                prefix_open = false;
-            }
-        }
-        if !dry_run {
-            self.gc_eligible_since.retain(|id, _| eligible.contains(id));
+            floor = end;
         }
         if dry_run {
             tracing::info!(
@@ -1055,9 +1058,37 @@ async fn tick(interval: &mut Option<Interval>) {
     }
 }
 
+#[cfg(feature = "slatedb")]
+fn older_than(
+    last_modified: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    min_age: Duration,
+) -> bool {
+    last_modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > min_age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "slatedb")]
+    #[test]
+    fn gc_age_requires_known_time_strictly_older_than_cutoff() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let age = Duration::from_secs(60);
+        let now = UNIX_EPOCH + Duration::from_secs(120);
+        assert!(super::older_than(
+            Some(now - age - Duration::from_nanos(1)),
+            now,
+            age
+        ));
+        assert!(!super::older_than(Some(now - age), now, age));
+        assert!(!super::older_than(Some(now), now, age));
+        assert!(!super::older_than(Some(now + age), now, age));
+        assert!(!super::older_than(None, now, age));
+    }
 
     fn segment(base: u64) -> SegmentDescriptor {
         SegmentDescriptor {

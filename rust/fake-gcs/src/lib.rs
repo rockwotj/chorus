@@ -161,6 +161,8 @@ pub struct FakeGcs {
 #[derive(Default)]
 struct State {
     objects: HashMap<String, StoredObject>,
+    // Explicit provider clock, initially UNIX epoch, keeps DST deterministic.
+    clock: Timestamp,
     next_generation: i64,
     next_stream_id: u64,
     crashed: bool,
@@ -192,6 +194,7 @@ struct StoredObject {
     name: String,
     generation: i64,
     metageneration: i64,
+    update_time: Option<Timestamp>,
     metadata: HashMap<String, String>,
     content_type: String,
     bytes: Vec<u8>,
@@ -256,6 +259,29 @@ impl Drop for RunningFake {
 }
 
 impl FakeGcs {
+    /// Set the provider clock used by subsequent creates, metadata updates and
+    /// finalizations. It does not advance automatically or change old objects.
+    pub async fn set_clock(&self, now: Timestamp) {
+        self.inner.lock().await.clock = now;
+    }
+
+    /// Override an object's update timestamp, including missing/malformed
+    /// metadata, for deterministic age-based collection tests.
+    pub async fn set_object_update_time(
+        &self,
+        bucket: &str,
+        name: &str,
+        update_time: Option<Timestamp>,
+    ) {
+        self.inner
+            .lock()
+            .await
+            .objects
+            .get_mut(&object_key(bucket, name))
+            .expect("object must exist")
+            .update_time = update_time;
+    }
+
     pub fn with_latency(profile: LatencyProfile) -> Self {
         let state = State {
             latency_profile: profile,
@@ -1184,6 +1210,7 @@ impl FakeGcs {
             name: resource.name,
             generation: state.next_generation,
             metageneration: 1,
+            update_time: Some(state.clock),
             metadata: resource.metadata,
             content_type: resource.content_type,
             integrity_crc32c: crc32c::crc32c(&bytes),
@@ -1466,6 +1493,7 @@ impl Storage for FakeGcs {
         check_metadata_size(&update.metadata)?;
         let mut state = self.inner.lock().await;
         let key = object_key(&update.bucket, &update.name);
+        let now = state.clock;
         let object = state
             .objects
             .get_mut(&key)
@@ -1482,6 +1510,7 @@ impl Storage for FakeGcs {
         }
         object.metadata = update.metadata;
         object.metageneration += 1;
+        object.update_time = Some(now);
         let proto = object.to_proto();
         if let Some(code) = state
             .response_losses
@@ -1717,6 +1746,7 @@ impl FakeGcs {
         stream_id: Option<u64>,
     ) -> Result<BidiWriteObjectResponse, Status> {
         let mut state = self.inner.lock().await;
+        let now = state.clock;
         match request.first_message.as_ref() {
             Some(FirstMessage::WriteObjectSpec(spec)) => {
                 let is_create = spec.if_generation_match == Some(0);
@@ -1755,6 +1785,7 @@ impl FakeGcs {
                     name: resource.name,
                     generation: state.next_generation,
                     metageneration: 1,
+                    update_time: Some(now),
                     metadata: resource.metadata,
                     content_type: resource.content_type,
                     bytes: Vec::new(),
@@ -1829,6 +1860,7 @@ impl FakeGcs {
                 append_data(object, &request)?;
                 if request.finish_write {
                     object.finalized = true;
+                    object.update_time = Some(now);
                     object.active_stream = None;
                     return Ok(BidiWriteObjectResponse {
                         write_status: Some(WriteStatus::Resource(object.to_proto())),
@@ -1867,6 +1899,7 @@ impl FakeGcs {
         }
         let mut state = self.inner.lock().await;
         let partial_write = state.partial_writes.pop_front();
+        let now = state.clock;
         if partial_write.is_some() {
             state.observed_faults += 1;
         }
@@ -1896,6 +1929,7 @@ impl FakeGcs {
         append_data(object, &request)?;
         if request.finish_write {
             object.finalized = true;
+            object.update_time = Some(now);
             object.active_stream = None;
             return Ok(BidiWriteObjectResponse {
                 write_status: Some(WriteStatus::Resource(object.to_proto())),
@@ -2073,6 +2107,7 @@ impl StoredObject {
                 md5_hash: Vec::new(),
             }),
             metadata: self.metadata.clone(),
+            update_time: self.update_time,
             finalize_time: self.finalized.then_some(Timestamp {
                 seconds: 1,
                 nanos: 0,
@@ -2147,6 +2182,7 @@ mod tests {
             name: "object".into(),
             generation: 1,
             metageneration: 1,
+            update_time: Some(Timestamp::default()),
             metadata: HashMap::new(),
             content_type: String::new(),
             bytes: Vec::new(),
@@ -2736,6 +2772,19 @@ mod tests {
             .unwrap();
         let bucket = "projects/_/buckets/zone-0";
         let name = "finalized";
+        let created_at = Timestamp {
+            seconds: 10,
+            nanos: 123,
+        };
+        let finalized_at = Timestamp {
+            seconds: 20,
+            nanos: 456,
+        };
+        let updated_at = Timestamp {
+            seconds: 30,
+            nanos: 789,
+        };
+        server.service.set_clock(created_at).await;
         create_appendable(&mut client, bucket, name).await;
         let open = client
             .get_object(GetObjectRequest {
@@ -2747,6 +2796,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(open.size, 0);
+        assert_eq!(open.update_time, Some(created_at));
+        server.service.set_clock(finalized_at).await;
 
         let mut finalize = append_request(
             bucket,
@@ -2774,6 +2825,8 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(finalized.size, 6);
+        assert_eq!(finalized.update_time, Some(finalized_at));
+        server.service.set_clock(updated_at).await;
         let updated = client
             .update_object(UpdateObjectRequest {
                 object: Some(Object {
@@ -2791,6 +2844,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(updated.metageneration, finalized.metageneration + 1);
+        assert_eq!(updated.update_time, Some(updated_at));
 
         let mut rejected = client
             .bidi_write_object(tokio_stream::iter([append_request(

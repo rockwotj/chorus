@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,6 +26,10 @@ pub struct ListedObject {
     pub size: i64,
     /// Whether the provider reports the object as finalized.
     pub finalized: bool,
+    /// Provider modification time, including metadata changes. Unknown times
+    /// must not authorize age-based garbage collection.
+    #[serde(default)]
+    pub last_modified: Option<SystemTime>,
     /// Provider-computed CRC32C of the complete object, when supplied. This is
     /// the same durable checksum a `stat` returns, so a listing alone decides
     /// whether a sealed copy matches the manifest's committed digest.

@@ -187,13 +187,17 @@ using the same initializer or a clone; separate-process/offline collection is
 not supported and returns an error rather than recovering/fencing the volume.
 
 Configure the GC builder's `GarbageCollectorOptions::wal_options` for interval,
-`min_age`, and `dry_run`. Age is conservative: a segment waits the full `min_age`
-after a collection pass first observes it as sealed and unreferenced. Restarting
-or subsequently observing it as referenced resets that grace period. No on-disk
-timestamp/schema change is needed. Dry runs do not advance the floor, delete
-objects, or start age timers; they log the proposed floor. Background maintenance
+`min_age`, and `dry_run`. Nonzero `min_age` uses GCS object modification time
+(`update_time`): every existing replica must be strictly older than the cutoff
+before GC authorizes a segment's deletion. A repaired/replaced copy gets its own
+age; unavailable listings, missing/invalid timestamps, or future timestamps defer
+new truncation. This requires all zones to answer age checks; `min_age = 0`
+disables the age gate and allows degraded-zone truncation. Object age survives
+restarts and is independent of when a segment becomes unreferenced. No on-disk
+schema change is needed. Dry runs do not advance the floor or delete objects;
+they log the proposed floor using the same age checks. Background maintenance
 may still retry deletions authorized by an earlier real collection. Long-lived
-checkpoints, a long grace period, or unavailable zones can still exhaust the
+checkpoints, a long minimum age, or unavailable zones can still exhaust the
 bounded manifest directory; size rotation/GC settings for the retention window.
 
 `WalReader` and `WalAdmin` remain unimplemented: separate live WAL readers and

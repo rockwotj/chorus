@@ -15,11 +15,12 @@
 //! initializer into SlateDB's GC builder as shown below: collection runs through
 //! the live writer's maintenance task, preserving all supplied checkpoint ranges.
 //! Only whole sealed segments from the unreferenced prefix are reclaimed.
-//! `min_age` conservatively starts when GC first observes a segment as eligible;
-//! restart or a referenced observation resets that grace period. Dry runs do not
-//! change storage or start timers. An attached, open writer is required; offline
-//! or separate-process GC is not supported. `WalReader` and `WalAdmin` remain
-//! unimplemented, so live WAL readers and WAL-based clones are unsupported.
+//! Nonzero `min_age` requires every existing replica's storage modification time
+//! to be strictly older than the cutoff. Unknown ages defer new truncation;
+//! zero disables the age gate. Dry runs do not change storage. An open writer
+//! is required; offline or separate-process GC is not supported.
+//! `WalReader` and `WalAdmin` remain unimplemented, so live WAL readers and
+//! WAL-based clones are unsupported.
 //! Do not run Chorus recovery/maintenance tools concurrently with the database:
 //! those tools claim a new writer epoch and fence the database.
 //!
