@@ -18,6 +18,9 @@ default = []
 probe-support = []
 # Internal capacity introspection and event counters for deterministic simulation.
 dst-support = []
+# Experimental: pinned to the unreleased pluggable-WAL API. Replace the git
+# dependency with a stable release before merging/publishing this integration.
+slatedb = ["dep:slatedb"]
 
 [dependencies]
 arc-swap.workspace = true
@@ -32,6 +35,7 @@ prost.workspace = true
 prost-types.workspace = true
 serde.workspace = true
 sha2.workspace = true
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "31656fe30064ce0d7991a578085341e21438af5e", default-features = false, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

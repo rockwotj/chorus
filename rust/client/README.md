@@ -160,6 +160,121 @@ every replica to advance its own durable checkpoint. If truncation overtakes a
 follower, the stream returns `Error::ReadOnlyLagged` rather than skipping
 records; resnapshot that replica before reopening it at a newer checkpoint.
 
+## Experimental SlateDB adapter
+
+The opt-in `slatedb` feature provides
+`chorus_client::slatedb::ChorusWal`, implementing SlateDB's pluggable WAL writer,
+startup replay, and garbage-collection interfaces. It is disabled by default; the default build
+does not compile SlateDB or enable its object-store providers/caches.
+
+**Not ready to merge or publish:** this currently pins SlateDB main at
+[`31656fe3`](https://github.com/slatedb/slatedb/commit/31656fe30064ce0d7991a578085341e21438af5e).
+Replace the git dependency with the first suitable stable release and rerun
+the adapter tests before merging. Cargo still resolves optional dependencies
+when generating a lockfile, so even feature-off resolution may need GitHub.
+Applications must use the same SlateDB revision to share the trait types:
+
+```toml
+[dependencies]
+chorus-client = { path = "path/to/chorus/rust/client", features = ["slatedb"] }
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "31656fe30064ce0d7991a578085341e21438af5e", default-features = false }
+```
+
+Create a dedicated `SegmentedVolume` using the storage setup below, then pass
+it directly to SlateDB. Do **not** recover/start it separately:
+
+```rust,ignore
+use chorus_client::slatedb::ChorusWal;
+use slatedb::{Db, GarbageCollectorBuilder};
+use std::sync::Arc;
+
+let wal = ChorusWal::new(volume);
+let gc = GarbageCollectorBuilder::new("databases/orders", sst_object_store.clone())
+    .with_wal_gc(Arc::new(wal.clone()));
+let db = Db::builder("databases/orders", sst_object_store)
+    .with_wal_writer(Box::new(wal))
+    .with_gc_builder(gc)
+    .build()
+    .await?;
+
+let write = db.put(b"customer/7", b"alice").await?;
+write.await_durable().await?; // Waits for a Chorus quorum, not an SST flush.
+db.close().await?;
+```
+
+Use `ChorusWal::with_config(volume, config)` to customize `WalEngineConfig`.
+The complete **encoded batch** must fit `max_record_bytes` (default 1 MiB).
+Oversized batches fail, rather than being split and losing atomicity. Admission
+and completion failures close the adapter; ambiguous outcomes require reopening
+the database to resolve the recovered prefix, not retrying within that writer.
+
+Each SlateDB write batch is one Chorus record, preserving values, tombstones,
+merge operands, sequence numbers, and optional creation/expiry timestamps. A
+versioned binary envelope is independent of SlateDB's SST encoding. Record index
+`n` maps to WAL file ID `n + 1`; SlateDB's `replay_after_wal_id` consequently maps
+directly to Chorus's inclusive recovery checkpoint. Replay streams one batch at
+a time, and the engine starts after replay finishes, making GC available even
+before the first append. Append admission is
+pipelined and ordered quorum completions drive durability notifications. Flush
+is a barrier over preceding admissions; it does not force segment rotation.
+
+Fencing follows SlateDB's manifest-fence / Chorus-recovery / manifest-recheck
+protocol. Starting another database writer takes over the volume and invalidates
+the previous writer. Use the same dedicated volume on every open; do not share
+one volume between databases, mix other application records into it, or switch
+an existing database from its native WAL merely by changing this option. The
+upstream manifest does not yet persist/validate the custom backend identity.
+
+GC must be wired explicitly with `with_wal_gc` **and** `with_gc_builder`, using
+clones of the same `ChorusWal` instance and the same SlateDB database path/store.
+SlateDB supplies ranges referenced by the current manifest and retained
+checkpoints. Collection removes only whole sealed segments from the prefix
+before **every** referenced range, leaving holes between retained ranges alone.
+It preserves the current WAL boundary, the active tail, and pending seals.
+Replay position and retention authority are separate: an older checkpoint can
+keep history below the current writer's startup replay position.
+
+Collection uses the attached writer's existing maintenance queue, serializing
+deletion with repair without fencing or pausing the append engine. Committed
+truncation floors and generation-guarded deletion tombstones provide the usual
+Chorus retry/recovery safety, including when a zone is unavailable. Successful
+collection wakes the rotation capacity check. This collector requires an open Db
+using the same initializer or a clone; separate-process/offline collection is
+not supported and returns an error rather than recovering/fencing the volume.
+
+Configure the GC builder's `GarbageCollectorOptions::wal_options` for interval,
+`min_age`, and `dry_run`. Age is conservative: a segment waits the full `min_age`
+after a collection pass first observes it as sealed and unreferenced. Restarting
+or subsequently observing it as referenced resets that grace period. No on-disk
+timestamp/schema change is needed. Dry runs do not advance the floor, delete
+objects, or start age timers; they log the proposed floor. Background maintenance
+may still retry deletions authorized by an earlier real collection. Long-lived
+checkpoints, a long grace period, or unavailable zones can still exhaust the
+bounded manifest directory; size rotation/GC settings for the retention window.
+
+`WalReader` and `WalAdmin` remain unimplemented: separate live WAL readers and
+WAL-based clones are unsupported. Ordinary `Db::get`/`Db::scan` reads work.
+Do not use SlateDB's default WAL reader/clone/delete tools for this backend.
+Chorus CLI recovery/repair commands fence the active writer and must run offline.
+
+From the repository's `rust` directory:
+
+```sh
+cargo test -p chorus-client --features slatedb slatedb::
+cargo test -p chorus-client --features slatedb --test slatedb_integration
+cargo test -p chorus-client --no-default-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+The adapter tests run actual SlateDB databases over the loopback fake-GCS
+transport, including atomic batch replay, L0 checkpoint resume, takeover,
+quorum-only durability, failure propagation, corrupt-record rejection, retained
+checkpoints, scheduled GC with live writes, age/dry-run gates, and deletion retries.
+External integration tests use only the exported API to check mixed writes,
+deletes, reads, and scans against a reference model across GC and fresh-client
+reopens, plus writer takeover while a zone is unavailable. These tests use fake
+GCS servers, not live-cloud resources.
+
 ## Storage setup
 
 A typical volume uses:

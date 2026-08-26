@@ -119,7 +119,7 @@ impl Default for WalEngineConfig {
 }
 
 impl WalEngineConfig {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.queue_capacity_bytes == 0 {
             return Err(Error::InvalidConfig("queue_capacity_bytes must be nonzero"));
         }
@@ -544,6 +544,13 @@ impl WalEngine {
 }
 
 impl WalHandle {
+    #[cfg(feature = "slatedb")]
+    pub(crate) fn gc_handle(&self) -> GcHandle {
+        GcHandle {
+            maintenance: self.maintenance.clone(),
+            rotation_recheck: self.rotation_recheck.clone(),
+        }
+    }
     /// Admit one caller-numbered opaque record without waiting for durability.
     ///
     /// Before waiting, this method verifies that `seqno` is exactly the next
@@ -815,6 +822,33 @@ impl WalHandle {
                 })
             }
         }
+    }
+}
+
+/// Collection-only capability. Cloning it never grants writer ownership.
+#[cfg(feature = "slatedb")]
+#[derive(Clone)]
+pub(crate) struct GcHandle {
+    maintenance: crate::maintenance::MaintenanceHandle,
+    rotation_recheck: mpsc::Sender<()>,
+}
+
+#[cfg(feature = "slatedb")]
+impl GcHandle {
+    pub(crate) async fn collect(
+        &self,
+        retain_from: u64,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<TruncationReport, Error> {
+        let report = self
+            .maintenance
+            .collect(retain_from, min_age, dry_run)
+            .await?;
+        if !dry_run {
+            let _ = self.rotation_recheck.try_send(());
+        }
+        Ok(report)
     }
 }
 
