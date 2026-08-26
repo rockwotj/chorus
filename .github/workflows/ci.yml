@@ -35,6 +35,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features
+      - name: Client without optional integrations
+        run: cargo test -p chorus-client --no-default-features
       - name: DST production smoke
         run: >-
           cargo run --release -p chorus-dst --

@@ -51,6 +51,17 @@ pub(crate) enum MaintenanceCmd {
         floor: WalSeqNo,
         response: oneshot::Sender<Result<TruncationReport, Error>>,
     },
+    /// Retained-range GC, independent of this writer's startup replay point.
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
+}
+
+#[cfg(feature = "slatedb")]
+pub(crate) struct GcRequest {
+    pub retain_from: u64,
+    pub min_age: Duration,
+    pub dry_run: bool,
+    pub response: oneshot::Sender<Result<TruncationReport, Error>>,
 }
 
 /// Control handle owned by the [`crate::WalHandle`]; dropping it ends the
@@ -121,6 +132,24 @@ impl MaintenanceHandle {
     pub(crate) fn shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
+
+    #[cfg(feature = "slatedb")]
+    pub(crate) async fn collect(
+        &self,
+        retain_from: u64,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<TruncationReport, Error> {
+        let (response, receiver) = oneshot::channel();
+        self.enqueue(MaintenanceCmd::Collect(GcRequest {
+            retain_from,
+            min_age,
+            dry_run,
+            response,
+        }))
+        .await?;
+        receiver.await.map_err(|_| Error::Closed)?
+    }
 }
 
 pub(crate) struct MaintenanceConfig {
@@ -170,6 +199,10 @@ struct MaintenanceState {
     /// and restart recovery enforces it.
     sealed: HashSet<u64>,
     checkpoint_floor: u64,
+    // Conservative age: time since this task first observed an eligible sealed
+    // segment. Restarting resets the grace period, never shortens it.
+    #[cfg(feature = "slatedb")]
+    gc_eligible_since: BTreeMap<String, Instant>,
     /// Retained until every zone was listed and every eligible object was
     /// deleted or already absent. The keep set may be stale; its strict
     /// below-claimed-epoch guard is the safety fence.
@@ -196,6 +229,8 @@ async fn run(
         deleted: HashSet::new(),
         sealed: HashSet::new(),
         checkpoint_floor: config.checkpoint_floor,
+        #[cfg(feature = "slatedb")]
+        gc_eligible_since: BTreeMap::new(),
         dead_segment_sweep: Some(config.dead_segment_sweep),
         manifest: None,
         metrics,
@@ -311,6 +346,17 @@ async fn execute_command(
                 let _ = response.send(result.clone());
             }
         }
+        #[cfg(feature = "slatedb")]
+        ReadyCommandKind::Collect(request) => {
+            task.adopt_catalog(catalog_rx);
+            let result = task
+                .collect_once(request.retain_from, request.min_age, request.dry_run)
+                .await;
+            if result.is_err() {
+                task.manifest = None;
+            }
+            let _ = request.response.send(result);
+        }
     }
 }
 
@@ -325,6 +371,8 @@ enum PendingGroup {
         segment: Box<SwappedSegment>,
         enforced: oneshot::Sender<()>,
     },
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
 }
 
 #[derive(Default)]
@@ -353,6 +401,8 @@ enum ReadyCommandKind {
         floor: WalSeqNo,
         responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
     },
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
 }
 
 impl PendingCommands {
@@ -368,6 +418,12 @@ impl PendingCommands {
             MaintenanceCmd::RepairSegment(segment) => self.push_repair(segment),
             MaintenanceCmd::Truncate { floor, response } => {
                 self.push_truncation(floor, response);
+            }
+            #[cfg(feature = "slatedb")]
+            MaintenanceCmd::Collect(request) => {
+                // Retention snapshots, dry runs, and age gates must not be
+                // coalesced with each other or ordinary truncation requests.
+                self.groups.push_back(PendingGroup::Collect(request));
             }
         }
     }
@@ -435,7 +491,17 @@ impl PendingCommands {
                             queued_requests: 1,
                         });
                     }
-                    Some(PendingGroup::Work(_)) | None => continue,
+                    _ => unreachable!("front group was a seal"),
+                },
+                #[cfg(feature = "slatedb")]
+                PendingGroup::Collect(_) => match self.groups.pop_front() {
+                    Some(PendingGroup::Collect(request)) => {
+                        return Some(ReadyCommand {
+                            kind: ReadyCommandKind::Collect(request),
+                            queued_requests: 1,
+                        })
+                    }
+                    _ => unreachable!("front group was a collection"),
                 },
             }
         }
@@ -871,6 +937,102 @@ impl MaintenanceState {
         Ok(report)
     }
 
+    #[cfg(feature = "slatedb")]
+    async fn collect_once(
+        &mut self,
+        retain_from: u64,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<TruncationReport, Error> {
+        let record = self
+            .ensure_manifest()
+            .await?
+            .refreshed_record()
+            .await
+            .map_err(Error::from)?;
+        let now = Instant::now();
+        let mut eligible = HashSet::new();
+        let mut floor = record.trunc;
+        let mut prefix_open = true;
+        for (index, entry) in record.segments.iter().enumerate() {
+            let end = record
+                .segments
+                .get(index + 1)
+                .map_or(record.tail_base, |next| next.base);
+            if end <= record.trunc {
+                continue;
+            } // Already-authorized deletion tombstone.
+            let sealed = self
+                .catalog
+                .iter()
+                .any(|segment| segment.id == entry.id && !segment.seal_pending);
+            if end > retain_from || !sealed {
+                prefix_open = false;
+                continue;
+            }
+            eligible.insert(entry.id.clone());
+            // A dry run neither advances the floor nor starts an age timer.
+            let since = if dry_run {
+                self.gc_eligible_since
+                    .get(&entry.id)
+                    .copied()
+                    .unwrap_or(now)
+            } else {
+                *self
+                    .gc_eligible_since
+                    .entry(entry.id.clone())
+                    .or_insert(now)
+            };
+            if prefix_open && now.duration_since(since) >= min_age {
+                floor = end;
+            } else {
+                prefix_open = false;
+            }
+        }
+        if !dry_run {
+            self.gc_eligible_since.retain(|id, _| eligible.contains(id));
+        }
+        if dry_run {
+            tracing::info!(
+                current_floor = record.trunc,
+                proposed_floor = floor,
+                retain_from,
+                "SlateDB WAL GC dry run"
+            );
+            return Ok(TruncationReport {
+                deleted_objects: 0,
+                deleted_segments: 0,
+            });
+        }
+        let before = self
+            .catalog
+            .iter()
+            .map(|segment| segment.base_record_index)
+            .collect();
+        let mut manifest = self
+            .manifest
+            .take()
+            .ok_or_else(|| Error::Internal("GC manifest disappeared".into()))?;
+        // Unlike truncate_before, this authority comes from ALL retained
+        // manifests, not the current writer's replay checkpoint. Never use
+        // checkpoint_floor here: it may be ahead of an older retained manifest.
+        let mut retention_floor = record.trunc;
+        let result = truncate_pass(
+            &self.factories,
+            &self.prefix,
+            &mut self.catalog,
+            &mut retention_floor,
+            &mut manifest,
+            WalSeqNo::record(floor),
+        )
+        .await;
+        self.manifest = Some(manifest);
+        if result.is_ok() {
+            self.remember_catalog_deletions(before);
+        }
+        result
+    }
+
     fn remember_catalog_deletions(&mut self, before: HashSet<u64>) {
         for gone in before {
             if !self
@@ -968,6 +1130,8 @@ mod tests {
                 ReadyCommandKind::SealSegment { .. } | ReadyCommandKind::Truncate { .. } => {
                     panic!("flood coalescer emitted an unexpected command");
                 }
+                #[cfg(feature = "slatedb")]
+                ReadyCommandKind::Collect(_) => panic!("no collections were queued"),
             }
         }
         assert_eq!(repaired, (0..8).step_by(2).collect::<Vec<_>>());
