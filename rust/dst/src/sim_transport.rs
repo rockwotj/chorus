@@ -171,7 +171,12 @@ impl ReplicaFactory for InMemoryReplicaFactory {
                     .unwrap_or(&object.name)
                     .to_string(),
                 generation: object.generation,
+                size: object.size,
                 finalized: object.finalize_time.is_some(),
+                crc32c: object
+                    .checksums
+                    .as_ref()
+                    .and_then(|checksums| checksums.crc32c),
                 metadata: object.metadata,
             })
             .collect())

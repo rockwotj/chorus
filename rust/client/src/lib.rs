@@ -23,8 +23,11 @@
 //! delete whole sealed segments below that checkpoint. Startup and periodic
 //! maintenance retry already-authorized deletion tombstones before repairing
 //! missing immutable sealed copies; degraded rotations also schedule a targeted
-//! repair. Active segments are never repaired in place, and maintenance never
-//! advances the database's checkpoint floor autonomously. See the `database_wal`
+//! repair. Recovery itself never inspects sealed history: it adopts the
+//! committed directory and starts serving, and background maintenance owns
+//! restoring a finalized quorum for older segments. Active segments are never
+//! repaired in place, and maintenance never advances the database's checkpoint
+//! floor autonomously. See the `database_wal`
 //! example for the complete lifecycle.
 //! Every fallible public operation returns [`Error`].
 //!

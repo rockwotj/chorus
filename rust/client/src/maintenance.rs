@@ -752,6 +752,9 @@ impl MaintenanceState {
                 self.metrics
                     .repair_transient_skips
                     .add(report.transient_failures as u64);
+                self.metrics
+                    .repair_segments_without_source
+                    .add(report.segments_without_source as u64);
                 if report.objects_repaired > 0 {
                     tracing::info!(
                         segments_examined = report.segments_examined,
@@ -769,6 +772,17 @@ impl MaintenanceState {
                         transient_failures = report.transient_failures,
                         floor,
                         "repair pass left transient failures"
+                    );
+                }
+                if report.segments_without_source > 0 {
+                    // Recovery no longer inspects sealed history, so this pass
+                    // is the only place committed history below a finalized
+                    // quorum can be noticed at all.
+                    tracing::error!(
+                        segments_examined = report.segments_examined,
+                        segments_without_source = report.segments_without_source,
+                        floor,
+                        "repair pass found committed sealed segments with no verifiable copy"
                     );
                 }
             }
@@ -825,6 +839,9 @@ impl MaintenanceState {
                 self.metrics
                     .repair_transient_skips
                     .add(report.transient_failures as u64);
+                self.metrics
+                    .repair_segments_without_source
+                    .add(report.segments_without_source as u64);
                 if report.objects_repaired > 0 {
                     tracing::info!(
                         segment_base = segment.base_record_index,

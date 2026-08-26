@@ -234,9 +234,9 @@ event eSealQuorumEnforced: (
 event eSealedCopyRepaired: (
     zone: int, segment: int, endOffset: int, recordCount: int
 );
-// Model-only startup-repair observation. `checksum` is the equality-only
+// Model-only background-repair observation. `checksum` is the equality-only
 // surrogate for the CRC32C committed in the production directory entry.
-event eHistoricalRecoveryReady: (
+event eHistoricalMaintenanceRepaired: (
     segment: int, checksum: int, healthyZones: set[int]
 );
 event eSegmentSealed: (segment: int, endOffset: int);
