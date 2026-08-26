@@ -1,0 +1,6 @@
+# Prefer considering this documentation rather than having the language identified
+# incorrectly and misleading users across the GitHub UI. To be removed when P
+# support is added to Linguist.
+# https://github.com/github-linguist/linguist/issues/6907
+*.p linguist-documentation
+*.pproj linguist-documentation
