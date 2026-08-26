@@ -10,7 +10,7 @@ use bytes::Bytes;
 use chorus_client::{
     slatedb::ChorusWal, ClientConfig, GrpcReplicaFactory, SegmentedVolume, WalEngineConfig,
 };
-use chorus_fake_gcs::{FakeGcs, RunningFake};
+use chorus_fake_gcs::{FakeGcs, LatencyProfile, Operation, RunningFake, SimulatedLatency};
 use slatedb::config::{
     CloseOptions, FlushOptions, FlushType, GarbageCollectorDirectoryOptions,
     GarbageCollectorOptions, Settings,
@@ -29,9 +29,28 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_slow_zone(false).await
+    }
+
+    async fn with_slow_zone(slow_zone: bool) -> Self {
         let mut servers = Vec::new();
-        for _ in 0..4 {
-            servers.push(FakeGcs::default().start().await.unwrap());
+        for zone in 0..4 {
+            let service = if slow_zone && zone == 2 {
+                FakeGcs::with_latency(
+                    LatencyProfile::new(7)
+                        .with_operation(
+                            Operation::BidiCreate,
+                            SimulatedLatency::fixed(Duration::from_millis(5)),
+                        )
+                        .with_operation(
+                            Operation::BidiFinalize,
+                            SimulatedLatency::fixed(Duration::from_millis(3)),
+                        ),
+                )
+            } else {
+                FakeGcs::default()
+            };
+            servers.push(service.start().await.unwrap());
         }
         Self {
             servers,
@@ -203,11 +222,36 @@ async fn close(db: &Db) {
         .unwrap();
 }
 
+// Object counts are not comparable across replicas: speculative provisioning
+// and catch-up can leave different numbers of objects in each zone. Instead,
+// check the exact sealed objects whose deletion the committed floor authorizes.
+fn collected_objects(manifest: &HashMap<String, String>, floor: u64) -> BTreeSet<String> {
+    let entries: Vec<_> = manifest["chorus.segments"]
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let mut fields = entry.split(':');
+            let id = fields.next().unwrap();
+            let base = fields.next().unwrap().parse::<u64>().unwrap();
+            (id, base)
+        })
+        .collect();
+    let tail = manifest["chorus.tail_base"].parse().unwrap();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| entries.get(index + 1).map_or(tail, |entry| entry.1) <= floor)
+        .map(|(_, (id, _))| format!("{PREFIX}/segments/{id}"))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_api_matches_model_across_gc_and_fresh_client_reopens() {
     tokio::time::timeout(Duration::from_secs(60), async {
         for seed in [1, 7, 42, 0xdead_beef] {
-            let fixture = Fixture::new().await;
+            // Exercise asymmetric provisioning/finalization as well as fast
+            // replicas; per-zone object counts need not agree at GC boundaries.
+            let fixture = Fixture::with_slow_zone(seed == 7).await;
             let mut model = Model::new();
             let mut state = seed;
             let mut previous_floor = 0;
@@ -217,7 +261,6 @@ async fn public_api_matches_model_across_gc_and_fresh_client_reopens() {
                 verify(&db, &model).await;
                 write_batches(&db, &mut model, &mut state, 40).await;
                 flush_l0(&db).await;
-                let before = fixture.segments(0).await;
                 let manifest = fixture.manifest().await;
                 collector.run_gc_once().await;
                 let collected = fixture.manifest().await;
@@ -226,8 +269,14 @@ async fn public_api_matches_model_across_gc_and_fresh_client_reopens() {
                 previous_floor = floor;
                 assert_eq!(manifest["chorus.epoch"], collected["chorus.epoch"]);
                 assert_eq!(manifest["chorus.owner"], collected["chorus.owner"]);
+                let deleted = collected_objects(&manifest, floor);
+                assert!(!deleted.is_empty(), "GC must reclaim physical objects");
                 for zone in 0..3 {
-                    assert!(fixture.segments(zone).await.len() < before.len());
+                    let remaining = fixture.segments(zone).await;
+                    assert!(
+                        deleted.is_disjoint(&remaining),
+                        "zone {zone}: {remaining:?}"
+                    );
                 }
                 write_batches(&db, &mut model, &mut state, 8).await;
                 verify(&db, &model).await;

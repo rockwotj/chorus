@@ -62,6 +62,7 @@ message Object {
   string content_type = 13;
   optional ObjectChecksums checksums = 16;
   map<string, string> metadata = 22;
+  optional Timestamp update_time = 17;
   optional Timestamp finalize_time = 36;
 }
 

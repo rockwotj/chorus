@@ -48,11 +48,12 @@ impl WalGc for ChorusWal {
     /// closes. It never recovers the volume or takes ownership of its writer.
     ///
     /// Only whole sealed segments preceding every retained range are reclaimed;
-    /// gaps between retained ranges are intentionally kept. `min_age` is a
-    /// conservative grace period from the first collection pass that observes a
-    /// segment as sealed and unreferenced. Reopening or observing the segment as
-    /// referenced resets that period. Dry runs do not start timers or change
-    /// storage. Already committed deletion tombstones may be retried by normal
+    /// gaps between retained ranges are intentionally kept. Nonzero `min_age`
+    /// checks storage modification time on every existing replica, including
+    /// newly repaired copies. Missing timestamps or unavailable listings defer
+    /// new truncation. Zero disables the age gate. Restarts and referenced
+    /// observations do not reset object age. Dry runs do not change storage.
+    /// Already committed deletion tombstones may be retried by normal
     /// background maintenance regardless of a later dry run or retention change.
     async fn collect(
         &self,

@@ -1274,6 +1274,13 @@ impl ReplicaFactory for GrpcReplicaFactory {
                     generation: object.generation,
                     size: object.size,
                     finalized: object.finalize_time.is_some(),
+                    last_modified: object
+                        .update_time
+                        .filter(|time| {
+                            (-62_135_596_800..=253_402_300_799).contains(&time.seconds)
+                                && (0..1_000_000_000).contains(&time.nanos)
+                        })
+                        .and_then(|time| time.try_into().ok()),
                     crc32c: object
                         .checksums
                         .as_ref()
