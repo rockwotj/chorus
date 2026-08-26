@@ -1,5 +1,105 @@
 use super::*;
 
+/// Run alone in an optimized test binary under a peak-RSS profiler. The fake
+/// servers live in this process, so their storage and gRPC buffers count too;
+/// compare identical fixtures/binaries, not this RSS with the WAL byte budget.
+/// Set CHORUS_RECOVERY_PROFILE_MIB to change the per-replica segment size.
+#[tokio::test]
+#[ignore = "manual full-segment recovery memory profile"]
+async fn seal_recovery_memory_profile() {
+    use crate::metrics::Metrics;
+    use crate::protocol::{digest_bytes, protocol_metadata, QuorumVolume};
+    use chorus_fake_gcs::proto;
+
+    let mib: usize = std::env::var("CHORUS_RECOVERY_PROFILE_MIB")
+        .unwrap_or_else(|_| "64".into())
+        .parse()
+        .unwrap();
+    assert!((1..=256).contains(&mib));
+    let framed = record(&vec![0x5a; 4092]).encode().unwrap();
+    let records = mib * 1024 * 1024 / framed.len();
+    let mut bytes = Vec::with_capacity(records * framed.len());
+    for _ in 0..records {
+        bytes.extend_from_slice(&framed);
+    }
+    let data = bytes::Bytes::from(bytes);
+    let expected_digest = digest_bytes(&data);
+    let expected_crc32c = crc32c::crc32c(&data);
+    let mut servers = Vec::new();
+    let mut factories = Vec::new();
+    for zone in 0..3 {
+        let server = FakeGcs::default().start().await.unwrap();
+        let factory = GrpcReplicaFactory::connect(
+            zone,
+            &server.endpoint,
+            format!("projects/_/buckets/zone-{zone}"),
+            None,
+        )
+        .await
+        .unwrap()
+        .with_test_read_message_limit(data.len() + 1024);
+        servers.push(server);
+        factories.push(factory);
+    }
+    let object = "seal-recovery-memory/segment";
+    // Seed finalized objects without retaining a writer or timing population.
+    // Recovery still takes the actual gRPC snapshot and canonical-selection
+    // paths, followed by committed-seal enforcement and its verification reads.
+    for (zone, server) in servers.iter().take(3).enumerate() {
+        server
+            .service
+            .sim_write_object(proto::WriteObjectRequest {
+                first_message: Some(proto::write_object_request::FirstMessage::WriteObjectSpec(
+                    proto::WriteObjectSpec {
+                        resource: Some(proto::Object {
+                            bucket: format!("projects/_/buckets/zone-{zone}"),
+                            name: object.into(),
+                            metadata: protocol_metadata(),
+                            ..Default::default()
+                        }),
+                        if_generation_match: Some(0),
+                        ..Default::default()
+                    },
+                )),
+                data: Some(proto::write_object_request::Data::ChecksummedData(
+                    proto::ChecksummedData {
+                        content: data.to_vec(),
+                        crc32c: Some(expected_crc32c),
+                    },
+                )),
+                finish_write: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    drop(data);
+    let volume = QuorumVolume::with_metadata(
+        factories
+            .iter()
+            .map(|factory| factory.replica(object))
+            .collect(),
+        test_config(),
+        protocol_metadata(),
+        Arc::new(Metrics::new(&crate::NoopMetricsRecorder, 3)),
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let recovered = volume.recover_for_seal(Some(records)).await.unwrap();
+    assert_eq!(recovered.digest(), expected_digest);
+    assert_eq!(recovered.crc32c(), expected_crc32c);
+    assert_eq!(recovered.canonical().len(), records);
+    assert!(!recovered.had_discarded_suffix());
+    volume.enforce_seal(recovered.canonical()).await.unwrap();
+    for server in servers.iter().take(3) {
+        assert!(server.service.operation_count(Operation::Read).await >= 2);
+    }
+    eprintln!(
+        "seal recovery: replicas=3 segment_mib={mib} records={records} elapsed={:?}",
+        start.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn recovery_does_not_promote_a_tail_below_the_second_largest_size() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
