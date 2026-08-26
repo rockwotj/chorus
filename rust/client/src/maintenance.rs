@@ -297,7 +297,6 @@ async fn execute_command(
                         deleted_segments = report.deleted_segments,
                         "truncation completed"
                     );
-                    task.metrics.truncation_cycles.increment();
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -306,7 +305,6 @@ async fn execute_command(
                         "truncation failed"
                     );
                     task.manifest = None;
-                    task.metrics.operation_failures.increment();
                 }
             }
             for response in responses {
@@ -535,6 +533,7 @@ impl MaintenanceState {
         match enforcement {
             Ok((segment, all_replicas_finalized)) => {
                 self.sealed.insert(base);
+                #[cfg(any(test, feature = "dst-support"))]
                 self.metrics.segments_sealed.increment();
                 self.metrics
                     .seal_duration
@@ -557,7 +556,6 @@ impl MaintenanceState {
                     %error,
                     "committed seal enforcement exhausted retries; rotation disabled until restart"
                 );
-                self.metrics.operation_failures.increment();
                 drop(enforced);
             }
         }
@@ -573,9 +571,6 @@ impl MaintenanceState {
     ) -> Result<SegmentDescriptor, Error> {
         let mut attempt = 0usize;
         loop {
-            if attempt > 0 {
-                self.metrics.seal_enforcement_retries.increment();
-            }
             match enforce_committed_seal(
                 &self.factories,
                 &self.prefix,
@@ -642,9 +637,6 @@ impl MaintenanceState {
             return;
         };
         let report = sweep_dead_segments(&self.factories, &self.prefix, &sweep).await;
-        self.metrics
-            .orphan_objects_deleted
-            .add(report.deleted_objects as u64);
         if report.deferred_operations == 0 {
             self.dead_segment_sweep = None;
             if report.orphan_segments > 0 || report.deleted_objects > 0 {
@@ -658,10 +650,8 @@ impl MaintenanceState {
             return;
         }
 
-        self.metrics.orphan_sweeps_deferred.increment();
         match report.failure {
             Some(error) => {
-                self.metrics.operation_failures.increment();
                 tracing::warn!(
                     claimed_epoch = sweep.claimed_epoch,
                     orphan_segments = report.orphan_segments,
@@ -688,12 +678,10 @@ impl MaintenanceState {
         let prefix = self.prefix.clone();
         if let Err(error) = self.ensure_manifest().await {
             tracing::warn!(%error, "tombstone cleanup manifest unavailable");
-            self.metrics.operation_failures.increment();
             return;
         }
         let Some(mut manifest) = self.manifest.take() else {
             tracing::warn!("tombstone cleanup lost its ensured manifest handle");
-            self.metrics.operation_failures.increment();
             return;
         };
         let before: HashSet<u64> = self
@@ -720,7 +708,6 @@ impl MaintenanceState {
                 // have left this handle's cache behind a concurrent truncator.
                 self.manifest = None;
                 tracing::warn!(%error, "committed-floor tombstone cleanup failed");
-                self.metrics.operation_failures.increment();
             }
         }
     }
@@ -732,29 +719,20 @@ impl MaintenanceState {
                 Err(error) => {
                     tracing::warn!(%error, "repair manifest refresh unavailable");
                     self.manifest = None;
-                    self.metrics.repair_failures.increment();
+                    #[cfg(any(test, feature = "dst-support"))]
                     self.metrics.repair_passes.increment();
                     return;
                 }
             },
             Err(error) => {
                 tracing::warn!(%error, "repair manifest unavailable");
-                self.metrics.repair_failures.increment();
+                #[cfg(any(test, feature = "dst-support"))]
                 self.metrics.repair_passes.increment();
                 return;
             }
         };
         match repair_sealed_pass(&self.factories, &self.prefix, &self.catalog, floor).await {
             Ok(report) => {
-                self.metrics
-                    .repair_objects_repaired
-                    .add(report.objects_repaired as u64);
-                self.metrics
-                    .repair_transient_skips
-                    .add(report.transient_failures as u64);
-                self.metrics
-                    .repair_segments_without_source
-                    .add(report.segments_without_source as u64);
                 if report.objects_repaired > 0 {
                     tracing::info!(
                         segments_examined = report.segments_examined,
@@ -788,12 +766,11 @@ impl MaintenanceState {
             }
             Err(error) => {
                 tracing::warn!(%error, floor, "repair pass failed");
-                self.metrics.repair_failures.increment();
-                self.metrics.operation_failures.increment();
             }
         }
         // counted on completion: deterministic tests and the DST poll this
         // as "a full pass has run"
+        #[cfg(any(test, feature = "dst-support"))]
         self.metrics.repair_passes.increment();
     }
 
@@ -808,7 +785,7 @@ impl MaintenanceState {
                         "targeted repair manifest refresh unavailable"
                     );
                     self.manifest = None;
-                    self.metrics.repair_failures.increment();
+                    #[cfg(any(test, feature = "dst-support"))]
                     self.metrics.repair_passes.increment();
                     return;
                 }
@@ -819,7 +796,7 @@ impl MaintenanceState {
                     segment_base = segment.base_record_index,
                     "targeted repair manifest unavailable"
                 );
-                self.metrics.repair_failures.increment();
+                #[cfg(any(test, feature = "dst-support"))]
                 self.metrics.repair_passes.increment();
                 return;
             }
@@ -833,21 +810,25 @@ impl MaintenanceState {
         .await
         {
             Ok(report) => {
-                self.metrics
-                    .repair_objects_repaired
-                    .add(report.objects_repaired as u64);
-                self.metrics
-                    .repair_transient_skips
-                    .add(report.transient_failures as u64);
-                self.metrics
-                    .repair_segments_without_source
-                    .add(report.segments_without_source as u64);
                 if report.objects_repaired > 0 {
                     tracing::info!(
                         segment_base = segment.base_record_index,
                         objects_repaired = report.objects_repaired,
                         transient_failures = report.transient_failures,
                         "targeted post-rotation repair completed"
+                    );
+                }
+                if report.transient_failures > 0 {
+                    tracing::warn!(
+                        segment_base = segment.base_record_index,
+                        transient_failures = report.transient_failures,
+                        "targeted post-rotation repair left transient failures"
+                    );
+                }
+                if report.segments_without_source > 0 {
+                    tracing::error!(
+                        segment_base = segment.base_record_index,
+                        "targeted post-rotation repair found a committed sealed segment with no verifiable copy"
                     );
                 }
             }
@@ -857,10 +838,9 @@ impl MaintenanceState {
                     segment_base = segment.base_record_index,
                     "targeted post-rotation repair failed"
                 );
-                self.metrics.repair_failures.increment();
-                self.metrics.operation_failures.increment();
             }
         }
+        #[cfg(any(test, feature = "dst-support"))]
         self.metrics.repair_passes.increment();
     }
 

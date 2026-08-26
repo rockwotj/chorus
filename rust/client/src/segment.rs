@@ -19,8 +19,8 @@ use crate::metrics::{Metrics, MetricsRecorder, NoopMetricsRecorder};
 #[cfg(test)]
 use crate::protocol::PendingCommit;
 use crate::protocol::{
-    canonical_prefix, majority, valid_format, AttemptedBytes, ClientConfig, CommitRange,
-    ProtocolError, QuorumVolume, RecoveredTail, RecoveryCandidate, Writer,
+    canonical_prefix, majority, valid_format, ClientConfig, CommitRange, ProtocolError,
+    QuorumVolume, RecoveredTail, RecoveryCandidate, Writer,
 };
 use crate::record::RecordFrame;
 use crate::transport::{
@@ -242,12 +242,13 @@ struct RecoveredSeal {
 }
 
 impl RecoveredPredecessor {
-    async fn enforce_seal(&mut self, metrics: &Metrics) -> Result<(), Error> {
+    async fn enforce_seal(&mut self, _metrics: &Metrics) -> Result<(), Error> {
         let Some(seal) = self.deferred_seal.take() else {
             return Ok(());
         };
         seal.volume.enforce_seal(seal.tail.canonical()).await?;
-        metrics.segments_sealed.increment();
+        #[cfg(any(test, feature = "dst-support"))]
+        _metrics.segments_sealed.increment();
         Ok(())
     }
 
@@ -727,7 +728,6 @@ mod recovery {
         /// call [`Recovery::start`] to conditionally create the manifest-selected
         /// active segment and begin admission.
         pub async fn recover(&self, checkpoint: WalSeqNo) -> Result<Recovery, Error> {
-            self.metrics.recoveries_run.increment();
             let mut manifest = self.open_manifest().await?;
             let claim_started = tokio::time::Instant::now();
             manifest.claim().await.map_err(Error::from)?;
@@ -746,7 +746,6 @@ mod recovery {
         /// database checkpoint. Database integrations should use [`Self::recover`]
         /// with their durable replay boundary.
         pub async fn recover_from_committed_floor(&self) -> Result<Recovery, Error> {
-            self.metrics.recoveries_run.increment();
             let mut manifest = self.open_manifest().await?;
             let claim_started = tokio::time::Instant::now();
             manifest.claim().await.map_err(Error::from)?;
@@ -839,7 +838,6 @@ mod recovery {
             &self,
             checkpoint: WalSeqNo,
         ) -> Result<SegmentedWriter, Error> {
-            self.metrics.recoveries_run.increment();
             let mut manifest = self.open_manifest().await?;
             manifest.claim().await.map_err(Error::from)?;
             tracing::info!(
@@ -1328,9 +1326,6 @@ mod recovery {
                     checkpoint.record_index, next_record_index
                 )));
             }
-            self.metrics
-                .recovery_segments_adopted
-                .add(sealed_segments.len() as u64);
             Ok(RecoveredWriterState {
                 sealed_segments,
                 base_record_index: next_record_index,
@@ -1397,10 +1392,6 @@ mod recovery {
             // owner's takeover and the fold CAS's quorum intersection carry the
             // safety argument for what remains.
             manifest.validate_owner().await.map_err(Error::from)?;
-            self.metrics.open_segments.add(1);
-            self.metrics
-                .committed_records_watermark
-                .set_u64(base_record_index);
             let spare_registered = pending_fold.is_none();
             Ok(SegmentedWriter {
                 factories: self.factories.clone(),
@@ -1616,6 +1607,7 @@ mod recovery {
                 expected_crc32c,
             )
             .await?;
+            #[cfg(any(test, feature = "dst-support"))]
             self.metrics.segments_sealed.increment();
             Ok(sealed)
         }
@@ -1717,12 +1709,6 @@ mod recovery {
 /// Active writer operation, spare adoption, and rotation transitions.
 mod writer {
     use super::*;
-
-    impl Drop for SegmentedWriter {
-        fn drop(&mut self) {
-            self.metrics.open_segments.add(-1);
-        }
-    }
 
     impl SegmentedWriter {
         pub(crate) fn metrics(&self) -> Arc<Metrics> {
@@ -1863,11 +1849,10 @@ mod writer {
         pub(crate) async fn enqueue_records(
             &mut self,
             records: Vec<RecordFrame>,
-            on_attempted: AttemptedBytes,
         ) -> Result<Vec<RecordPendingCommit>, Error> {
             let pending = self
                 .segment_writer
-                .enqueue_data_window(records, on_attempted)
+                .enqueue_data_window(records)
                 .await?
                 .into_pending();
             Ok(pending
@@ -1882,12 +1867,8 @@ mod writer {
         pub(crate) async fn enqueue_records_for_engine(
             &mut self,
             records: Vec<RecordFrame>,
-            on_attempted: AttemptedBytes,
         ) -> Result<RecordCommitRange, Error> {
-            let range = self
-                .segment_writer
-                .enqueue_data_window(records, on_attempted)
-                .await?;
+            let range = self.segment_writer.enqueue_data_window(records).await?;
             let first_offset = range.first_offset() as u64;
             let end_offset = range.end_offset() as u64;
             Ok(RecordCommitRange {
@@ -2083,7 +2064,6 @@ mod writer {
                     seal_pending: swap.writer.is_some(),
                 });
             }
-            self.metrics.rotations_completed.increment();
             Ok(())
         }
 
@@ -2127,6 +2107,7 @@ mod writer {
                 .into_segment()
                 .ok_or_else(|| Error::Internal("live rotation lost its old writer".into()))?;
             segment.writer.seal().await?;
+            #[cfg(any(test, feature = "dst-support"))]
             self.metrics.segments_sealed.increment();
             tracing::info!(
                 segment_base = segment.base_record_index,
@@ -2529,6 +2510,14 @@ mod maintenance {
             let zones = listings
                 .into_iter()
                 .map(|listing| {
+                    if let Err(error) = &listing {
+                        tracing::warn!(
+                            %error,
+                            zone = error.zone,
+                            prefix = %objects_prefix,
+                            "sealed segment listing failed; skipping zone for this repair pass"
+                        );
+                    }
                     listing.ok().map(|objects| {
                         objects
                             .into_iter()

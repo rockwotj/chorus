@@ -120,7 +120,7 @@ async fn five_zone_writes_block_without_a_three_zone_quorum() {
         server.service.set_crashed(true).await;
     }
     let pending = writer
-        .enqueue_records(vec![record(b"no-quorum")], no_attempted_bytes())
+        .enqueue_records(vec![record(b"no-quorum")])
         .await
         .unwrap()
         .remove(0);

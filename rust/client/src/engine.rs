@@ -239,7 +239,6 @@ pub struct WalEngine;
 /// awaitable by the database's apply pipeline.
 pub struct WalHandle {
     sender: mpsc::Sender<Command>,
-    metrics: Arc<Metrics>,
     engine_task: tokio::task::JoinHandle<()>,
     provisioner_task: tokio::task::JoinHandle<()>,
     provisioner_shutdown: watch::Sender<bool>,
@@ -248,7 +247,6 @@ pub struct WalHandle {
     rotation_recheck: mpsc::Sender<()>,
     next_seqno: u64,
     max_record_bytes: usize,
-    max_inflight_bytes: usize,
     max_active_segment_bytes: usize,
     total_admitted_bytes: u128,
     active_capacity: watch::Receiver<ActiveSegmentCapacity>,
@@ -261,7 +259,6 @@ struct AdmittedAppend {
     seqno: WalSeqNo,
     record: RecordFrame,
     payload_bytes: usize,
-    encoded_bytes: usize,
     /// Cumulative encoded admission boundary after this record. The engine
     /// publishes the last boundary assigned to an old segment when it swaps,
     /// so the handle can charge every later queued record to the successor
@@ -340,14 +337,12 @@ impl EngineState {
     ) {
         self.stop_admission(receiver);
         fail_all(&mut self.queue, error, metrics);
-        metrics.operation_failures.increment();
     }
 
     fn poison(&mut self, receiver: &mut mpsc::Receiver<Command>, metrics: &Metrics) {
         self.stop_admission(receiver);
         fail_completion_batches(&mut self.completion_batches, Error::Poisoned, metrics);
         fail_all(&mut self.queue, Error::Poisoned, metrics);
-        metrics.operation_failures.increment();
     }
 }
 
@@ -461,7 +456,6 @@ impl WalEngine {
         ));
         Ok(WalHandle {
             sender,
-            metrics,
             engine_task,
             provisioner_task,
             provisioner_shutdown,
@@ -470,7 +464,6 @@ impl WalEngine {
             rotation_recheck,
             next_seqno,
             max_record_bytes,
-            max_inflight_bytes,
             max_active_segment_bytes,
             total_admitted_bytes: 0,
             active_capacity,
@@ -574,17 +567,12 @@ impl WalHandle {
             .acquire_owned()
             .await
             .map_err(|_| Error::Closed)?;
-        self.metrics.max_inflight_bytes.update_max(
-            self.max_inflight_bytes
-                .saturating_sub(self.inflight_bytes.available_permits()) as u64,
-        );
         let (completion, receiver) = oneshot::channel();
         self.sender
             .send(Command::Append(AdmittedAppend {
                 seqno,
                 record,
                 payload_bytes,
-                encoded_bytes,
                 admission_end_bytes,
                 admitted_at: tokio::time::Instant::now(),
                 _inflight_bytes: inflight_bytes,
@@ -596,8 +584,6 @@ impl WalHandle {
 
         self.total_admitted_bytes = admission_end_bytes;
         self.next_seqno += 1;
-        self.metrics.append_records.increment();
-        self.metrics.append_bytes.add(payload_bytes as u64);
         Ok(AppendCompletion { receiver })
     }
 
@@ -795,13 +781,8 @@ async fn run_engine(
     // `select!` wake source, so a swap waiting on a slow spare can never park
     // the engine. `spare_requested` keeps at most one attempt outstanding.
     let mut spare_requested = false;
-    let attempted_stats = Arc::clone(&metrics);
-    let on_attempted: crate::protocol::AttemptedBytes = Arc::new(move |bytes| {
-        attempted_stats.replica_bytes_attempted.add(bytes);
-    });
 
     'engine: loop {
-        metrics.rotation_state.set(rotation.metric_value());
         state.drain_available(&mut receiver);
         observe_queue_depth(&metrics, config.queue_capacity, &queue_slots);
 
@@ -958,7 +939,6 @@ async fn run_engine(
             if let Some(attempt) = attempt {
                 if provision_requests.try_send(attempt).is_ok() {
                     spare_requested = true;
-                    metrics.spare_provisioning_attempts.increment();
                 }
             }
         }
@@ -1030,27 +1010,16 @@ async fn run_engine(
                 appends.push(append);
             }
             let records = appends.iter().map(|append| append.record.clone()).collect();
-            let wal_record_bytes: u64 = appends
-                .iter()
-                .map(|append| append.encoded_bytes as u64)
-                .sum();
             let batch_admission_end = appends
                 .last()
                 .map(|append| append.admission_end_bytes)
                 .unwrap_or(state.last_dispatched_admission_bytes);
-            match writer
-                .enqueue_records_for_engine(records, Arc::clone(&on_attempted))
-                .await
-            {
+            match writer.enqueue_records_for_engine(records).await {
                 Ok(commits) => {
                     for append in &mut appends {
                         drop(append.queue_slot.take());
                     }
                     state.last_dispatched_admission_bytes = batch_admission_end;
-                    if outstanding > 0 {
-                        metrics.pipeline_refills.increment();
-                    }
-                    metrics.wal_record_bytes.add(wal_record_bytes);
                     let expected_first = appends
                         .first()
                         .map(|append| append.seqno.record_index)
@@ -1072,7 +1041,6 @@ async fn run_engine(
                             fail_append(append, error.clone(), &metrics);
                         }
                         fail_all(&mut state.queue, error, &metrics);
-                        metrics.operation_failures.increment();
                         break 'engine;
                     }
                     state.pending_records += appends.len();
@@ -1080,9 +1048,6 @@ async fn run_engine(
                         commits,
                         appends: appends.into(),
                     });
-                    metrics
-                        .max_inflight_records
-                        .update_max(state.pending_records as u64);
                     rotation.mark_due(writer.rotation_due(config.max_segment_bytes));
                 }
                 Err(error) => {
@@ -1091,7 +1056,6 @@ async fn run_engine(
                     for append in appends {
                         fail_append(append, error.clone(), &metrics);
                     }
-                    metrics.operation_failures.increment();
                     fail_all(&mut state.queue, error, &metrics);
                     break 'engine;
                 }
@@ -1103,7 +1067,6 @@ async fn run_engine(
             break;
         }
 
-        metrics.rotation_state.set(rotation.metric_value());
         // The single wait point: every event that can unblock the engine is a
         // branch here, so nothing the loop is waiting for can fail to wake it.
         //
@@ -1126,7 +1089,6 @@ async fn run_engine(
                     }
                     fail_completion_batches(&mut state.completion_batches, Error::Poisoned, &metrics);
                     fail_all(&mut state.queue, Error::Poisoned, &metrics);
-                    metrics.operation_failures.increment();
                     break 'engine;
                 }
             }
@@ -1155,7 +1117,6 @@ async fn run_engine(
                         rotation = Rotation::Disabled {
                             due: writer.rotation_due(config.max_segment_bytes),
                         };
-                        metrics.operation_failures.increment();
                     }
                     RotationEvent::RetryElapsed => {
                         if let Rotation::Draining { retry, .. } = &mut rotation {
@@ -1181,7 +1142,6 @@ async fn run_engine(
                                     %error,
                                     "failed to refresh rotation eligibility after truncation"
                                 );
-                                metrics.operation_failures.increment();
                             }
                         }
                     }
@@ -1226,7 +1186,6 @@ async fn run_engine(
                                     rotation = Rotation::Disabled {
                                         due: writer.rotation_due(config.max_segment_bytes),
                                     };
-                                    metrics.operation_failures.increment();
                                 }
                             }
                         } else {
@@ -1250,12 +1209,10 @@ async fn run_engine(
                                 "manifest directory is full; pending fold waits for truncation"
                             );
                         } else if matches!(error, Error::Poisoned | Error::Fenced(_)) {
-                            metrics.spare_provisioning_failures.increment();
                             tracing::warn!(%error, "background rotation work was fenced");
                             state.fail_queued(&mut receiver, error, &metrics);
                             break 'engine;
                         } else {
-                            metrics.spare_provisioning_failures.increment();
                             tracing::warn!(%error, "background rotation work failed; will retry");
                             if rotation.has_pending_fold() && writer.unregistered_spare_ready() {
                                 rotation.arm_fold_retry(&client_config);
@@ -1263,7 +1220,6 @@ async fn run_engine(
                         }
                     }
                     None => {
-                        metrics.spare_provisioning_failures.increment();
                         tracing::warn!("spare provisioner stopped");
                         state.fail_queued(&mut receiver, Error::Closed, &metrics);
                         break 'engine;
@@ -1291,7 +1247,6 @@ async fn run_engine(
         tracing::warn!("WAL engine stopped without graceful shutdown");
     }
     metrics.queue_depth.set(0);
-    metrics.rotation_state.set(0);
 }
 
 /// What the rotation wake arm of the engine's `select!` observed: the two
@@ -1339,16 +1294,6 @@ enum Rotation {
 }
 
 impl Rotation {
-    fn metric_value(&self) -> i64 {
-        match self {
-            Self::Idle => 0,
-            Self::Due => 1,
-            Self::Draining { .. } => 2,
-            Self::Sealing { .. } => 3,
-            Self::Disabled { .. } => 4,
-        }
-    }
-
     fn mark_due(&mut self, due: bool) {
         if !due {
             return;
@@ -1556,9 +1501,6 @@ fn complete_append(append: AdmittedAppend, metrics: &Metrics) {
     }));
     metrics.committed_records.increment();
     metrics.committed_bytes.add(append.payload_bytes as u64);
-    metrics
-        .committed_records_watermark
-        .set_u64(append.seqno.record_index + 1);
 }
 
 fn admit_command(command: Command, queue: &mut VecDeque<Command>, next_admission: &mut u64) {

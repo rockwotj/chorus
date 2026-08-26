@@ -43,8 +43,6 @@ fn select_recovery_size(sizes: &mut [i64], replica_count: usize) -> Option<i64> 
     (required_available_support > 0).then(|| sizes[sizes.len() - required_available_support])
 }
 
-pub(crate) type AttemptedBytes = Arc<dyn Fn(u64) + Send + Sync>;
-
 #[derive(Clone, Debug)]
 /// Retry policy for transport operations used by recovery and writes.
 ///
@@ -1426,7 +1424,6 @@ impl Writer {
     pub async fn enqueue_data_window(
         &mut self,
         records: Vec<RecordFrame>,
-        on_attempted: AttemptedBytes,
     ) -> Result<CommitRange, ProtocolError> {
         if records.is_empty() {
             return Ok(CommitRange {
@@ -1451,7 +1448,6 @@ impl Writer {
             self.commits.poison();
             return Err(ProtocolError::NoQuorum);
         }
-        self.metrics.batches_sent.increment();
         let batch_bytes = chunks.iter().map(Bytes::len).sum::<usize>();
         let mut reservations = Vec::with_capacity(self.lanes.len());
         let mut retired_lanes = Vec::new();
@@ -1464,6 +1460,7 @@ impl Writer {
                 lane.done.abort();
                 retired_lanes.push(lane.done);
                 self.commits.finish_lane(zone, None);
+                #[cfg(any(test, feature = "dst-support"))]
                 self.metrics.lane_capacity_drops.increment();
                 tracing::warn!(
                     zone,
@@ -1491,8 +1488,6 @@ impl Writer {
             start,
             chunks: Arc::clone(&chunks),
             boundaries,
-            on_attempted: Arc::clone(&on_attempted),
-            bytes: batch_bytes,
             pending_lanes: AtomicUsize::new(reservations.iter().flatten().count()),
             packed_groups: std::sync::Mutex::new(BTreeMap::new()),
         });
@@ -1847,8 +1842,6 @@ struct BatchDescriptor {
     start: i64,
     chunks: Arc<[Bytes]>,
     boundaries: Arc<[i64]>,
-    on_attempted: AttemptedBytes,
-    bytes: usize,
     pending_lanes: AtomicUsize,
     packed_groups: Mutex<BTreeMap<i64, Arc<OnceLock<Arc<PackedAppend>>>>>,
 }
@@ -1987,8 +1980,9 @@ enum LaneDeath {
 }
 
 impl LaneDeath {
-    fn stalled(metrics: &Metrics) -> Self {
-        metrics.lane_timeouts.increment();
+    fn stalled(_metrics: &Metrics) -> Self {
+        #[cfg(any(test, feature = "dst-support"))]
+        _metrics.lane_timeouts.increment();
         Self::Stalled
     }
 }
@@ -2002,7 +1996,6 @@ struct LaneRuntime {
     stall_timeout: Arc<LaneStallTimeout>,
     durable: i64,
     retained: VecDeque<RetainedBatch>,
-    attempted: Option<AttemptedBytes>,
     monitor_session: bool,
     last_progress: tokio::time::Instant,
 }
@@ -2026,7 +2019,6 @@ impl LaneRuntime {
             stall_timeout,
             durable,
             retained: VecDeque::new(),
-            attempted: None,
             // Keep observing an idle live stream so a trailing fence cannot
             // disappear merely because its persisted-size response drained
             // the retained suffix.
@@ -2074,12 +2066,7 @@ impl LaneRuntime {
     async fn stage(&mut self, batches: Vec<LaneBatch>) -> Result<bool, LaneDeath> {
         match tokio::time::timeout_at(
             self.stall_deadline(),
-            stage_group(
-                &self.replica,
-                batches,
-                &mut self.attempted,
-                &mut self.retained,
-            ),
+            stage_group(&self.replica, batches, &mut self.retained),
         )
         .await
         {
@@ -2240,7 +2227,6 @@ async fn run_lane(
 async fn stage_group(
     replica: &Arc<dyn Replica>,
     batches: Vec<LaneBatch>,
-    attempted: &mut Option<AttemptedBytes>,
     retained: &mut VecDeque<RetainedBatch>,
 ) -> bool {
     let group_start = batches
@@ -2250,8 +2236,6 @@ async fn stage_group(
         .start;
     let packed = packed_group(&batches);
     for batch in batches {
-        (batch.batch.on_attempted)(batch.batch.bytes as u64);
-        *attempted = Some(Arc::clone(&batch.batch.on_attempted));
         retained.push_back(batch.into_retained());
     }
     replica
@@ -2400,7 +2384,6 @@ impl LaneRuntime {
     async fn recover(&mut self) -> Result<(), LaneDeath> {
         let mut attempt = 0usize;
         loop {
-            self.metrics.lane_retries.increment();
             let deadline = self.stall_deadline();
             let resumed =
                 tokio::time::timeout_at(deadline, self.replica.resume_tail(&mut self.token)).await;
@@ -2458,9 +2441,6 @@ impl LaneRuntime {
                         attempt,
                         "resending append lane batch after recovery"
                     );
-                    if let Some(attempted) = &self.attempted {
-                        attempted(resend_bytes as u64);
-                    }
                     let sent = tokio::time::timeout_at(
                         self.stall_deadline(),
                         self.replica.lane_send_packed(self.durable, &packed),
@@ -2765,13 +2745,10 @@ mod tests {
             end += chunk.len() as i64;
             boundaries.push(end);
         }
-        let bytes = chunks.iter().map(Bytes::len).sum();
         Arc::new(BatchDescriptor {
             start,
             chunks: chunks.into(),
             boundaries: boundaries.into(),
-            on_attempted: Arc::new(|_| {}),
-            bytes,
             pending_lanes: AtomicUsize::new(pending_lanes),
             packed_groups: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -3255,26 +3232,28 @@ mod tests {
     fn matching_lane_groups_share_one_packed_wire_payload() {
         let first = batch_descriptor(0, vec![Bytes::from_static(b"first")], 2);
         let second = batch_descriptor(first.end(), vec![Bytes::from_static(b"second")], 2);
+        let first_bytes = first.chunks.iter().map(Bytes::len).sum();
+        let second_bytes = second.chunks.iter().map(Bytes::len).sum();
         let first_budget = LaneBudget::new();
         let second_budget = LaneBudget::new();
         let group_one = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                first_budget.try_reserve(first.bytes).unwrap(),
+                first_budget.try_reserve(first_bytes).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                first_budget.try_reserve(second.bytes).unwrap(),
+                first_budget.try_reserve(second_bytes).unwrap(),
             ),
         ];
         let group_two = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                second_budget.try_reserve(first.bytes).unwrap(),
+                second_budget.try_reserve(first_bytes).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                second_budget.try_reserve(second.bytes).unwrap(),
+                second_budget.try_reserve(second_bytes).unwrap(),
             ),
         ];
 
@@ -3686,10 +3665,9 @@ mod tests {
         );
         let encoded = record(b"first").encode().unwrap().len();
         writer.set_max_replica_lag_bytes(encoded * 2);
-        let attempted: AttemptedBytes = Arc::new(|_| {});
 
         let first = writer
-            .enqueue_data_window(vec![record(b"first")], attempted.clone())
+            .enqueue_data_window(vec![record(b"first")])
             .await
             .unwrap()
             .into_pending()
@@ -3697,7 +3675,7 @@ mod tests {
         assert_eq!(sends_rx.recv().await, Some(encoded as i64));
 
         let second = writer
-            .enqueue_data_window(vec![record(b"other")], attempted.clone())
+            .enqueue_data_window(vec![record(b"other")])
             .await
             .unwrap()
             .into_pending()
@@ -3708,7 +3686,7 @@ mod tests {
         assert_eq!(sends_rx.recv().await, Some((encoded * 2) as i64));
 
         let third = writer
-            .enqueue_data_window(vec![record(b"third")], attempted)
+            .enqueue_data_window(vec![record(b"third")])
             .await
             .unwrap()
             .into_pending()

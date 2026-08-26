@@ -96,8 +96,9 @@ cargo run --release -p chorus-cli --bin chorus -- \
 ```
 
 Set a positive `--arrival-rate` for open-loop records per second. The report
-includes throughput, latency percentiles, batching, write amplification,
-pipeline metrics, and drain accounting.
+includes throughput, latency percentiles (`p50`, `p99`, `p99_9`, and `max`),
+configuration, and drain accounting. Batching, write amplification, pipeline
+high-water marks, and lane event counters are no longer reported.
 
 `benchmark recovery` populates a separate WAL below `<prefix>/iNNN` for each
 iteration, cleanly shuts down its writer, then measures epoch claim, prepare,
@@ -117,6 +118,10 @@ cargo run --release -p chorus-cli --bin chorus -- \
   --iterations 5 \
   --payload-bytes 4096
 ```
+
+The report retains per-phase latency percentiles, observed sealed-segment counts,
+and replayed-record counts. It no longer reports manifest CAS attempts or seal
+operation counts.
 
 The base prefix must be unused because each iteration starts record numbering at
 zero. This measures a new Chorus recovery pass in the same process with reused
