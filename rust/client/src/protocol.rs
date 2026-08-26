@@ -211,7 +211,7 @@ impl SealReport {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct CanonicalPrefix {
     bytes: Vec<u8>,
     records: Vec<RecordFrame>,
@@ -1128,7 +1128,7 @@ impl QuorumVolume {
             metadata: self.metadata.clone(),
             bytes: Vec::new(),
         }));
-        let (mut canonical, _) = select_canonical_quorum(&recovery_snapshots, self.quorum())?;
+        let mut canonical = select_canonical_quorum(&recovery_snapshots, self.quorum())?;
         let had_discarded_suffix = max_observed_size > canonical.bytes.len();
         if let Some(expected) = expected_records {
             if canonical.len() < expected {
@@ -2571,7 +2571,7 @@ pub(crate) fn canonical_prefix(
     snapshots: &[ReplicaSnapshot],
     quorum: usize,
 ) -> Result<Vec<RecordFrame>, ProtocolError> {
-    select_canonical_quorum(snapshots, quorum).map(|(prefix, _)| prefix.into_records())
+    select_canonical_quorum(snapshots, quorum).map(CanonicalPrefix::into_records)
 }
 
 /// Ascending index combinations of size `quorum` out of `count` snapshots,
@@ -2608,11 +2608,11 @@ fn quorum_subsets(count: usize, quorum: usize) -> Vec<Vec<usize>> {
 fn select_canonical_quorum(
     snapshots: &[ReplicaSnapshot],
     quorum: usize,
-) -> Result<(CanonicalPrefix, Vec<ReplicaSnapshot>), ProtocolError> {
+) -> Result<CanonicalPrefix, ProtocolError> {
     if snapshots.len() < quorum {
         return Err(ProtocolError::NoQuorum);
     }
-    let decoded: Vec<_> = snapshots
+    let mut decoded: Vec<_> = snapshots
         .iter()
         .map(CanonicalPrefix::from_snapshot)
         .collect();
@@ -2646,47 +2646,46 @@ fn select_canonical_quorum(
                 longest_member = member;
             }
         }
-        candidates.push((
-            decoded[longest_member].clone(),
-            subset
-                .iter()
-                .map(|&member| snapshots[member].clone())
-                .collect::<Vec<_>>(),
-        ));
+        // Candidates only identify existing buffers. Cloning a canonical
+        // prefix and every witness here duplicates whole segments for each
+        // quorum combination, although callers only need the selected prefix.
+        candidates.push((longest_member, subset));
     }
     let longest = candidates
         .iter()
-        .map(|(candidate, _)| candidate.len())
+        .map(|&(candidate, _)| decoded[candidate].len())
         .max()
         .ok_or(ProtocolError::ConflictingPrefix {
             record_index: first_conflict.unwrap_or(0),
         })?;
     let mut longest_candidates = candidates
         .into_iter()
-        .filter(|(candidate, _)| candidate.len() == longest);
+        .filter(|&(candidate, _)| decoded[candidate].len() == longest);
     let first = longest_candidates
         .next()
         .expect("longest length came from a candidate");
     let mut equivalent = vec![first];
     for candidate in longest_candidates {
-        if candidate.0.bytes != equivalent[0].0.bytes {
-            let record_index = (0..candidate.0.len())
-                .find(|index| {
-                    candidate.0.record_bytes(*index) != equivalent[0].0.record_bytes(*index)
-                })
+        let other = &decoded[candidate.0];
+        let first = &decoded[equivalent[0].0];
+        if other.bytes != first.bytes {
+            let record_index = (0..other.len())
+                .find(|index| other.record_bytes(*index) != first.record_bytes(*index))
                 .unwrap_or(0);
             return Err(ProtocolError::ConflictingPrefix { record_index });
         }
         equivalent.push(candidate);
     }
-    Ok(equivalent
+    let (selected, _) = equivalent
         .into_iter()
         .max_by(|(_, left_witnesses), (_, right_witnesses)| {
-            let left_zones: Vec<_> = left_witnesses.iter().map(|copy| copy.zone).collect();
-            let right_zones: Vec<_> = right_witnesses.iter().map(|copy| copy.zone).collect();
-            right_zones.cmp(&left_zones)
+            let left_zones = left_witnesses.iter().map(|&index| snapshots[index].zone);
+            let right_zones = right_witnesses.iter().map(|&index| snapshots[index].zone);
+            right_zones.cmp(left_zones)
         })
-        .expect("at least one equivalent candidate remains"))
+        .expect("at least one equivalent candidate remains");
+    // Move the winner once; all other decoded prefixes are released here.
+    Ok(decoded.swap_remove(selected))
 }
 
 pub(crate) fn protocol_metadata() -> HashMap<String, String> {
@@ -3412,6 +3411,108 @@ mod tests {
             canonical_prefix(&snapshots, 3).unwrap(),
             vec![first, second]
         );
+    }
+
+    #[test]
+    fn canonical_selection_matches_record_level_reference() {
+        // Deliberately compare decoded records rather than the production
+        // byte-range conflict table and candidate representation. Exhaustive
+        // assignments cover minority divergence, ambiguous maximal candidates,
+        // compatible shorter candidates, missing witnesses and truncated tails.
+        fn reference(
+            snapshots: &[ReplicaSnapshot],
+            quorum: usize,
+        ) -> Result<Vec<RecordFrame>, ProtocolError> {
+            if snapshots.len() < quorum {
+                return Err(ProtocolError::NoQuorum);
+            }
+            let records: Vec<_> = snapshots
+                .iter()
+                .map(|copy| RecordFrame::decode_complete_prefix(&copy.bytes).0)
+                .collect();
+            let conflict = |left: usize, right: usize| {
+                records[left]
+                    .iter()
+                    .zip(&records[right])
+                    .position(|(left, right)| left != right)
+            };
+            let first_conflict = (0..records.len())
+                .find_map(|left| (left + 1..records.len()).find_map(|right| conflict(left, right)));
+            let mut candidates = Vec::new();
+            for subset in quorum_subsets(records.len(), quorum) {
+                if subset.iter().enumerate().all(|(position, &left)| {
+                    subset[position + 1..]
+                        .iter()
+                        .all(|&right| conflict(left, right).is_none())
+                }) {
+                    let longest = subset
+                        .into_iter()
+                        .max_by_key(|&member| records[member].len())
+                        .unwrap();
+                    candidates.push(longest);
+                }
+            }
+            let longest = candidates
+                .iter()
+                .map(|&member| records[member].len())
+                .max()
+                .ok_or(ProtocolError::ConflictingPrefix {
+                    record_index: first_conflict.unwrap_or(0),
+                })?;
+            let mut maximal = candidates
+                .into_iter()
+                .filter(|&member| records[member].len() == longest);
+            let first = maximal.next().unwrap();
+            for other in maximal {
+                if let Some(record_index) = conflict(first, other) {
+                    return Err(ProtocolError::ConflictingPrefix { record_index });
+                }
+            }
+            Ok(records[first].clone())
+        }
+
+        let a = record(b"a");
+        let b = record(b"b");
+        let mut partial = encode_records(&[a.clone(), b.clone()]).unwrap();
+        partial.pop();
+        let mut malformed = encode_records(std::slice::from_ref(&a)).unwrap();
+        malformed.extend_from_slice(&[0, 0, 0, 3]);
+        let variants = [
+            Vec::new(),
+            encode_records(&[record(b"")]).unwrap(),
+            encode_records(std::slice::from_ref(&a)).unwrap(),
+            encode_records(std::slice::from_ref(&b)).unwrap(),
+            encode_records(&[a.clone(), a.clone()]).unwrap(),
+            encode_records(&[a.clone(), b.clone()]).unwrap(),
+            encode_records(&[b, a]).unwrap(),
+            partial,
+            malformed,
+        ];
+        let zones = [4, 0, 3, 1, 2];
+        for width in [1usize, 3, 5] {
+            let quorum = majority(width);
+            for readable in 0..=width {
+                for assignment in 0..variants.len().pow(readable as u32) {
+                    let mut remaining = assignment;
+                    let snapshots: Vec<_> = zones[..readable]
+                        .iter()
+                        .map(|&zone| {
+                            let bytes = variants[remaining % variants.len()].clone();
+                            remaining /= variants.len();
+                            ReplicaSnapshot {
+                                bytes,
+                                ..snapshot(zone, &[])
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        canonical_prefix(&snapshots, quorum).map_err(|error| error.to_string()),
+                        reference(&snapshots, quorum).map_err(|error| error.to_string()),
+                        "width={width} readable={readable} assignment={assignment}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

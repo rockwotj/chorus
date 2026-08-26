@@ -60,6 +60,17 @@ pub struct GrpcReplicaFactory {
     routing_token: RoutingToken,
 }
 
+#[cfg(test)]
+impl GrpcReplicaFactory {
+    // The in-process fake returns an entire object in one read response.
+    // Large manual recovery fixtures need a higher limit than real GCS's
+    // chunked responses; production channels keep the default message limit.
+    pub(crate) fn with_test_read_message_limit(mut self, limit: usize) -> Self {
+        self.client = self.client.max_decoding_message_size(limit);
+        self
+    }
+}
+
 /// A live appendable write stream: an ordered request sender plus a
 /// background reader translating flush acknowledgments into a watchable
 /// durable tail. Send-ahead lanes write through `tx` while waiting on
