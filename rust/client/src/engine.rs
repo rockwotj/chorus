@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -18,24 +19,30 @@ use crate::segment::{
 };
 use crate::transport::Replica;
 
-const DEFAULT_PIPELINE_WINDOW_RECORDS: usize = 32;
-const DEFAULT_QUEUE_CAPACITY: usize = DEFAULT_PIPELINE_WINDOW_RECORDS * 8;
+const DEFAULT_PIPELINE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_QUEUE_CAPACITY_BYTES: usize = DEFAULT_PIPELINE_WINDOW_BYTES * 16;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 /// Capacity controls for the in-process transactional WAL pipeline.
 pub struct WalEngineConfig {
-    /// Maximum records waiting to enter the dispatched pipeline.
+    /// Maximum encoded WAL bytes waiting to enter the dispatched pipeline.
     ///
     /// This is one combined bound across the handle-to-engine channel and the
     /// engine's internal queue, not a separate allowance for each stage. The
-    /// default is 256 records, eight times the default pipeline window.
-    pub queue_capacity: usize,
+    /// default is 64 MiB, sixteen times the default pipeline window. Must fit
+    /// one maximum-size encoded record.
+    pub queue_capacity_bytes: usize,
     /// Maximum application payload bytes accepted in one record.
     pub max_record_bytes: usize,
-    /// Maximum dispatched but not yet logically committed records. Slots are
-    /// replenished individually as ordered quorum completions arrive.
-    pub pipeline_window_records: usize,
+    /// Maximum encoded WAL bytes dispatched but not yet logically committed.
+    /// Budget is returned per record as ordered quorum completions arrive.
+    ///
+    /// The provider bounds an append by the bytes it carries, not by the number
+    /// of records packed into it, so this window is what decides how much data
+    /// one dispatched append may hold. The default is 4 MiB. Must fit one
+    /// maximum-size encoded record.
+    pub pipeline_window_bytes: usize,
     /// Maximum encoded WAL bytes admitted but not yet resolved through the
     /// ordered quorum completion stream. Admission waits for this byte budget
     /// before taking ownership of another record.
@@ -96,9 +103,9 @@ pub struct WalEngineConfig {
 impl Default for WalEngineConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            queue_capacity_bytes: DEFAULT_QUEUE_CAPACITY_BYTES,
             max_record_bytes: 1024 * 1024,
-            pipeline_window_records: DEFAULT_PIPELINE_WINDOW_RECORDS,
+            pipeline_window_bytes: DEFAULT_PIPELINE_WINDOW_BYTES,
             max_inflight_bytes: 64 * 1024 * 1024,
             max_replica_lag_bytes: 64 * 1024 * 1024,
             lane_stall_timeout: crate::protocol::DEFAULT_LANE_STALL_TIMEOUT,
@@ -113,8 +120,8 @@ impl Default for WalEngineConfig {
 
 impl WalEngineConfig {
     fn validate(&self) -> Result<(), Error> {
-        if self.queue_capacity == 0 {
-            return Err(Error::InvalidConfig("queue_capacity must be nonzero"));
+        if self.queue_capacity_bytes == 0 {
+            return Err(Error::InvalidConfig("queue_capacity_bytes must be nonzero"));
         }
         if self.max_record_bytes == 0 {
             return Err(Error::InvalidConfig("max_record_bytes must be nonzero"));
@@ -124,9 +131,9 @@ impl WalEngineConfig {
                 "max_record_bytes exceeds the record format limit",
             ));
         }
-        if self.pipeline_window_records == 0 {
+        if self.pipeline_window_bytes == 0 {
             return Err(Error::InvalidConfig(
-                "pipeline_window_records must be nonzero",
+                "pipeline_window_bytes must be nonzero",
             ));
         }
         if self.max_inflight_bytes == 0 {
@@ -139,11 +146,21 @@ impl WalEngineConfig {
         }
         let max_encoded_record = self
             .max_record_bytes
-            .checked_add(4)
+            .checked_add(RecordFrame::HEADER_LEN)
             .ok_or(Error::InvalidConfig("max_record_bytes is too large"))?;
         if max_encoded_record > self.max_inflight_bytes {
             return Err(Error::InvalidConfig(
                 "max_inflight_bytes must fit one maximum-size encoded record",
+            ));
+        }
+        if max_encoded_record > self.queue_capacity_bytes {
+            return Err(Error::InvalidConfig(
+                "queue_capacity_bytes must fit one maximum-size encoded record",
+            ));
+        }
+        if max_encoded_record > self.pipeline_window_bytes {
+            return Err(Error::InvalidConfig(
+                "pipeline_window_bytes must fit one maximum-size encoded record",
             ));
         }
         if self.max_replica_lag_bytes < self.max_inflight_bytes {
@@ -157,6 +174,11 @@ impl WalEngineConfig {
         if self.max_inflight_bytes > Semaphore::MAX_PERMITS {
             return Err(Error::InvalidConfig(
                 "max_inflight_bytes exceeds the semaphore limit",
+            ));
+        }
+        if self.queue_capacity_bytes > Semaphore::MAX_PERMITS {
+            return Err(Error::InvalidConfig(
+                "queue_capacity_bytes exceeds the semaphore limit",
             ));
         }
         if self.max_segment_bytes == 0 {
@@ -238,7 +260,7 @@ pub struct WalEngine;
 /// numbers, while returned [`AppendCompletion`] values remain independently
 /// awaitable by the database's apply pipeline.
 pub struct WalHandle {
-    sender: mpsc::Sender<Command>,
+    sender: mpsc::UnboundedSender<Command>,
     engine_task: tokio::task::JoinHandle<()>,
     provisioner_task: tokio::task::JoinHandle<()>,
     provisioner_shutdown: watch::Sender<bool>,
@@ -252,6 +274,7 @@ pub struct WalHandle {
     active_capacity: watch::Receiver<ActiveSegmentCapacity>,
     inflight_bytes: Arc<Semaphore>,
     queue_slots: Arc<Semaphore>,
+    queued_bytes: Arc<AtomicUsize>,
     shutdown_timeout: Duration,
 }
 
@@ -268,8 +291,44 @@ struct AdmittedAppend {
     /// follows the simulator's virtual clock under DST.
     admitted_at: tokio::time::Instant,
     _inflight_bytes: OwnedSemaphorePermit,
-    queue_slot: Option<OwnedSemaphorePermit>,
+    queue_slot: Option<QueueSlot>,
     completion: oneshot::Sender<Result<AppendReceipt, Error>>,
+}
+
+/// The queue budget one admitted record holds until dispatch.
+///
+/// Dropping this returns the semaphore permit and the record's share of the
+/// queue gauge together, so a record failed before dispatch stops counting as
+/// waiting.
+struct QueueSlot {
+    _permit: OwnedSemaphorePermit,
+    queued_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl QueueSlot {
+    fn new(permit: OwnedSemaphorePermit, queued_bytes: Arc<AtomicUsize>, bytes: usize) -> Self {
+        queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            _permit: permit,
+            queued_bytes,
+            bytes,
+        }
+    }
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl AdmittedAppend {
+    /// Encoded size charged against the queue budget until dispatch and
+    /// against the pipeline window until this record commits.
+    fn encoded_bytes(&self) -> usize {
+        self.payload_bytes + RecordFrame::HEADER_LEN
+    }
 }
 
 enum Command {
@@ -286,6 +345,7 @@ struct EngineState {
     queue: VecDeque<Command>,
     completion_batches: VecDeque<CompletionBatch>,
     pending_records: usize,
+    pending_bytes: usize,
     next_completion: u64,
     next_admission: u64,
     last_dispatched_admission_bytes: u128,
@@ -299,6 +359,7 @@ impl EngineState {
             queue: VecDeque::new(),
             completion_batches: VecDeque::new(),
             pending_records: 0,
+            pending_bytes: 0,
             next_completion: next_record_index,
             next_admission: next_record_index,
             last_dispatched_admission_bytes: 0,
@@ -307,7 +368,7 @@ impl EngineState {
         }
     }
 
-    fn drain_available(&mut self, receiver: &mut mpsc::Receiver<Command>) {
+    fn drain_available(&mut self, receiver: &mut mpsc::UnboundedReceiver<Command>) {
         loop {
             match receiver.try_recv() {
                 Ok(command) => {
@@ -322,7 +383,7 @@ impl EngineState {
         }
     }
 
-    fn stop_admission(&mut self, receiver: &mut mpsc::Receiver<Command>) {
+    fn stop_admission(&mut self, receiver: &mut mpsc::UnboundedReceiver<Command>) {
         receiver.close();
         while let Ok(command) = receiver.try_recv() {
             self.queue.push_back(command);
@@ -331,7 +392,7 @@ impl EngineState {
 
     fn fail_queued(
         &mut self,
-        receiver: &mut mpsc::Receiver<Command>,
+        receiver: &mut mpsc::UnboundedReceiver<Command>,
         error: Error,
         metrics: &Metrics,
     ) {
@@ -339,7 +400,7 @@ impl EngineState {
         fail_all(&mut self.queue, error, metrics);
     }
 
-    fn poison(&mut self, receiver: &mut mpsc::Receiver<Command>, metrics: &Metrics) {
+    fn poison(&mut self, receiver: &mut mpsc::UnboundedReceiver<Command>, metrics: &Metrics) {
         self.stop_admission(receiver);
         fail_completion_batches(&mut self.completion_batches, Error::Poisoned, metrics);
         fail_all(&mut self.queue, Error::Poisoned, metrics);
@@ -370,7 +431,7 @@ struct EngineControl {
     catalog: watch::Sender<Vec<crate::segment::SegmentDescriptor>>,
     maintenance: crate::maintenance::MaintenanceHandle,
     active_capacity: watch::Sender<ActiveSegmentCapacity>,
-    queue_slots: Arc<Semaphore>,
+    queued_bytes: Arc<AtomicUsize>,
     rotation_rechecks: mpsc::Receiver<()>,
     provision_requests: mpsc::Sender<ProvisionAttempt>,
     provision_results: mpsc::Receiver<Result<ProvisionOutcome, Error>>,
@@ -387,7 +448,10 @@ impl WalEngine {
     /// after spawning the task.
     pub fn start(mut writer: SegmentedWriter, config: WalEngineConfig) -> Result<WalHandle, Error> {
         config.validate()?;
-        let (sender, receiver) = mpsc::channel(config.queue_capacity);
+        // The queue byte budget is the single bound on accepted work: an
+        // append holds its slot from admission until dispatch, so it covers
+        // both this channel and the engine's internal queue.
+        let (sender, receiver) = mpsc::unbounded_channel();
         let metrics = writer.metrics();
         let next_seqno = writer.committed_record_end();
         let active_segment_bytes = writer.active_segment_bytes();
@@ -400,7 +464,11 @@ impl WalEngine {
         let max_active_segment_bytes = config.max_active_segment_bytes;
         let shutdown_timeout = config.shutdown_timeout;
         let inflight_bytes = Arc::new(Semaphore::new(max_inflight_bytes));
-        let queue_slots = Arc::new(Semaphore::new(config.queue_capacity));
+        let queue_slots = Arc::new(Semaphore::new(config.queue_capacity_bytes));
+        // Bytes accepted but not yet dispatched. Tracked separately from the
+        // semaphore: a blocked `acquire_many_owned` reserves the permits it can
+        // take while it waits, which would show up as queued work.
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         writer.set_max_replica_lag_bytes(config.max_replica_lag_bytes);
         writer.set_lane_stall_timeout(config.lane_stall_timeout);
         // Maintenance (sealed-segment repair, floor-committed truncation)
@@ -430,8 +498,8 @@ impl WalEngine {
         ));
         tracing::info!(
             next_record_index = next_seqno,
-            queue_capacity = config.queue_capacity,
-            pipeline_window_records = config.pipeline_window_records,
+            queue_capacity_bytes = config.queue_capacity_bytes,
+            pipeline_window_bytes = config.pipeline_window_bytes,
             max_inflight_bytes = config.max_inflight_bytes,
             max_replica_lag_bytes = config.max_replica_lag_bytes,
             lane_stall_timeout_ms = config.lane_stall_timeout.as_millis(),
@@ -448,7 +516,7 @@ impl WalEngine {
                 catalog: catalog_tx,
                 maintenance: maintenance.clone(),
                 active_capacity: active_capacity_tx,
-                queue_slots: Arc::clone(&queue_slots),
+                queued_bytes: Arc::clone(&queued_bytes),
                 rotation_rechecks,
                 provision_requests,
                 provision_results,
@@ -469,6 +537,7 @@ impl WalEngine {
             active_capacity,
             inflight_bytes,
             queue_slots,
+            queued_bytes,
             shutdown_timeout,
         })
     }
@@ -484,10 +553,10 @@ impl WalHandle {
     /// active object is at its hard ceiling, admission returns
     /// [`Error::ActiveSegmentFull`]. Neither condition consumes `seqno`;
     /// truncation may free directory capacity, after which the same append can
-    /// be retried. Otherwise this waits for encoded-byte admission capacity and
-    /// a bounded queue slot. On success the WAL owns the record and the
-    /// returned [`AppendCompletion`] may be moved to another task. Await that
-    /// completion before applying the transaction to the database.
+    /// be retried. Otherwise this waits for the record's encoded size in both
+    /// the in-flight and queue byte budgets. On success the WAL owns the record
+    /// and the returned [`AppendCompletion`] may be moved to another task. Await
+    /// that completion before applying the transaction to the database.
     ///
     /// The payload should be the database's complete encoded transaction batch.
     /// The WAL treats it as opaque bytes and never merges it with another call.
@@ -563,10 +632,12 @@ impl WalHandle {
             .acquire_many_owned(permits)
             .await
             .map_err(|_| Error::Closed)?;
-        let queue_slot = Arc::clone(&self.queue_slots)
-            .acquire_owned()
+        let queue_permit = Arc::clone(&self.queue_slots)
+            .acquire_many_owned(permits)
             .await
             .map_err(|_| Error::Closed)?;
+        let queue_slot =
+            QueueSlot::new(queue_permit, Arc::clone(&self.queued_bytes), encoded_bytes);
         let (completion, receiver) = oneshot::channel();
         self.sender
             .send(Command::Append(AdmittedAppend {
@@ -579,7 +650,6 @@ impl WalHandle {
                 queue_slot: Some(queue_slot),
                 completion,
             }))
-            .await
             .map_err(|_| Error::Closed)?;
 
         self.total_admitted_bytes = admission_end_bytes;
@@ -679,7 +749,7 @@ impl WalHandle {
         let provisioner_timeout_shutdown = provisioner_shutdown.clone();
         let graceful = async {
             let (response, receiver) = oneshot::channel();
-            let sent = sender.send(Command::Shutdown { response }).await;
+            let sent = sender.send(Command::Shutdown { response });
             drop(sender);
             let acknowledged = if sent.is_ok() {
                 receiver.await.is_ok()
@@ -751,7 +821,7 @@ impl WalHandle {
 async fn run_engine(
     mut writer: SegmentedWriter,
     config: WalEngineConfig,
-    mut receiver: mpsc::Receiver<Command>,
+    mut receiver: mpsc::UnboundedReceiver<Command>,
     metrics: Arc<Metrics>,
     control: EngineControl,
 ) {
@@ -759,7 +829,7 @@ async fn run_engine(
         catalog,
         maintenance,
         active_capacity,
-        queue_slots,
+        queued_bytes,
         mut rotation_rechecks,
         provision_requests,
         mut provision_results,
@@ -784,7 +854,7 @@ async fn run_engine(
 
     'engine: loop {
         state.drain_available(&mut receiver);
-        observe_queue_depth(&metrics, config.queue_capacity, &queue_slots);
+        observe_queue_bytes(&metrics, &queued_bytes);
 
         // Consume the segment commit watermark directly. Every batch is in
         // global record order, and each segment watermark is already a
@@ -815,8 +885,9 @@ async fn run_engine(
                     ));
                 }
                 debug_assert_eq!(append.seqno.record_index, state.next_completion);
-                complete_append(append, &metrics);
                 state.pending_records -= 1;
+                state.pending_bytes = state.pending_bytes.saturating_sub(append.encoded_bytes());
+                complete_append(append, &metrics);
                 state.next_completion += 1;
                 rotation.mark_due(writer.rotation_due(config.max_segment_bytes));
             }
@@ -836,6 +907,7 @@ async fn run_engine(
                     ));
                 }
                 state.pending_records -= 1;
+                state.pending_bytes = state.pending_bytes.saturating_sub(append.encoded_bytes());
                 break Some(CompletionFailure::Append(append, error));
             }
             break None;
@@ -995,19 +1067,27 @@ async fn run_engine(
         // the threshold before fold/refill completes.
         while !rotation.dispatch_paused()
             && matches!(state.queue.front(), Some(Command::Append(_)))
-            && state.pending_records < config.pipeline_window_records
+            && state.pending_bytes < config.pipeline_window_bytes
         {
-            let outstanding = state.pending_records;
-            let room = config.pipeline_window_records - outstanding;
-            let mut appends = Vec::with_capacity(room);
-            for _ in 0..room {
-                if !matches!(state.queue.front(), Some(Command::Append(_))) {
+            let mut room = config.pipeline_window_bytes - state.pending_bytes;
+            let mut appends = Vec::new();
+            let mut dispatched_bytes = 0usize;
+            while let Some(Command::Append(append)) = state.queue.front() {
+                let encoded_bytes = append.encoded_bytes();
+                if encoded_bytes > room {
                     break;
                 }
                 let Some(Command::Append(append)) = state.queue.pop_front() else {
                     unreachable!();
                 };
+                room -= encoded_bytes;
+                dispatched_bytes += encoded_bytes;
                 appends.push(append);
+            }
+            // The window fits one maximum-size encoded record, so an empty
+            // batch means the retained records need a completion first.
+            if appends.is_empty() {
+                break;
             }
             let records = appends.iter().map(|append| append.record.clone()).collect();
             let batch_admission_end = appends
@@ -1044,6 +1124,7 @@ async fn run_engine(
                         break 'engine;
                     }
                     state.pending_records += appends.len();
+                    state.pending_bytes += dispatched_bytes;
                     state.completion_batches.push_back(CompletionBatch {
                         commits,
                         appends: appends.into(),
@@ -1061,7 +1142,7 @@ async fn run_engine(
                 }
             }
         }
-        observe_queue_depth(&metrics, config.queue_capacity, &queue_slots);
+        observe_queue_bytes(&metrics, &queued_bytes);
 
         if state.input_closed && state.queue.is_empty() && state.pending_records == 0 {
             break;
@@ -1246,7 +1327,7 @@ async fn run_engine(
     } else {
         tracing::warn!("WAL engine stopped without graceful shutdown");
     }
-    metrics.queue_depth.set(0);
+    metrics.queue_bytes.set(0);
 }
 
 /// What the rotation wake arm of the engine's `select!` observed: the two
@@ -1486,10 +1567,10 @@ async fn next_commit_update(batches: &mut VecDeque<CompletionBatch>) -> Result<(
     batch.commits.changed().await
 }
 
-fn observe_queue_depth(metrics: &Metrics, queue_capacity: usize, queue_slots: &Semaphore) {
+fn observe_queue_bytes(metrics: &Metrics, queued_bytes: &AtomicUsize) {
     metrics
-        .queue_depth
-        .set_usize(queue_capacity.saturating_sub(queue_slots.available_permits()));
+        .queue_bytes
+        .set_usize(queued_bytes.load(Ordering::Relaxed));
 }
 
 fn complete_append(append: AdmittedAppend, metrics: &Metrics) {

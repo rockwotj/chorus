@@ -147,7 +147,7 @@ The default build registers 12 metric names, all prefixed with `chorus.wal.`:
 | Kind | Names |
 | --- | --- |
 | Counter | `append.committed_records`, `append.committed_bytes`, `append.failures`, `transport.rpc_failures{code}` |
-| Gauge | `pipeline.queue_depth`, `maintenance.queue_depth`, `replica.durable_lag_bytes{zone}`, `manifest.directory_bytes` |
+| Gauge | `pipeline.queue_bytes`, `maintenance.queue_depth`, `replica.durable_lag_bytes{zone}`, `manifest.directory_bytes` |
 | Histogram | `append.commit_latency_seconds`, `transport.rpc_seconds{op}`, `manifest.cas_latency_seconds`, `seal.duration_seconds` |
 
 Lifecycle events, repair outcomes, retries, and maintenance failures are logged.

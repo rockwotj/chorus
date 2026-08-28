@@ -32,16 +32,16 @@ pub(crate) struct AppendArgs {
     payload_bytes: usize,
     #[arg(long, default_value_t = 1_048_576)]
     max_record_bytes: usize,
-    #[arg(long, default_value_t = 32)]
-    pipeline_window: usize,
+    #[arg(long, default_value_t = 4_194_304)]
+    pipeline_window_bytes: usize,
     #[arg(long, default_value_t = 67_108_864)]
     max_inflight_bytes: usize,
     #[arg(long, default_value_t = 67_108_864)]
     max_replica_lag_bytes: usize,
     #[arg(long, default_value_t = 5_000)]
     lane_stall_timeout_ms: u64,
-    #[arg(long, default_value_t = 256)]
-    queue_capacity: usize,
+    #[arg(long, default_value_t = 67_108_864)]
+    queue_capacity_bytes: usize,
     #[arg(long, default_value_t = 268_435_456)]
     segment_bytes: usize,
     #[arg(long, default_value_t = 4)]
@@ -61,11 +61,11 @@ impl AppendArgs {
             || self.payload_bytes == 0
             || self.duration_seconds == 0
             || self.max_record_bytes == 0
-            || self.pipeline_window == 0
+            || self.pipeline_window_bytes == 0
             || self.max_inflight_bytes == 0
             || self.max_replica_lag_bytes == 0
             || self.lane_stall_timeout_ms == 0
-            || self.queue_capacity == 0
+            || self.queue_capacity_bytes == 0
             || self.segment_bytes == 0
             || self.worker_threads == 0
         {
@@ -213,9 +213,9 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
     }
     let mut handle = recovery
         .start(WalEngineConfig {
-            queue_capacity: args.queue_capacity,
+            queue_capacity_bytes: args.queue_capacity_bytes,
             max_record_bytes: args.max_record_bytes,
-            pipeline_window_records: args.pipeline_window,
+            pipeline_window_bytes: args.pipeline_window_bytes,
             max_inflight_bytes: args.max_inflight_bytes,
             max_replica_lag_bytes: args.max_replica_lag_bytes,
             lane_stall_timeout: Duration::from_millis(args.lane_stall_timeout_ms),
@@ -229,7 +229,12 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
     let payload = Bytes::from(vec![0x5a; args.payload_bytes]);
     // The engine can hold this many accepted records across its dispatch queue
     // and active pipeline; waiting at the same bound prevents benchmark growth.
-    let open_loop_outstanding_cap = args.queue_capacity.saturating_add(args.pipeline_window);
+    let encoded_record_bytes = args.payload_bytes.saturating_add(4);
+    let open_loop_outstanding_cap = args
+        .queue_capacity_bytes
+        .saturating_add(args.pipeline_window_bytes)
+        / encoded_record_bytes;
+    let open_loop_outstanding_cap = open_loop_outstanding_cap.max(1);
     let (mode, started, workload, latency) = if args.arrival_rate > 0.0 {
         let mut latency = Histogram::<u64>::new_with_bounds(1, 600_000_000, 3)?;
         let (started, workload) = run_open_loop(
@@ -320,7 +325,8 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
             "open_loop_outstanding_cap": open_loop_outstanding_cap,
             "payload_bytes": args.payload_bytes,
             "max_record_bytes": args.max_record_bytes,
-            "pipeline_window": args.pipeline_window,
+            "pipeline_window_bytes": args.pipeline_window_bytes,
+            "queue_capacity_bytes": args.queue_capacity_bytes,
             "max_inflight_bytes": args.max_inflight_bytes,
             "max_replica_lag_bytes": args.max_replica_lag_bytes,
             "lane_stall_timeout_ms": args.lane_stall_timeout_ms,

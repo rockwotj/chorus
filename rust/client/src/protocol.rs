@@ -3875,9 +3875,9 @@ mod tests {
         let mut handle = crate::engine::WalEngine::start(
             writer,
             crate::WalEngineConfig {
-                queue_capacity: 2,
+                queue_capacity_bytes: 2 * encoded_bytes,
                 max_record_bytes: payload.len(),
-                pipeline_window_records: 1,
+                pipeline_window_bytes: encoded_bytes,
                 max_inflight_bytes: encoded_bytes,
                 max_replica_lag_bytes: encoded_bytes,
                 lane_stall_timeout: stall_timeout,

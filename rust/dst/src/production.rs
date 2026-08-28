@@ -93,9 +93,9 @@ fn manifest_latency_profile(seed: u64) -> LatencyProfile {
 
 fn production_engine_config() -> WalEngineConfig {
     WalEngineConfig {
-        queue_capacity: 4096,
+        queue_capacity_bytes: 64 * 1024,
         max_record_bytes: 16 * 1024,
-        pipeline_window_records: 4,
+        pipeline_window_bytes: 32 * 1024,
         max_inflight_bytes: 64 * 1024,
         max_replica_lag_bytes: 64 * 1024,
         lane_stall_timeout: WalEngineConfig::default().lane_stall_timeout,
@@ -550,7 +550,7 @@ fn run_lane_stall_seed(seed: u64) -> Result<SimulationReport> {
     let report = Rc::clone(&slot);
     sim.client("harness", async move {
         let mut config = production_engine_config();
-        config.pipeline_window_records = 32;
+        config.pipeline_window_bytes = 256 * 1024;
         config.max_replica_lag_bytes = 1024 * 1024;
         config.lane_stall_timeout = Duration::from_millis(50);
         config.max_segment_bytes = 16 * 1024 * 1024;
@@ -642,9 +642,9 @@ async fn run_lane_stall_recheck_scenario(seed: u64, zone: FakeGcs, close_code: C
     let stall_timeout = Duration::from_millis(50);
     let mut handle = recovery
         .start(WalEngineConfig {
-            queue_capacity: 16,
+            queue_capacity_bytes: 16 * 1024,
             max_record_bytes: 1024,
-            pipeline_window_records: 4,
+            pipeline_window_bytes: 4 * 1028,
             max_inflight_bytes: 16 * 1024,
             max_replica_lag_bytes: 16 * 1024,
             lane_stall_timeout: stall_timeout,

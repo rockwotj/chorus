@@ -285,7 +285,7 @@ pub(crate) struct Metrics {
     pub(crate) rpc: TransportRpcMetrics,
     #[cfg(any(test, feature = "dst-support"))]
     pub(crate) lane_capacity_drops: Counter,
-    pub(crate) queue_depth: Gauge,
+    pub(crate) queue_bytes: Gauge,
     zone_durable_lag: Vec<AggregateGauge>,
     maintenance_queue_depth: AggregateGauge,
     pub(crate) manifest_directory_bytes: Gauge,
@@ -417,9 +417,9 @@ impl Metrics {
                 "chorus.wal.lane.capacity_drops",
                 "Replica lanes dropped after exceeding their retained-byte budget"
             ),
-            queue_depth: gauge!(
-                "chorus.wal.pipeline.queue_depth",
-                "Appends waiting across the admission channel and engine queue"
+            queue_bytes: gauge!(
+                "chorus.wal.pipeline.queue_bytes",
+                "Encoded bytes waiting across the admission channel and engine queue"
             ),
             zone_durable_lag,
             rpc: TransportRpcMetrics::register(recorder),

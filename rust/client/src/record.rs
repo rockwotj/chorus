@@ -1,7 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
-const HEADER_LEN: usize = 4;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal durable envelope for one opaque application record.
 pub struct RecordFrame {
@@ -10,10 +8,12 @@ pub struct RecordFrame {
 }
 
 impl RecordFrame {
-    pub(crate) const MAX_PAYLOAD_BYTES: usize = u32::MAX as usize - HEADER_LEN;
+    /// Bytes the `total_len` prefix adds to every encoded record.
+    pub(crate) const HEADER_LEN: usize = 4;
+    pub(crate) const MAX_PAYLOAD_BYTES: usize = u32::MAX as usize - Self::HEADER_LEN;
 
     pub(crate) fn encoded_len(&self) -> Result<usize, RecordError> {
-        let total_len = HEADER_LEN
+        let total_len = Self::HEADER_LEN
             .checked_add(self.payload.len())
             .ok_or(RecordError::TooLarge)?;
         u32::try_from(total_len).map_err(|_| RecordError::TooLarge)?;
@@ -64,11 +64,11 @@ impl RecordFrame {
     }
 
     fn decode_one(input: &[u8]) -> Result<(Self, usize), RecordError> {
-        if input.len() < HEADER_LEN {
+        if input.len() < Self::HEADER_LEN {
             return Err(RecordError::Truncated);
         }
-        let total_len = u32::from_be_bytes(input[..HEADER_LEN].try_into().unwrap()) as usize;
-        if total_len < HEADER_LEN {
+        let total_len = u32::from_be_bytes(input[..Self::HEADER_LEN].try_into().unwrap()) as usize;
+        if total_len < Self::HEADER_LEN {
             return Err(RecordError::InvalidLength(total_len));
         }
         if input.len() < total_len {
@@ -76,7 +76,7 @@ impl RecordFrame {
         }
         Ok((
             Self {
-                payload: Bytes::copy_from_slice(&input[HEADER_LEN..total_len]),
+                payload: Bytes::copy_from_slice(&input[Self::HEADER_LEN..total_len]),
             },
             total_len,
         ))

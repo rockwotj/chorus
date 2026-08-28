@@ -91,7 +91,7 @@ cargo run --release -p chorus-cli --bin chorus -- \
   --duration-seconds 300 \
   --outstanding-appends 256 \
   --payload-bytes 4096 \
-  --pipeline-window 32 \
+  --pipeline-window-bytes 4194304 \
   --worker-threads 8
 ```
 
