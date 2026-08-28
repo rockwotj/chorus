@@ -983,7 +983,8 @@ machine HistoricalMaintenanceCoordinator {
             zone = 0;
             while (zone < sizeof(payload.buckets)) {
                 send payload.buckets[zone], eRead, (
-                    caller=this, segment=payload.directoryEntry.base, gen=-1);
+                    caller=this, segment=payload.directoryEntry.base, gen=-1,
+                    readonly=false);
                 zone = zone + 1;
             }
             replies = 0;

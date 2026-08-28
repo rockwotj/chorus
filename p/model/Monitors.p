@@ -737,9 +737,17 @@ spec DirectoryEnforcement observes eSealQuorumEnforced, eDirectoryAdopted,
                 "directory replay used an entry before adoption";
         }
 
+        // Scoped to coordinating reads. The property is that a recovering
+        // writer which adopted an entry on finalized-quorum evidence does not
+        // then download it, keeping repair off the startup path. A readonly
+        // follower never adopts, so its reads are outside the boundary; it
+        // reads whatever segment its own cursor still needs, including one a
+        // later writer has since adopted unread.
         on eRead do (request: tReadRequest) {
-            assert !(request.segment in adoptedUnreadBases),
-                "recovery reread an older adopted directory entry";
+            if (!request.readonly) {
+                assert !(request.segment in adoptedUnreadBases),
+                    "recovery reread an older adopted directory entry";
+            }
         }
     }
 }

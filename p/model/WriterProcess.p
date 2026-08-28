@@ -500,7 +500,7 @@ machine WriterProcess {
         zone = 0;
         while (zone < sizeof(buckets)) {
             send buckets[zone], eRead, (
-                caller=this, segment=segBase, gen=gen);
+                caller=this, segment=segBase, gen=gen, readonly=false);
             zone = zone + 1;
         }
         replies = 0;
@@ -569,7 +569,7 @@ machine WriterProcess {
         var response: tReadResponse;
         foreach (zone in lanes) {
             send buckets[zone], eRead, (
-                caller=this, segment=segBase, gen=gen);
+                caller=this, segment=segBase, gen=gen, readonly=false);
         }
         replies = 0;
         while (replies < sizeof(lanes)) {
@@ -907,7 +907,7 @@ machine PendingChainRecovery {
         // prior acknowledged record among the reachable reads.
         foreach (zone in prepared) {
             send segmentBuckets[id][zone], eRead, (
-                caller=this, segment=base, gen=id);
+                caller=this, segment=base, gen=id, readonly=false);
         }
         replies = 0;
         found = false;

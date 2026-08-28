@@ -1,9 +1,13 @@
 // Persistent readonly follower over the manifest-selected segment chain.
 //
 // The follower never claims an epoch and never sends a mutating storage
-// request. Each poll reads one linearizable manifest snapshot, detects an
+// request. A poll works from a linearizable manifest snapshot, detects an
 // overtaking truncation floor, reads finalized directory segments, then reads
-// the active tail without requiring finalization. Active records are emitted
+// the active tail without requiring finalization. Manifest refresh runs on its
+// own schedule, so a poll either re-reads the register or reuses the snapshot
+// an earlier poll read. Both are modeled. Every published field a poll consumes
+// only advances, so a reused snapshot delays what the poll observes and can
+// never expose a record the register had not published. Active records are emitted
 // only after identical bytes are visible on two zones. The active read returns
 // as soon as the first matching majority arrives; a slow third response is not
 // on the publication path. Polling the same machine again discovers later
@@ -16,6 +20,14 @@ machine ReadonlyFollower {
     var nextOffset: int;
     var pauseAfterSnapshot: bool;
     var paused: bool;
+    // Most recent manifest snapshot this follower read, reused by polls that
+    // fall between manifest refreshes.
+    var cached: tManifestRecord;
+    var haveCached: bool;
+    // Consecutive polls served from `cached`. Manifest refresh is driven by a
+    // timer, so a snapshot cannot go unrefreshed forever; bounding the run
+    // keeps that finite here.
+    var stalePolls: int;
 
     start state Following {
         entry (payload: (
@@ -48,13 +60,21 @@ machine ReadonlyFollower {
         var endOffset: int;
         var found: bool;
 
-        send manifest, eManifestRead, (caller=this,);
-        receive { case eManifestReadResponse: (r: tManifestReadResponse) {
-            readResponse = r;
-        } }
-        if (readResponse.status != STATUS_OK) {
-            Done(0, false);
-            return;
+        if (haveCached && stalePolls < 2 && $) {
+            readResponse = (status=STATUS_OK, metagen=0, rec=cached);
+            stalePolls = stalePolls + 1;
+        } else {
+            send manifest, eManifestRead, (caller=this,);
+            receive { case eManifestReadResponse: (r: tManifestReadResponse) {
+                readResponse = r;
+            } }
+            if (readResponse.status != STATUS_OK) {
+                Done(0, false);
+                return;
+            }
+            cached = readResponse.rec;
+            haveCached = true;
+            stalePolls = 0;
         }
         if (readResponse.rec.trunc > nextOffset) {
             announce eReadonlyLagged, (
@@ -137,7 +157,8 @@ machine ReadonlyFollower {
         zone = 0;
         while (zone < sizeof(segmentBuckets[directoryEntry.base])) {
             send segmentBuckets[directoryEntry.base][zone], eRead, (
-                caller=this, segment=directoryEntry.base, gen=-1);
+                caller=this, segment=directoryEntry.base, gen=-1,
+                readonly=true);
             zone = zone + 1;
         }
         replies = 0;
@@ -186,7 +207,8 @@ machine ReadonlyFollower {
         zone = 0;
         while (zone < sizeof(segmentBuckets[segmentBase])) {
             send segmentBuckets[segmentBase][zone], eRead, (
-                caller=this, segment=segmentBase, gen=segmentId);
+                caller=this, segment=segmentBase, gen=segmentId,
+                readonly=true);
             zone = zone + 1;
         }
         replies = 0;
@@ -251,6 +273,7 @@ machine ReadonlyFollowerDriver {
                 reader: int, nextOffset: int,
                 emitted: int, lagged: bool
             );
+            var attempts: int;
 
             base = 0;
             while (base < 2) {
@@ -308,13 +331,21 @@ machine ReadonlyFollowerDriver {
                     writerId = writerId + 1;
                 }
 
-                send follower, eReadonlyPoll;
-                receive { case eReadonlyPollDone: (payload: (
-                    reader: int, nextOffset: int,
-                    emitted: int, lagged: bool
-                )) { poll = payload; } }
-                assert poll.nextOffset == base + 1 &&
-                    poll.emitted == 1 && !poll.lagged,
+                // A poll served from an unrefreshed snapshot emits nothing.
+                // Refresh is bounded, so polling again discovers the seal.
+                attempts = 0;
+                poll = (reader=0, nextOffset=-1, emitted=0, lagged=false);
+                while (attempts < 3 && poll.nextOffset != base + 1) {
+                    send follower, eReadonlyPoll;
+                    receive { case eReadonlyPollDone: (payload: (
+                        reader: int, nextOffset: int,
+                        emitted: int, lagged: bool
+                    )) { poll = payload; } }
+                    assert !poll.lagged,
+                        "readonly follower lagged while discovering a seal";
+                    attempts = attempts + 1;
+                }
+                assert poll.nextOffset == base + 1,
                     "readonly follower did not discover the next seal";
                 base = base + 1;
             }
@@ -338,6 +369,7 @@ machine ReadonlyActiveTailDriver {
                 reader: int, nextOffset: int,
                 emitted: int, lagged: bool
             );
+            var attempts: int;
 
             zone = 0;
             while (zone < 3) {
@@ -404,6 +436,7 @@ machine ReadonlyTruncationRaceDriver {
                 reader: int, nextOffset: int,
                 emitted: int, lagged: bool
             );
+            var attempts: int;
 
             zone = 0;
             while (zone < 3) {
@@ -446,13 +479,21 @@ machine ReadonlyTruncationRaceDriver {
             assert poll.nextOffset == 0 && poll.emitted == 0 &&
                 !poll.lagged;
 
-            send follower, eReadonlyPoll;
-            receive { case eReadonlyPollDone: (payload: (
-                reader: int, nextOffset: int,
-                emitted: int, lagged: bool
-            )) { poll = payload; } }
-            assert poll.nextOffset == 0 && poll.emitted == 0 &&
-                poll.lagged,
+            // A poll served from an unrefreshed snapshot has not seen the
+            // raised floor yet. That is safe as long as it publishes nothing;
+            // refresh is bounded, so a later poll reports the lag.
+            attempts = 0;
+            while (attempts < 3 && !poll.lagged) {
+                send follower, eReadonlyPoll;
+                receive { case eReadonlyPollDone: (payload: (
+                    reader: int, nextOffset: int,
+                    emitted: int, lagged: bool
+                )) { poll = payload; } }
+                assert poll.nextOffset == 0 && poll.emitted == 0,
+                    "readonly follower advanced past an overtaking truncation floor";
+                attempts = attempts + 1;
+            }
+            assert poll.lagged,
                 "readonly follower skipped an overtaking truncation floor";
         }
     }

@@ -31,7 +31,10 @@ type tTakeoverRequest = (
 type tTakeoverResponse = (
     zone: int, status: tStatus, persistedSize: int
 );
-type tReadRequest = (caller: machine, segment: int, gen: int);
+// `readonly` marks a read issued by a non-coordinating follower. Directory
+// trust invariants constrain what a recovering writer may re-read after
+// adopting an entry unread; a follower's reads are outside that boundary.
+type tReadRequest = (caller: machine, segment: int, gen: int, readonly: bool);
 type tReadResponse = (
     zone: int,
     status: tStatus,
