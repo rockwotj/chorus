@@ -168,7 +168,7 @@ async fn metric_surface_contains_only_core_and_enabled_dst_instruments() {
         ("append.committed_bytes", "counter"),
         ("append.failures", "counter"),
         ("transport.rpc_failures", "counter"),
-        ("pipeline.queue_depth", "gauge"),
+        ("pipeline.queue_bytes", "gauge"),
         ("maintenance.queue_depth", "gauge"),
         ("replica.durable_lag_bytes", "gauge"),
         ("manifest.directory_bytes", "gauge"),

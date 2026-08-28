@@ -8,7 +8,7 @@ async fn caller_numbered_appends_admit_in_order_and_refill_the_pipeline() {
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
             max_record_bytes: 64 * 1024,
-            pipeline_window_records: 8,
+            pipeline_window_bytes: 8 * (64 * 1024 + 4),
             ..Default::default()
         },
     )
@@ -89,9 +89,9 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            queue_capacity: 256,
+            queue_capacity_bytes: 256 * 4100,
             max_record_bytes: 4096,
-            pipeline_window_records: 64,
+            pipeline_window_bytes: 64 * 4100,
             max_inflight_bytes: 64 * 1024 * 1024,
             max_replica_lag_bytes: 64 * 1024 * 1024,
             max_segment_bytes: 1024 * 1024,
@@ -166,8 +166,8 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
             );
         }
         panic!(
-            "latency pipeline timed out: completed={completed}/{RECORDS} rate={records_per_second:.1}/s queue_depth={} seals={} append_failures={}",
-            metrics.gauge("chorus.wal.pipeline.queue_depth"),
+            "latency pipeline timed out: completed={completed}/{RECORDS} rate={records_per_second:.1}/s queue_bytes={} seals={} append_failures={}",
+            metrics.gauge("chorus.wal.pipeline.queue_bytes"),
             metrics.counter("chorus.wal.seal.segments"),
             metrics.counter("chorus.wal.append.failures"),
         );
@@ -203,9 +203,9 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            queue_capacity: 1,
+            queue_capacity_bytes: 4100,
             max_record_bytes: 4096,
-            pipeline_window_records: 1,
+            pipeline_window_bytes: 4100,
             max_inflight_bytes: 4100,
             max_replica_lag_bytes: 64 * 1024 * 1024,
             max_segment_bytes: 128 * 1024,
@@ -237,9 +237,9 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
     if result.is_err() {
         let manifest_updates = servers[3].service.operation_count(Operation::Update).await;
         panic!(
-            "queue-depth-one append wedged under service latency: seals={} queue_depth={} append_failures={} manifest_updates={manifest_updates}",
+            "queue-depth-one append wedged under service latency: seals={} queue_bytes={} append_failures={} manifest_updates={manifest_updates}",
             metrics.counter("chorus.wal.seal.segments"),
-            metrics.gauge("chorus.wal.pipeline.queue_depth"),
+            metrics.gauge("chorus.wal.pipeline.queue_bytes"),
             metrics.counter("chorus.wal.append.failures"),
         );
     }
@@ -562,15 +562,18 @@ async fn admission_waits_for_the_encoded_inflight_byte_budget() {
 }
 
 #[tokio::test]
-async fn queue_capacity_bounds_channel_and_engine_queue_together() {
+async fn queue_capacity_bytes_bounds_channel_and_engine_queue_together() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let (volume, metrics) =
         volume_with_metrics(factories, manifest_factory, "record-queue-budget-wal");
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            queue_capacity: 2,
-            pipeline_window_records: 1,
+            // Payloads encode to 9 or 10 bytes: the window carries one
+            // record, and the queue budget holds two more.
+            max_record_bytes: 6,
+            queue_capacity_bytes: 20,
+            pipeline_window_bytes: 10,
             repair_interval: None,
             ..Default::default()
         },
@@ -600,7 +603,7 @@ async fn queue_capacity_bounds_channel_and_engine_queue_together() {
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while metrics.gauge("chorus.wal.pipeline.queue_depth") != 2 {
+        while metrics.gauge("chorus.wal.pipeline.queue_bytes") != 19 {
             tokio::task::yield_now().await;
         }
     })
@@ -617,7 +620,7 @@ async fn queue_capacity_bounds_channel_and_engine_queue_together() {
                 .is_err(),
             "a third waiting record exceeded the combined queue capacity"
         );
-        assert_eq!(metrics.gauge("chorus.wal.pipeline.queue_depth"), 2);
+        assert_eq!(metrics.gauge("chorus.wal.pipeline.queue_bytes"), 19);
 
         servers[0].service.release_flush_holds().await;
         servers[1].service.release_flush_holds().await;
@@ -1394,7 +1397,10 @@ async fn indeterminate_record_poisons_and_closes_the_engine() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            pipeline_window_records: 3,
+            max_record_bytes: 16,
+            // `record-N` payloads encode to 13 bytes, so this window carries
+            // three records.
+            pipeline_window_bytes: 3 * 13,
             ..Default::default()
         },
     )
