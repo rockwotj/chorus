@@ -32,9 +32,17 @@ pub(crate) struct ReadOnlyArgs {
     payload_bytes: usize,
     #[arg(long, default_value_t = 64)]
     pipeline_window: usize,
-    /// Delay between readonly active-tail polls.
+    /// Delay before the next active-tail read when the previous one delivered
+    /// no records.
     #[arg(long, default_value_t = 100)]
     poll_interval_ms: u64,
+    /// Delay between readonly manifest re-reads.
+    #[arg(long, default_value_t = 1000)]
+    manifest_poll_interval_ms: u64,
+    /// Poll on a fixed cadence even while records are being delivered, instead
+    /// of reading again immediately after a read that produced records.
+    #[arg(long, default_value_t = false)]
+    fixed_poll_cadence: bool,
     /// Maximum wait for writer completion and follower catch-up.
     #[arg(long, default_value_t = 180)]
     timeout_seconds: u64,
@@ -52,6 +60,7 @@ impl ReadOnlyArgs {
             || self.payload_bytes == 0
             || self.pipeline_window == 0
             || self.poll_interval_ms == 0
+            || self.manifest_poll_interval_ms == 0
             || self.timeout_seconds == 0
             || self.worker_threads == 0
         {
@@ -80,7 +89,13 @@ impl CommitTimeline {
 
     async fn take(&self, record_index: u64) -> Instant {
         loop {
+            // Register before checking the map. `notify_waiters` wakes only
+            // waiters already registered and stores no permit, so a publish
+            // between the check and the await would otherwise be lost and the
+            // last record would never be timestamped.
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(at) = self.committed_at.lock().unwrap().remove(&record_index) {
                 return at;
             }
@@ -199,9 +214,11 @@ pub(crate) async fn run(
     let mut writer = recovery
         .start(WalEngineConfig {
             queue_capacity: args.pipeline_window.saturating_mul(8),
-            max_record_bytes: args
-                .payload_bytes
-                .max(WalEngineConfig::default().max_record_bytes),
+            // The workload appends one fixed payload size. Raising this to the
+            // library default would force `max_active_segment_bytes` to cover a
+            // maximum-size record the benchmark never writes, which rejects
+            // every small configuration.
+            max_record_bytes: args.payload_bytes,
             pipeline_window_records: args.pipeline_window,
             max_inflight_bytes: WalEngineConfig::default().max_inflight_bytes,
             max_replica_lag_bytes: WalEngineConfig::default().max_replica_lag_bytes,
@@ -218,6 +235,8 @@ pub(crate) async fn run(
             WalSeqNo::ZERO,
             ReadOnlyConfig {
                 poll_interval: Duration::from_millis(args.poll_interval_ms),
+                manifest_poll_interval: Duration::from_millis(args.manifest_poll_interval_ms),
+                continuous_when_active: !args.fixed_poll_cadence,
             },
         )
         .await?;
@@ -285,6 +304,8 @@ pub(crate) async fn run(
             "pipeline_window": args.pipeline_window,
             "active_segment_bytes": active_segment_bytes,
             "poll_interval_ms": args.poll_interval_ms,
+            "manifest_poll_interval_ms": args.manifest_poll_interval_ms,
+            "continuous_when_active": !args.fixed_poll_cadence,
             "worker_threads": args.worker_threads,
         }
     });

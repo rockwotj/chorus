@@ -4,6 +4,8 @@ use crate::ReadOnlyConfig;
 fn readonly_config() -> ReadOnlyConfig {
     ReadOnlyConfig {
         poll_interval: Duration::from_millis(10),
+        manifest_poll_interval: Duration::from_millis(10),
+        ..ReadOnlyConfig::default()
     }
 }
 
@@ -290,4 +292,28 @@ async fn readonly_follower_reports_when_truncation_overtakes_it() {
             truncation_floor: WalSeqNo { record_index: 1 },
         })
     ));
+}
+
+#[tokio::test]
+async fn readonly_open_rejects_a_zero_poll_interval() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(factories, manifest_factory, "readonly-config-wal");
+
+    for config in [
+        ReadOnlyConfig {
+            poll_interval: Duration::ZERO,
+            ..readonly_config()
+        },
+        ReadOnlyConfig {
+            manifest_poll_interval: Duration::ZERO,
+            ..readonly_config()
+        },
+    ] {
+        assert!(matches!(
+            volume
+                .open_readonly_with_config(WalSeqNo::ZERO, config)
+                .await,
+            Err(Error::InvalidConfig(_))
+        ));
+    }
 }

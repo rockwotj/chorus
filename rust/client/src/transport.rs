@@ -60,7 +60,11 @@ pub struct ReplicaSnapshot {
 pub struct ReplicaRangeRead {
     /// Replica zone.
     pub zone: usize,
-    /// Object generation returned with the read.
+    /// Generation of the object this read's session is bound to. Providers
+    /// report object metadata when a bidirectional read session opens rather
+    /// than on every range, so this is the generation the session was opened
+    /// against, not a fresh observation per range. It is comparable across
+    /// reads from one replica; generations of different zones are unrelated.
     pub generation: i64,
     /// Requested bytes currently visible at the open object's durable tail.
     pub bytes: Vec<u8>,
@@ -242,8 +246,9 @@ pub trait Replica: Send + Sync {
     /// `offset` through the provider's bidirectional range-read API.
     ///
     /// The default keeps non-production test doubles source-compatible. A
-    /// readonly follower requires an implementation and treats this error as a
-    /// missing replica observation.
+    /// readonly follower requires an implementation and fails with this error
+    /// rather than polling a replica that can never answer. The default cannot
+    /// know its own zone, so the caller attributes the failure.
     async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
         Err(TransportError {
             zone: 0,
@@ -466,6 +471,10 @@ impl Replica for TimedReplica {
 
     async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
         timed_rpc!(self, stat, self.inner.stat())
+    }
+
+    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
+        timed_rpc!(self, read_range, self.inner.read_range(offset))
     }
 
     async fn create_appendable(

@@ -144,6 +144,7 @@ impl MetricsRecorder for Registrations {
                     "op",
                     "snapshot"
                         | "stat"
+                        | "read_range"
                         | "create_appendable"
                         | "create_append_session"
                         | "resume_tail"

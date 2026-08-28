@@ -101,15 +101,29 @@ pub struct SegmentedVolume {
 /// Polling controls for a readonly follower.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadOnlyConfig {
-    /// Delay between active-tail reads while the follower is caught up or
-    /// waiting for a complete frame to become visible on a replica quorum.
+    /// Delay before the next active-tail read when the previous one produced
+    /// no records, either because the follower is caught up or because no
+    /// complete frame is yet visible on a replica quorum.
     pub poll_interval: Duration,
+    /// Delay between manifest re-reads. The manifest changes only when the
+    /// writer rotates, seals, or truncates, so this is normally much larger
+    /// than `poll_interval`; polling it at the active-tail rate multiplies
+    /// regional reads without observing anything new.
+    pub manifest_poll_interval: Duration,
+    /// When set, a read that produced records is followed immediately by the
+    /// next read instead of by `poll_interval`. This keeps `poll_interval` out
+    /// of the commit-to-subscribe path while the writer is active, at the cost
+    /// of reading as fast as the replicas answer. Clear it to poll on a fixed
+    /// cadence regardless of whether records were delivered.
+    pub continuous_when_active: bool,
 }
 
 impl Default for ReadOnlyConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(1),
+            manifest_poll_interval: Duration::from_secs(1),
+            continuous_when_active: true,
         }
     }
 }
@@ -119,6 +133,11 @@ impl ReadOnlyConfig {
         if self.poll_interval == Duration::ZERO {
             return Err(Error::InvalidConfig(
                 "readonly poll_interval must be nonzero",
+            ));
+        }
+        if self.manifest_poll_interval == Duration::ZERO {
+            return Err(Error::InvalidConfig(
+                "readonly manifest_poll_interval must be nonzero",
             ));
         }
         Ok(())
@@ -153,6 +172,10 @@ struct ActiveReadState {
     replicas: Vec<Arc<dyn Replica>>,
     inflight: FuturesUnordered<BoxFuture<'static, ActiveReadResult>>,
     inflight_offsets: Vec<Option<i64>>,
+    /// Object generation each replica last reported for this active segment.
+    /// Generations are per-object, so they are comparable across polls of one
+    /// replica but never across replicas.
+    generations: Vec<Option<i64>>,
 }
 
 struct ActiveReadResult {
@@ -852,7 +875,7 @@ mod recovery {
             check_readonly_floor(manifest.record(), checkpoint)?;
             Ok(ReadOnlyFollower {
                 from: checkpoint,
-                inner: self.follow_readonly(manifest, checkpoint, config.poll_interval),
+                inner: self.follow_readonly(manifest, checkpoint, config),
             })
         }
 
@@ -860,14 +883,16 @@ mod recovery {
             &self,
             manifest: Manifest,
             checkpoint: WalSeqNo,
-            poll_interval: Duration,
+            config: ReadOnlyConfig,
         ) -> StartupReplayStream {
             let factories = self.factories.clone();
             let prefix = self.prefix.clone();
+            let metrics = Arc::clone(&self.metrics);
+            let poll_interval = config.poll_interval;
             async_stream::try_stream! {
                 let mut next = checkpoint;
                 let (mut manifest_updates, _manifest_task) =
-                    spawn_readonly_manifest_poller(manifest, poll_interval);
+                    spawn_readonly_manifest_poller(manifest, config.manifest_poll_interval);
                 let initial_record = { manifest_updates.borrow().clone() };
                 let mut record = initial_record?;
                 let mut active = None;
@@ -914,7 +939,7 @@ mod recovery {
                     });
                     if reset_active {
                         let object = format!("{prefix}/segments/{tail_id}");
-                        let replicas = replicas_for(&factories, &object);
+                        let replicas = timed_replicas_for(&factories, &object, &metrics);
                         let replica_count = replicas.len();
                         active = Some(ActiveReadState {
                             id: tail_id,
@@ -925,9 +950,11 @@ mod recovery {
                             replicas,
                             inflight: FuturesUnordered::new(),
                             inflight_offsets: vec![None; replica_count],
+                            generations: vec![None; replica_count],
                         });
                     }
                     let state = active.as_mut().expect("active state was initialized");
+                    let mut delivered = false;
                     match read_active_quorum(state).await {
                         Ok(frames) => {
                             for frame in frames {
@@ -948,6 +975,7 @@ mod recovery {
                                     payload: frame.payload,
                                 };
                                 next = wal_record.next_seqno();
+                                delivered = true;
                                 yield wal_record;
                             }
                         }
@@ -955,7 +983,13 @@ mod recovery {
                         Err(error) => Err(error)?,
                     }
 
-                    tokio::time::sleep(poll_interval).await;
+                    // A read that delivered records means the writer is active
+                    // and more bytes may already be visible, so the next read
+                    // starts immediately. `poll_interval` then bounds only how
+                    // often an idle follower re-reads the tail.
+                    if !(delivered && config.continuous_when_active) {
+                        tokio::time::sleep(poll_interval).await;
+                    }
                     let update = { manifest_updates.borrow_and_update().clone() };
                     record = update?;
                 }
@@ -2541,7 +2575,38 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
 
         observations[result.replica_index] = match result.read {
             Ok(read) => {
+                // A replica's own generation must not change while the
+                // follower is reading one active segment. If it does, the
+                // object was replaced underneath the session and this byte
+                // offset no longer denotes the same position, so the bytes
+                // must not be mixed with what was already published.
+                match state.generations[result.replica_index] {
+                    Some(seen) if seen != read.generation => {
+                        return Err(Error::InvalidSegmentData(format!(
+                            "active segment {} on zone {} moved from generation {seen} to {}",
+                            state.id, result.replica_index, read.generation
+                        )));
+                    }
+                    Some(_) => {}
+                    None => state.generations[result.replica_index] = Some(read.generation),
+                }
                 ActiveReadObservation::Records(RecordFrame::decode_complete_prefix(&read.bytes).0)
+            }
+            // A replica without a range-read implementation never becomes a
+            // usable observation, so treating it as a transient failure would
+            // poll forever without ever delivering an active record. Surface
+            // it instead of counting it towards a missing quorum.
+            Err(error) if error.code == TransportCode::Unimplemented => {
+                return Err(Error::Transport {
+                    // The trait default cannot know its own zone, so attribute
+                    // the failure to the replica this read was issued against.
+                    zone: result.replica_index,
+                    code: error.code,
+                    message: format!(
+                        "readonly following requires Replica::read_range: {}",
+                        error.message
+                    ),
+                });
             }
             Err(_) => ActiveReadObservation::Failed,
         };
@@ -3409,14 +3474,14 @@ fn readonly_segments(record: &ManifestRecord) -> Result<Vec<SegmentDescriptor>, 
 
 async fn refresh_readonly_manifest(
     manifest: &mut Manifest,
-    poll_interval: Duration,
+    retry_interval: Duration,
 ) -> Result<ManifestRecord, Error> {
     loop {
         match manifest.refreshed_existing_record().await {
             Ok(Some(record)) => return Ok(record),
             Ok(None) => return Err(Error::Uninitialized),
             Err(ProtocolError::ManifestUnavailable) => {
-                tokio::time::sleep(poll_interval).await;
+                tokio::time::sleep(retry_interval).await;
             }
             Err(error) => return Err(error.into()),
         }
@@ -3425,7 +3490,7 @@ async fn refresh_readonly_manifest(
 
 fn spawn_readonly_manifest_poller(
     mut manifest: Manifest,
-    poll_interval: Duration,
+    manifest_poll_interval: Duration,
 ) -> (
     tokio::sync::watch::Receiver<Result<ManifestRecord, Error>>,
     ReadOnlyManifestTask,
@@ -3433,8 +3498,8 @@ fn spawn_readonly_manifest_poller(
     let (updates, receiver) = tokio::sync::watch::channel(Ok(manifest.record().clone()));
     let task = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(poll_interval).await;
-            let update = refresh_readonly_manifest(&mut manifest, poll_interval).await;
+            tokio::time::sleep(manifest_poll_interval).await;
+            let update = refresh_readonly_manifest(&mut manifest, manifest_poll_interval).await;
             let terminal = update.is_err();
             if updates.send(update).is_err() || terminal {
                 break;
@@ -3448,5 +3513,24 @@ fn replicas_for(factories: &[Arc<dyn ReplicaFactory>], object: &str) -> Vec<Arc<
     factories
         .iter()
         .map(|factory| factory.replica(object))
+        .collect()
+}
+
+/// [`replicas_for`] with RPC timing. The writer quorum path wraps its replicas
+/// inside `Writer`, which a readonly follower never constructs, so the
+/// follower's own reads are wrapped here to keep every provider RPC timed.
+fn timed_replicas_for(
+    factories: &[Arc<dyn ReplicaFactory>],
+    object: &str,
+    metrics: &Arc<Metrics>,
+) -> Vec<Arc<dyn Replica>> {
+    factories
+        .iter()
+        .map(|factory| {
+            Arc::new(crate::transport::TimedReplica::new(
+                factory.replica(object),
+                Arc::clone(metrics),
+            )) as Arc<dyn Replica>
+        })
         .collect()
 }
