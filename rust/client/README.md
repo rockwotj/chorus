@@ -160,24 +160,20 @@ every replica to advance its own durable checkpoint. If truncation overtakes a
 follower, the stream returns `Error::ReadOnlyLagged` rather than skipping
 records; resnapshot that replica before reopening it at a newer checkpoint.
 
-## Experimental SlateDB adapter
+## SlateDB adapter
 
 The opt-in `slatedb` feature provides
 `chorus_client::slatedb::ChorusWal`, implementing SlateDB's pluggable WAL writer,
 startup replay, and garbage-collection interfaces. It is disabled by default; the default build
 does not compile SlateDB or enable its object-store providers/caches.
 
-**Not ready to merge or publish:** this currently pins SlateDB main at
-[`31656fe3`](https://github.com/slatedb/slatedb/commit/31656fe30064ce0d7991a578085341e21438af5e).
-Replace the git dependency with the first suitable stable release and rerun
-the adapter tests before merging. Cargo still resolves optional dependencies
-when generating a lockfile, so even feature-off resolution may need GitHub.
-Applications must use the same SlateDB revision to share the trait types:
+The adapter targets SlateDB 0.16. Applications must depend on the same SlateDB
+major version to share the trait types:
 
 ```toml
 [dependencies]
 chorus-client = { path = "path/to/chorus/rust/client", features = ["slatedb"] }
-slatedb = { git = "https://github.com/slatedb/slatedb", rev = "31656fe30064ce0d7991a578085341e21438af5e", default-features = false }
+slatedb = { version = "0.16", default-features = false }
 ```
 
 Create a dedicated `SegmentedVolume` using the storage setup below, then pass

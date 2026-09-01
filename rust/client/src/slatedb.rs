@@ -24,8 +24,7 @@
 //! Do not run Chorus recovery/maintenance tools concurrently with the database:
 //! those tools claim a new writer epoch and fence the database.
 //!
-//! The dependency is pinned to an unreleased SlateDB commit. Replace it with a
-//! stable release and revalidate the contract before merging or publishing.
+//! The adapter targets the SlateDB 0.16 pluggable-WAL traits.
 //!
 //! # Usage
 //!
@@ -429,7 +428,16 @@ impl Writer {
             .map_err(|_| internal_error("consume the complete SlateDB replay iterator first"))?;
         self.ready = None;
         let handle = started.handle.take().unwrap();
-        let (sender, mut receiver) = mpsc::channel::<Pending>(self.config.queue_capacity);
+        // The engine bounds admission by bytes, so bound this completion queue
+        // by the number of maximum-size records that fit the same budget.
+        // `WalEngineConfig::validate` requires the budget to hold one such
+        // record, so the divisor never yields zero.
+        let capacity = self
+            .config
+            .queue_capacity_bytes
+            .div_euclid(self.config.max_record_bytes)
+            .max(1);
+        let (sender, mut receiver) = mpsc::channel::<Pending>(capacity);
         self.runtime = Some(tokio::runtime::Handle::current());
         let observer = self.observer.clone();
         self.completions = Some(tokio::spawn(async move {
