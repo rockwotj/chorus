@@ -540,3 +540,94 @@ async fn readonly_follower_reports_a_permission_error_instead_of_polling_forever
         "expected PermissionDenied, got {outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn readonly_follower_keeps_reading_when_one_zone_denies_it() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let writer_volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "readonly-one-zone-denied-wal",
+    );
+    let reader_volume = volume(factories, manifest_factory, "readonly-one-zone-denied-wal");
+    let mut writer = writer_volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"first").await;
+
+    // One denied zone leaves two that can still form a quorum. That is a
+    // degraded replica set, not a follower that can never make progress. A
+    // transient failure on a second zone makes the first poll miss its quorum
+    // with the denial present, which is the case that must keep polling
+    // rather than terminate.
+    for _ in 0..8 {
+        servers[0]
+            .service
+            .inject(Operation::Read, Code::PermissionDenied)
+            .await;
+    }
+    servers[1]
+        .service
+        .inject(Operation::Read, Code::Unavailable)
+        .await;
+    let mut follower = reader_volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .expect("two authorized zones must still deliver")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.payload, b"first".as_slice());
+    append_one(&mut writer, b"second").await;
+    let second = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.payload, b"second".as_slice());
+}
+
+#[tokio::test]
+async fn readonly_sealed_replay_reports_a_permission_error_instead_of_polling_forever() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let writer_volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "readonly-sealed-permission-wal",
+    );
+    let reader_volume = volume(
+        factories,
+        manifest_factory,
+        "readonly-sealed-permission-wal",
+    );
+    let mut writer = writer_volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"sealed").await;
+    writer.rotate().await.unwrap();
+
+    // The checkpoint needs the sealed segment, and every zone denies the read.
+    for server in &servers[..3] {
+        for _ in 0..8 {
+            server
+                .service
+                .inject(Operation::Read, Code::PermissionDenied)
+                .await;
+        }
+    }
+    let mut follower = reader_volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .expect("a denied sealed read quorum must fail fast");
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::Transport {
+                code: TransportCode::PermissionDenied,
+                ..
+            })
+        ),
+        "expected PermissionDenied from sealed replay, got {outcome:?}"
+    );
+}

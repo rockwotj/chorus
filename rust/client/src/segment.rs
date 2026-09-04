@@ -2554,27 +2554,39 @@ async fn read_sealed_segment(
         ));
     }
     let mut snapshots = Vec::new();
-    for replica in &replicas {
-        if let Ok(snapshot) = replica.snapshot().await {
-            if snapshot.crc32c == Some(expected_crc32c)
-                && crc32c::crc32c(&snapshot.bytes) == expected_crc32c
-            {
-                if let Some(records) = decoded_sealed_snapshot(
-                    &snapshot,
-                    expected_records,
-                    !accept_unfinalized_crc_match,
-                ) {
-                    return Ok(records);
+    // Failures that cannot clear by retrying, kept so a read that can never
+    // reach a quorum is reported instead of retried as a missing quorum.
+    let mut permanent = Vec::new();
+    for (zone, replica) in replicas.iter().enumerate() {
+        match replica.snapshot().await {
+            Ok(snapshot) => {
+                if snapshot.crc32c == Some(expected_crc32c)
+                    && crc32c::crc32c(&snapshot.bytes) == expected_crc32c
+                {
+                    if let Some(records) = decoded_sealed_snapshot(
+                        &snapshot,
+                        expected_records,
+                        !accept_unfinalized_crc_match,
+                    ) {
+                        return Ok(records);
+                    }
                 }
+                snapshots.push(snapshot);
             }
-            snapshots.push(snapshot);
+            Err(error) if permanent_read_code(error.code) => permanent.push((zone, error)),
+            Err(_) => {}
         }
     }
     snapshots
         .retain(|snapshot| decoded_sealed_snapshot(snapshot, expected_records, true).is_some());
     let quorum = majority(replicas.len());
     if snapshots.len() < quorum {
-        return Err(Error::NoReadQuorum);
+        return Err(quorum_impossible_error(
+            replicas.len(),
+            quorum,
+            permanent.iter().map(|(zone, error)| (*zone, error)),
+        )
+        .unwrap_or(Error::NoReadQuorum));
     }
     let records = canonical_prefix(&snapshots, quorum)?;
     if records.len() as u64 != expected_records {
@@ -2653,39 +2665,63 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
             ActiveReadDecision::Pending => {}
             ActiveReadDecision::Frames(frames) => return Ok(frames),
             ActiveReadDecision::NoReadQuorum => {
-                return Err(
-                    permanent_active_read_failure(&observations).unwrap_or(Error::NoReadQuorum)
-                );
+                return Err(permanent_active_read_failure(&observations, quorum)
+                    .unwrap_or(Error::NoReadQuorum));
             }
         }
     }
 }
 
-/// A missing read quorum caused by a failure that no amount of polling can
-/// clear. Authorization and request-shape errors are reported to the caller;
-/// everything else is treated as a replica that may answer on a later poll,
-/// including a copy that is absent, replaced, or still being written.
-fn permanent_active_read_failure(observations: &[ActiveReadObservation]) -> Option<Error> {
-    observations
-        .iter()
-        .enumerate()
-        .find_map(|(zone, observation)| match observation {
-            ActiveReadObservation::Failed(Some(error))
-                if matches!(
-                    error.code,
-                    TransportCode::PermissionDenied
-                        | TransportCode::Unauthenticated
-                        | TransportCode::InvalidArgument
-                ) =>
-            {
-                Some(Error::Transport {
-                    zone,
-                    code: error.code,
-                    message: error.message.clone(),
-                })
-            }
-            _ => None,
-        })
+/// Whether a read failure can never clear by polling the same replica again.
+/// Authorization and request-shape errors qualify. Everything else is a
+/// replica that may answer later, including a copy that is absent, replaced,
+/// or still being written.
+fn permanent_read_code(code: TransportCode) -> bool {
+    matches!(
+        code,
+        TransportCode::PermissionDenied
+            | TransportCode::Unauthenticated
+            | TransportCode::InvalidArgument
+    )
+}
+
+/// The error to report when permanent failures alone leave too few replicas
+/// to ever form a read quorum. One denied zone alongside a transient failure
+/// is not that: the remaining zones can still answer on a later poll, so the
+/// caller keeps retrying. Returns the first permanent failure by zone.
+fn quorum_impossible_error<'a>(
+    replica_count: usize,
+    quorum: usize,
+    permanent: impl Iterator<Item = (usize, &'a TransportError)>,
+) -> Option<Error> {
+    let permanent: Vec<_> = permanent.collect();
+    if replica_count.saturating_sub(permanent.len()) >= quorum {
+        return None;
+    }
+    permanent.first().map(|(zone, error)| Error::Transport {
+        zone: *zone,
+        code: error.code,
+        message: error.message.clone(),
+    })
+}
+
+fn permanent_active_read_failure(
+    observations: &[ActiveReadObservation],
+    quorum: usize,
+) -> Option<Error> {
+    quorum_impossible_error(
+        observations.len(),
+        quorum,
+        observations
+            .iter()
+            .enumerate()
+            .filter_map(|(zone, observation)| match observation {
+                ActiveReadObservation::Failed(Some(error)) if permanent_read_code(error.code) => {
+                    Some((zone, error))
+                }
+                _ => None,
+            }),
+    )
 }
 
 fn ensure_active_reads(state: &mut ActiveReadState) {
