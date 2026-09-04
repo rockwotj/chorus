@@ -164,7 +164,7 @@ records; resnapshot that replica before reopening it at a newer checkpoint.
 
 The opt-in `slatedb` feature provides
 `chorus_client::slatedb::ChorusWal`, implementing SlateDB's pluggable WAL writer,
-startup replay, and garbage-collection interfaces. It is disabled by default; the default build
+startup replay, reader, and garbage-collection interfaces. It is disabled by default; the default build
 does not compile SlateDB or enable its object-store providers/caches.
 
 The adapter targets SlateDB 0.16. Applications must depend on the same SlateDB
@@ -252,9 +252,33 @@ may still retry deletions authorized by an earlier real collection. Long-lived
 checkpoints, a long minimum age, or unavailable zones can still exhaust the
 bounded manifest directory; size rotation/GC settings for the retention window.
 
-`WalReader` and `WalAdmin` remain unimplemented: separate live WAL readers and
-WAL-based clones are unsupported. Ordinary `Db::get`/`Db::scan` reads work.
-Do not use SlateDB's default WAL reader/clone/delete tools for this backend.
+### SlateDB readers
+
+`ChorusWal` also implements `slatedb::wal::WalReader`. A separate process can
+construct its own volume/transports and initializer for the same WAL namespace:
+
+```rust,ignore
+use std::sync::Arc;
+use chorus_client::slatedb::ChorusWal;
+use slatedb::{DbReader, DbReaderMode};
+
+let reader = DbReader::builder("orders", sst_store)
+    .with_reader_mode(DbReaderMode::ManagedCheckpoint)
+    .with_wal_reader(Arc::new(ChorusWal::new(volume)))
+    .build()
+    .await?;
+let value = reader.get(b"customer/7").await?;
+reader.close().await?;
+```
+
+Readers do not fence the writer. Managed readers retain history through SlateDB
+checkpoints, which the GC adapter honors. Direct iterators and `FollowLatest`
+readers do not pin history: if GC overtakes them, they return
+`WalError::WalTruncated` rather than skipping records. See the `ChorusWal` API
+docs for range semantics and polling configuration.
+
+`WalAdmin` and WAL-based clones remain unsupported. Do not use SlateDB's default
+native-WAL reader/clone/delete tools for this backend; configure `with_wal_reader`.
 Chorus CLI recovery/repair commands fence the active writer and must run offline.
 
 From the repository's `rust` directory:
@@ -272,7 +296,10 @@ quorum-only durability, failure propagation, corrupt-record rejection, retained
 checkpoints, scheduled GC with live writes, age/dry-run gates, and deletion retries.
 External integration tests use only the exported API to check mixed writes,
 deletes, reads, and scans against a reference model across GC and fresh-client
-reopens, plus writer takeover while a zone is unavailable. These tests use fake
+reopens, plus writer takeover while a zone is unavailable. Reader tests cover
+active-tail quorum visibility, bounded ranges, canceled polls, rotation and
+takeover, corruption, GC lag, and real `DbReader` instances in managed, latest,
+and pinned-checkpoint modes with fresh transports. These tests use fake
 GCS servers, not live-cloud resources.
 
 ## Storage setup

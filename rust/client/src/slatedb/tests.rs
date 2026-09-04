@@ -8,6 +8,8 @@ use std::time::Duration;
 
 #[path = "gc_tests.rs"]
 mod gc_tests;
+#[path = "reader_tests.rs"]
+mod reader_tests;
 
 async fn volume() -> (Vec<RunningFake>, SegmentedVolume) {
     let mut servers = Vec::new();

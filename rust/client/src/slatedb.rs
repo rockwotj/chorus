@@ -1,4 +1,4 @@
-//! Experimental SlateDB writer integration, enabled by the `slatedb` feature.
+//! SlateDB WAL integration, enabled by the opt-in `slatedb` feature.
 //!
 //! Pass [`ChorusWal`] to `Db::builder(...).with_wal_writer(Box::new(wal))`.
 //! Use one dedicated Chorus volume per SlateDB database, and supply the same
@@ -19,8 +19,13 @@
 //! to be strictly older than the cutoff. Unknown ages defer new truncation;
 //! zero disables the age gate. Dry runs do not change storage. An open writer
 //! is required; offline or separate-process GC is not supported.
-//! `WalReader` and `WalAdmin` remain unimplemented, so live WAL readers and
-//! WAL-based clones are unsupported.
+//! `WalReader` uses non-coordinating Chorus reads, including the quorum-visible
+//! active tail. Pass a separately constructed initializer for the same volume
+//! to `DbReader::builder(...).with_wal_reader(Arc::new(wal))`. Reader opens never
+//! fence the writer and do not require the writer's process-local GC connection.
+//! Direct WAL iterators do not register retention; a follower overtaken by GC
+//! returns `WalError::WalTruncated`. `WalAdmin` and WAL-based clones remain
+//! unsupported.
 //! Do not run Chorus recovery/maintenance tools concurrently with the database:
 //! those tools claim a new writer epoch and fence the database.
 //!
@@ -47,9 +52,29 @@
 //!         .await
 //! }
 //! ```
+//!
+//! # Readers
+//!
+//! ```no_run
+//! use chorus_client::{SegmentedVolume, slatedb::ChorusWal};
+//! use slatedb::{DbReader, DbReaderMode, object_store::ObjectStore};
+//! use std::sync::Arc;
+//!
+//! async fn open_reader(
+//!     volume: SegmentedVolume,
+//!     sst_store: Arc<dyn ObjectStore>,
+//! ) -> Result<DbReader, slatedb::Error> {
+//!     DbReader::builder("orders", sst_store)
+//!         .with_reader_mode(DbReaderMode::ManagedCheckpoint)
+//!         .with_wal_reader(Arc::new(ChorusWal::new(volume)))
+//!         .build()
+//!         .await
+//! }
+//! ```
 
 mod codec;
 mod gc;
+mod reader;
 #[cfg(test)]
 mod tests;
 
@@ -67,10 +92,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    AppendCompletion, Error, Recovery, SegmentedVolume, WalEngineConfig, WalHandle, WalSeqNo,
+    AppendCompletion, Error, ReadOnlyConfig, Recovery, SegmentedVolume, WalEngineConfig, WalHandle,
+    WalSeqNo,
 };
 
-/// A SlateDB WAL initializer backed by a dedicated Chorus volume.
+/// A SlateDB WAL initializer, reader, and collector for a dedicated Chorus volume.
 ///
 /// Construction does no I/O. SlateDB first fences its manifest, then calls this
 /// initializer to fence Chorus and resolve replay, then checks its manifest
@@ -79,12 +105,24 @@ use crate::{
 ///
 /// Also implements `slatedb::wal::WalGc`. The writer and collector must receive
 /// clones of the same initializer so they share the process-local maintenance
-/// connection. Collection returns `WalError::Closed` before replay finishes or
-/// after the attached writer closes; it never opens/fences the volume itself.
+/// connection. During startup, collection waits for replay and engine
+/// initialization to finish, or returns their failure. Cancelled/dropped replay,
+/// collection before initialization, and a closed writer return `WalError::Closed`.
+/// Collection never opens/fences the volume itself.
+///
+/// `slatedb::wal::WalReader` is independent of that connection and works in
+/// separate reader processes. It preserves complete batch and WAL ID boundaries.
+/// Unbounded iterators wait for new quorum-visible records. Bounded iterators
+/// require a currently readable upper bound and return `Unavailable` if that
+/// bound is not yet quorum-visible; they never wait for a future endpoint.
+/// Locating the WAL end reads and decodes the active segment, since GCS object
+/// metadata does not expose its durable length. Size reader refresh intervals
+/// and segment rotation with that read cost in mind.
 #[derive(Clone)]
 pub struct ChorusWal {
     volume: SegmentedVolume,
     config: WalEngineConfig,
+    reader_config: ReadOnlyConfig,
     gc: gc::Registry,
 }
 
@@ -103,8 +141,17 @@ impl ChorusWal {
         Self {
             volume,
             config,
+            reader_config: ReadOnlyConfig::default(),
             gc: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Configure active-tail and manifest polling for trailing WAL iterators.
+    /// SlateDB `DbReader` refresh frequency is configured separately through
+    /// `DbReaderOptions::manifest_poll_interval`. Both intervals must be nonzero.
+    pub fn with_reader_config(mut self, config: ReadOnlyConfig) -> Self {
+        self.reader_config = config;
+        self
     }
 }
 
@@ -148,6 +195,7 @@ fn writer_and_replay_with_gc(
         .checked_add(1)
         .ok_or_else(|| internal_error("WAL ID space exhausted"))?;
     let observer = Observer::new(next_index);
+    let startup = gc::Startup::new(observer.clone(), &gc);
     let (ready_tx, ready_rx) = oneshot::channel();
     Ok(WriterInitResult {
         replay_iterator: Box::new(Replay {
@@ -157,7 +205,7 @@ fn writer_and_replay_with_gc(
             last_seq: None,
             failure: None,
             config: config.clone(),
-            gc,
+            startup: Some(startup),
         }),
         wal_writer: Box::new(Writer {
             ready: Some(ready_rx),
@@ -180,7 +228,7 @@ struct Replay {
     last_seq: Option<u64>,
     failure: Option<WalError>,
     config: WalEngineConfig,
-    gc: gc::Registry,
+    startup: Option<gc::Startup>,
 }
 
 // A successfully started engine must also be cancelled if replay's receiver is
@@ -204,9 +252,19 @@ impl WalIterator for Replay {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
+        if let Err(status) = self.observer.status() {
+            let error = WalError::from(status);
+            if let Some(startup) = self.startup.take() {
+                startup.complete(Err(error.clone()));
+            }
+            return Err(error);
+        }
         let Some(recovery) = self.recovery.as_mut() else {
             return Ok(None);
         };
+        // Keep the completion guard in this future across every suspension. If
+        // `next` is cancelled, fail closed and wake GC even if Replay is retained.
+        let mut startup = self.startup.take();
         let result = match recovery.try_next().await {
             Ok(Some(record)) => codec::decode(record.payload).and_then(|rows| {
                 let seq = rows[0].seq;
@@ -230,13 +288,14 @@ impl WalIterator for Replay {
                             handle: Some(handle),
                             runtime: tokio::runtime::Handle::current(),
                         };
-                        *self.gc.lock().unwrap() = Some(gc::Connection {
+                        let connection = gc::Connection {
                             handle: started.handle.as_ref().unwrap().gc_handle(),
                             observer: self.observer.clone(),
-                        });
+                        };
                         if let Some(ready) = self.ready.take() {
                             let _ = ready.send(started);
                         }
+                        startup.take().unwrap().complete(Ok(connection));
                         Ok(None)
                     }
                     Err(error) => Err(error),
@@ -246,8 +305,9 @@ impl WalIterator for Replay {
         };
         if let Err(error) = &result {
             self.failure = Some(error.clone());
-            self.observer.close(error.clone());
+            startup.take().unwrap().complete(Err(error.clone()));
         }
+        self.startup = startup;
         result
     }
 }
@@ -597,6 +657,9 @@ fn wal_error(error: Error) -> WalError {
     match error {
         Error::Fenced(_) => WalError::Fenced,
         Error::Closed => WalError::Closed,
+        Error::ReadOnlyLagged { next, .. } => {
+            WalError::WalTruncated(next.record_index.saturating_add(1))
+        }
         Error::InvalidCatalog(_)
         | Error::InvalidSegmentData(_)
         | Error::InvalidManifest(_)

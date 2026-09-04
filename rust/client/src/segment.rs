@@ -894,6 +894,54 @@ mod recovery {
             })
         }
 
+        /// Resolve a finite, quorum-visible end without fencing or following
+        /// future writes. SlateDB uses this to bound a reader's startup replay.
+        /// Object metadata cannot supply the length of an appendable tail.
+        #[cfg(feature = "slatedb")]
+        pub(crate) async fn readonly_end(
+            &self,
+            checkpoint: WalSeqNo,
+            through: Option<u64>,
+        ) -> Result<WalSeqNo, Error> {
+            let mut manifest = self
+                .open_existing_manifest()
+                .await?
+                .ok_or(Error::Uninitialized)?;
+            let record = manifest.record();
+            let tail_id = record.tail_id.clone().ok_or(Error::Uninitialized)?;
+            check_readonly_floor(record, checkpoint)?;
+            let base = record.tail_base;
+            // A bounded read entirely in published sealed history does not
+            // depend on the active tail's availability.
+            if through.is_some_and(|end| end <= base) {
+                return Ok(WalSeqNo::record(base.max(checkpoint.record_index)));
+            }
+            let object = format!("{}/segments/{tail_id}", self.prefix);
+            let replicas = timed_replicas_for(&self.factories, &object, &self.metrics);
+            let count = replicas.len();
+            let mut state = ActiveReadState {
+                id: tail_id,
+                epoch: record.epoch,
+                base_record_index: base,
+                byte_offset: 0,
+                skip_records: 0,
+                replicas,
+                inflight: FuturesUnordered::new(),
+                inflight_offsets: vec![None; count],
+                abort_handles: vec![None; count],
+                generations: vec![None; count],
+            };
+            // One finite range read per replica; do not chase a moving tail.
+            let frames = read_active_quorum(&mut state, true).await;
+            // GC may have removed the sampled tail while these reads ran.
+            let refreshed = manifest.refreshed_record().await.map_err(Error::from)?;
+            check_readonly_floor(&refreshed, checkpoint)?;
+            let end = base
+                .checked_add(frames?.len() as u64)
+                .ok_or(Error::SequenceExhausted)?;
+            Ok(WalSeqNo::record(end.max(checkpoint.record_index)))
+        }
+
         fn follow_readonly(
             &self,
             manifest: Manifest,
@@ -980,7 +1028,7 @@ mod recovery {
                     }
                     let state = active.as_mut().expect("active state was initialized");
                     let mut delivered = false;
-                    match read_active_quorum(state).await {
+                    match read_active_quorum(state, false).await {
                         Ok(frames) => {
                             for frame in frames {
                                 state.byte_offset = state
@@ -2602,7 +2650,10 @@ async fn read_sealed_segment(
     Ok(records)
 }
 
-async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFrame>, Error> {
+async fn read_active_quorum(
+    state: &mut ActiveReadState,
+    snapshot: bool,
+) -> Result<Vec<RecordFrame>, Error> {
     if state.replicas.is_empty() {
         return Err(Error::InvalidCatalog(
             "active segment has no configured replicas".into(),
@@ -2639,6 +2690,12 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
                     ),
                 }
             }
+            // A finite end probe must handle the lazily created empty tail.
+            // Absence supplies no records and cannot vote for a minority suffix.
+            // Live followers retain their existing retry-on-absence behavior.
+            Err(error) if snapshot && error.code == TransportCode::NotFound => {
+                ActiveReadObservation::Records(Vec::new())
+            }
             // A replica without a range-read implementation never becomes a
             // usable observation, so treating it as a transient failure would
             // poll forever without ever delivering an active record. Surface
@@ -2659,7 +2716,26 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
         };
         match active_read_decision(&observations, quorum)? {
             ActiveReadDecision::Pending => {}
-            ActiveReadDecision::Frames(frames) => return Ok(frames),
+            ActiveReadDecision::Frames(frames) => {
+                // A follower can emit a short prefix and immediately read
+                // again. An end probe cannot: a fast lagging replica must not
+                // hide a longer prefix on a slower majority. Wait only when
+                // pending replies could still establish a longer quorum.
+                let pending = observations
+                    .iter()
+                    .any(|o| matches!(o, ActiveReadObservation::Pending));
+                let possible_longer = observations
+                    .iter()
+                    .filter(|o| match o {
+                        ActiveReadObservation::Pending => true,
+                        ActiveReadObservation::Records(records) => records.len() > frames.len(),
+                        ActiveReadObservation::Failed(_) => false,
+                    })
+                    .count();
+                if !snapshot || !pending || possible_longer < quorum {
+                    return Ok(frames);
+                }
+            }
             ActiveReadDecision::NoReadQuorum => {
                 return Err(permanent_active_read_failure(&observations, quorum)
                     .unwrap_or(Error::NoReadQuorum));

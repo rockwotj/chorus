@@ -55,15 +55,18 @@ fn retained(first: u64) -> Vec<WalFileRange> {
 }
 
 async fn initialize(wal: &ChorusWal, checkpoint: u64) -> WriterInitResult {
+    let mut result = unreplayed(wal, checkpoint).await;
+    replay(&mut result).await;
+    result
+}
+
+async fn unreplayed(wal: &ChorusWal, checkpoint: u64) -> WriterInitResult {
     let recovery = wal
         .volume
         .recover(WalSeqNo::record(checkpoint))
         .await
         .unwrap();
-    let mut result =
-        writer_and_replay_with_gc(recovery, wal.config.clone(), wal.gc.clone()).unwrap();
-    replay(&mut result).await;
-    result
+    writer_and_replay_with_gc(recovery, wal.config.clone(), wal.gc.clone()).unwrap()
 }
 
 async fn seeded(checkpoint: u64) -> (Vec<RunningFake>, ChorusWal, WriterInitResult) {
@@ -336,6 +339,185 @@ async fn gc_is_available_before_first_append_and_rebinds_after_close() {
         .await
         .unwrap();
     next.wal_writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_waits_through_replay_and_collects_on_the_same_call() {
+    let (servers, wal, mut old) = seeded(0).await;
+    old.wal_writer.close().await.unwrap();
+    let mut writer = unreplayed(&wal, 0).await;
+    let before = names(&servers, 0).await;
+    let mut first = Box::pin(wal.collect(retained(13), Duration::ZERO, false));
+    let mut second = Box::pin(wal.collect(retained(13), Duration::ZERO, false));
+    assert!(futures::poll!(&mut first).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    for seq in 1..=16 {
+        let batch = writer.replay_iterator.next().await.unwrap().unwrap();
+        assert_eq!(batch.rows, vec![row(seq)]);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+    }
+    // Consuming the last batch is not enough: the EOF call starts the engine.
+    assert_eq!(floor(&servers).await, 0);
+    assert_eq!(names(&servers, 0).await, before);
+    assert!(writer.replay_iterator.next().await.unwrap().is_none());
+    drop(writer.replay_iterator);
+    for pending in [first, second] {
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("GC did not resume after replay")
+            .unwrap();
+    }
+    assert!(floor(&servers).await > 0);
+    assert!(names(&servers, 0).await.len() < before.len());
+    writer.wal_writer.append(&[row(17)]).await.unwrap();
+    writer.wal_writer.flush().await.unwrap().await.unwrap();
+    writer.wal_writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_propagates_replay_failure_without_waiting_for_writer_close() {
+    let (servers, volume) = volume().await;
+    let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
+    assert!(recovery.try_next().await.unwrap().is_none());
+    let mut handle = recovery.start(config()).await.unwrap();
+    handle
+        .enqueue_append(WalSeqNo::ZERO, Bytes::from_static(b"not a SlateDB record"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    handle.shutdown().await.unwrap();
+    let wal = ChorusWal::with_config(volume, config());
+    let mut writer = unreplayed(&wal, 0).await;
+    let before = names(&servers, 0).await;
+    let mut pending = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut pending).is_pending());
+    let error = writer.replay_iterator.next().await.err().unwrap();
+    assert!(matches!(error, WalError::DataError(_)));
+    let gc_error = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("GC hung after replay failed")
+        .unwrap_err();
+    assert_eq!(gc_error.to_string(), error.to_string());
+    assert!(matches!(gc_error, WalError::DataError(_)));
+    assert_eq!(floor(&servers).await, 0);
+    assert_eq!(names(&servers, 0).await, before);
+    let _ = writer.wal_writer.close().await;
+}
+
+#[tokio::test]
+async fn gc_propagates_engine_start_failure() {
+    let (servers, volume) = volume().await;
+    let wal = ChorusWal::with_config(volume, config());
+    let mut writer = unreplayed(&wal, 0).await;
+    let mut pending = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut pending).is_pending());
+    // Revoke ownership between replay construction and engine initialization.
+    let _newer = wal.volume.recover(WalSeqNo::ZERO).await.unwrap();
+    let before = names(&servers, 0).await;
+    assert!(matches!(
+        writer.replay_iterator.next().await,
+        Err(WalError::Fenced)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("GC hung after engine startup failed"),
+        Err(WalError::Fenced)
+    ));
+    assert_eq!(floor(&servers).await, 0);
+    assert_eq!(names(&servers, 0).await, before);
+    let _ = writer.wal_writer.close().await;
+}
+
+#[tokio::test]
+async fn dropping_old_replay_releases_its_gc_without_affecting_new_startup() {
+    let (servers, volume) = volume().await;
+    let wal = ChorusWal::with_config(volume, config());
+    let mut old = unreplayed(&wal, 0).await;
+    let mut old_gc = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut old_gc).is_pending());
+    let mut new = unreplayed(&wal, 0).await;
+    let mut new_gc = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut new_gc).is_pending());
+    let before = names(&servers, 0).await;
+    drop(old.replay_iterator);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), old_gc)
+            .await
+            .expect("GC hung after replay was dropped"),
+        Err(WalError::Closed)
+    ));
+    assert!(futures::poll!(&mut new_gc).is_pending());
+    assert_eq!(names(&servers, 0).await, before);
+    assert_eq!(floor(&servers).await, 0);
+    old.wal_writer.close().await.unwrap();
+    assert!(replay(&mut new).await.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), new_gc)
+        .await
+        .unwrap()
+        .unwrap();
+    new.wal_writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_engine_start_wakes_gc_even_when_replay_is_retained() {
+    let (servers, volume) = volume().await;
+    let wal = ChorusWal::with_config(volume, config());
+    let mut writer = unreplayed(&wal, 0).await;
+    for server in &servers[..3] {
+        server.service.inject_open_hold().await;
+    }
+    let mut pending = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut pending).is_pending());
+    let mut next = writer.replay_iterator.next();
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut next)
+        .await
+        .is_err());
+    assert!(futures::poll!(&mut pending).is_pending());
+    drop(next);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("GC hung after the replay future was cancelled"),
+        Err(WalError::Closed)
+    ));
+    assert!(matches!(
+        writer.replay_iterator.next().await,
+        Err(WalError::Closed)
+    ));
+    assert_eq!(floor(&servers).await, 0);
+    for server in &servers[..3] {
+        server.service.release_open_holds().await;
+    }
+    writer.wal_writer.close().await.unwrap();
+    let mut reopened = initialize(&wal, 0).await;
+    wal.collect(retained(0), Duration::ZERO, false)
+        .await
+        .unwrap();
+    reopened.wal_writer.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_waiter_rechecks_closed_writer_after_replay() {
+    let (servers, wal, mut old) = seeded(0).await;
+    old.wal_writer.close().await.unwrap();
+    let mut writer = unreplayed(&wal, 0).await;
+    let mut pending = Box::pin(wal.collect(vec![], Duration::ZERO, false));
+    assert!(futures::poll!(&mut pending).is_pending());
+    replay(&mut writer).await;
+    // The startup result is ready, but GC has not resumed yet.
+    writer.wal_writer.close().await.unwrap();
+    let before = names(&servers, 0).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap(),
+        Err(WalError::Closed)
+    ));
+    assert_eq!(floor(&servers).await, 0);
+    assert_eq!(names(&servers, 0).await, before);
 }
 
 #[tokio::test]

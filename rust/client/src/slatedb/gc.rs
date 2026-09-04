@@ -3,11 +3,55 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use slatedb::wal::{WalError, WalFileRange, WalGc, WalObserver};
+use tokio::sync::oneshot;
 
 use super::{wal_error, ChorusWal, Observer};
 
-pub(super) type Registry = Arc<Mutex<Option<Connection>>>;
+type Ready = Shared<BoxFuture<'static, Result<Connection, WalError>>>;
+pub(super) type Registry = Arc<Mutex<Option<Ready>>>;
+
+/// Each replay owns its completion signal. Dropping an unfinished replay (or
+/// its in-flight `next` future) must release GC without waiting for writer close:
+/// SlateDB shuts down GC before the writer and awaits in-flight GC callbacks.
+pub(super) struct Startup {
+    ready: Option<oneshot::Sender<Result<Connection, WalError>>>,
+    observer: Observer,
+}
+
+impl Startup {
+    pub(super) fn new(observer: Observer, registry: &Registry) -> Self {
+        let (sender, receiver) = oneshot::channel();
+        let ready = async move { receiver.await.unwrap_or(Err(WalError::Closed)) }
+            .boxed()
+            .shared();
+        // Replace the previous attempt, not its completion signal: collectors
+        // already waiting on an older replay must keep that attempt's result.
+        *registry.lock().unwrap() = Some(ready);
+        Self {
+            ready: Some(sender),
+            observer,
+        }
+    }
+
+    pub(super) fn complete(mut self, result: Result<Connection, WalError>) {
+        if let Err(error) = &result {
+            self.observer.close(error.clone());
+        }
+        let _ = self.ready.take().unwrap().send(result);
+    }
+}
+
+impl Drop for Startup {
+    fn drop(&mut self) {
+        if self.ready.is_some() {
+            self.observer.close(WalError::Closed);
+            // Dropping the sole sender resolves every GC waiter as Closed.
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Connection {
@@ -44,8 +88,10 @@ impl WalGc for ChorusWal {
     /// `GarbageCollectorBuilder`, and attach that builder with `with_gc_builder`.
     ///
     /// The collector is process-local: it requires successful replay by a Db
-    /// using this initializer (or a clone), and returns `Closed` once that writer
-    /// closes. It never recovers the volume or takes ownership of its writer.
+    /// using this initializer (or a clone). During startup it waits for replay
+    /// and engine initialization, propagating failure or cancellation without
+    /// deleting anything. Before initialization or after writer close it returns
+    /// `Closed`. It never recovers the volume or takes ownership of its writer.
     ///
     /// Only whole sealed segments preceding every retained range are reclaimed;
     /// gaps between retained ranges are intentionally kept. Nonzero `min_age`
@@ -61,7 +107,8 @@ impl WalGc for ChorusWal {
         min_age: Duration,
         dry_run: bool,
     ) -> Result<(), WalError> {
-        let connection = self.gc.lock().unwrap().clone().ok_or(WalError::Closed)?;
+        let ready = self.gc.lock().unwrap().clone().ok_or(WalError::Closed)?;
+        let connection = ready.await?;
         connection.observer.status().map_err(WalError::from)?;
         connection
             .handle
