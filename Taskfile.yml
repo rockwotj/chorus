@@ -109,6 +109,68 @@ tasks:
       - cargo test -p chorus-client --all-features
       - cargo publish -p chorus-client --locked --dry-run
 
+  bump:
+    desc: 'Show the chorus-client version, or set and commit it (task bump VERSION=0.2.0)'
+    vars:
+      VERSION: '{{.VERSION | default ""}}'
+    cmds:
+      - |
+        set -eu
+
+        current="$(
+          cd rust
+          cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "chorus-client") | .version'
+        )"
+        version="{{.VERSION}}"
+        if [ -z "$version" ]; then
+          echo "chorus-client $current"
+          echo "to bump: task bump VERSION=<major.minor.patch>"
+          exit 0
+        fi
+        case "$version" in
+          [0-9]*.[0-9]*.[0-9]*) ;;
+          *) echo "VERSION must be major.minor.patch, got $version" >&2; exit 1 ;;
+        esac
+
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+          echo "bump requires a clean tracked worktree so the commit holds only the bump" >&2
+          exit 1
+        fi
+
+        if [ "$version" = "$current" ]; then
+          echo "chorus-client is already $current" >&2
+          exit 1
+        fi
+        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+          echo "release tag v$version already exists on origin" >&2
+          exit 1
+        fi
+
+        # The crate version is the only line in the manifest that starts with
+        # `version =`; dependency versions live in inline tables.
+        sed -i.bak "s/^version = \"$current\"\$/version = \"$version\"/" rust/client/Cargo.toml
+        rm -f rust/client/Cargo.toml.bak
+        if ! grep -q "^version = \"$version\"\$" rust/client/Cargo.toml; then
+          echo "failed to rewrite the version in rust/client/Cargo.toml" >&2
+          git checkout -- rust/client/Cargo.toml
+          exit 1
+        fi
+        # Re-sync the workspace entries in Cargo.lock without touching the
+        # registry; the publish runs with --locked and must see the new version.
+        (cd rust && cargo update --workspace --offline --quiet)
+
+        changed="$(git diff --name-only | sort | tr '\n' ' ')"
+        if [ "$changed" != "rust/Cargo.lock rust/client/Cargo.toml " ]; then
+          echo "unexpected files changed by the bump: $changed" >&2
+          git checkout -- rust/Cargo.lock rust/client/Cargo.toml
+          exit 1
+        fi
+
+        git add rust/Cargo.lock rust/client/Cargo.toml
+        git commit -m "Release chorus-client $version"
+        echo "committed chorus-client $current -> $version; push to main, then run: task release"
+
   release:
     desc: Verify main, create the signed crate-version tag, and push it
     cmds:
