@@ -716,8 +716,10 @@ impl FakeGcs {
         range: ReadRange,
         include_metadata: bool,
     ) -> Result<BidiReadObjectResponse, Status> {
-        // Every range message is its own round trip, so it is charged as a
-        // content read. `Operation::BidiRead` covers opening the stream.
+        // Each range charges Read for counting, latency, and fault injection,
+        // preserving recovery's one Read per full-object read. The first gRPC
+        // range also incurs BidiRead at stream open; later ranges and the
+        // in-process path incur only Read.
         self.before(Operation::Read).await?;
         if range.read_length < 0 {
             return Err(Status::out_of_range("negative read length"));
@@ -1181,6 +1183,9 @@ impl FakeGcs {
 
     /// Read the currently visible suffix of an appendable object through the
     /// in-process equivalent of `BidiReadObject`.
+    /// Each read reports the current generation instead of retaining a session
+    /// generation. Followers discard a changed-generation observation, so both
+    /// this path and a gRPC session reopened after replacement are supported.
     pub async fn sim_bidi_read_bytes(
         &self,
         bucket: &str,
@@ -1495,16 +1500,25 @@ impl Storage for FakeGcs {
         &self,
         request: Request<tonic::Streaming<BidiReadObjectRequest>>,
     ) -> Result<Response<Self::BidiReadObjectStream>, Status> {
+        // Opening a gRPC stream charges BidiRead for counting, latency, and
+        // fault injection in addition to the first range's Read charge. Later
+        // ranges and the in-process path incur only the per-range Read charge.
         self.before(Operation::BidiRead).await?;
         let mut requests = request.into_inner();
         let first = requests
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("missing BidiReadObject request"))?;
-        let spec = first
+        let mut spec = first
             .read_object_spec
             .clone()
             .ok_or_else(|| Status::invalid_argument("first read request requires object spec"))?;
+        if spec.generation == 0 {
+            // Bind every range to the opening generation. The fake stores only
+            // the current object, so replacement fails the existing generation
+            // precondition and requires the client to open a new session.
+            spec.generation = self.bidi_read_metadata(&spec).await?.generation;
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let service = self.clone();
         let task = tokio::spawn(async move {
@@ -2960,6 +2974,93 @@ mod tests {
         let error = rejected.message().await.unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert_eq!(error.message(), "The object has already been finalized.");
+    }
+
+    #[tokio::test]
+    async fn bidi_read_session_rejects_replacement_and_reopens_with_new_generation() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let name = "replaced-during-read";
+        let mut create = create_request(bucket, name);
+        create.data = request(0, b"old", crc32c::crc32c(b"old")).data;
+        let mut writes = client
+            .bidi_write_object(tokio_stream::iter([create]))
+            .await
+            .unwrap()
+            .into_inner();
+        writes.message().await.unwrap().unwrap();
+
+        let first = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: bucket.into(),
+                object: name.into(),
+                ..Default::default()
+            }),
+            read_ranges: vec![ReadRange {
+                read_length: 3,
+                ..Default::default()
+            }],
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(first.clone()).await.unwrap();
+        let mut reads = client
+            .bidi_read_object(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let opened = reads.message().await.unwrap().unwrap();
+        let old_generation = opened.metadata.unwrap().generation;
+        assert_eq!(
+            opened.object_data_ranges[0]
+                .checksummed_data
+                .as_ref()
+                .unwrap()
+                .content,
+            b"old"
+        );
+
+        let mut replace = create_request(bucket, name);
+        let Some(FirstMessage::WriteObjectSpec(spec)) = replace.first_message.as_mut() else {
+            unreachable!();
+        };
+        spec.if_generation_match = Some(old_generation);
+        replace.data = request(0, b"new", crc32c::crc32c(b"new")).data;
+        let mut replacements = client
+            .bidi_write_object(tokio_stream::iter([replace]))
+            .await
+            .unwrap()
+            .into_inner();
+        replacements.message().await.unwrap().unwrap();
+        tx.send(BidiReadObjectRequest {
+            read_object_spec: None,
+            read_ranges: first.read_ranges.clone(),
+        })
+        .await
+        .unwrap();
+        let status = reads.message().await.unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), "generation mismatch");
+
+        let mut reopened = client
+            .bidi_read_object(tokio_stream::iter([first]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = reopened.message().await.unwrap().unwrap();
+        assert_ne!(response.metadata.unwrap().generation, old_generation);
+        assert_eq!(
+            response.object_data_ranges[0]
+                .checksummed_data
+                .as_ref()
+                .unwrap()
+                .content,
+            b"new"
+        );
+        assert_eq!(server.service.operation_count(Operation::BidiRead).await, 2);
+        assert_eq!(server.service.operation_count(Operation::Read).await, 3);
     }
 
     #[tokio::test]

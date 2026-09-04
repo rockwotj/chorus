@@ -97,6 +97,9 @@ machine WriterProcess {
                         // the register before declaring the tail empty
                         if (MaybeCrash()) { return; }
                         if (CommitRetire()) {
+                            announce eRecoveryCompleted, (
+                                writerId=writerId, segment=segBase,
+                                startOffset=segBase, endOffset=segBase);
                             announce eProgressCompleted, writerId;
                         }
                     }
@@ -143,6 +146,9 @@ machine WriterProcess {
                     // can see
                     if (MaybeCrash()) { return; }
                     if (CommitRetire()) {
+                        announce eRecoveryCompleted, (
+                            writerId=writerId, segment=segBase,
+                            startOffset=segBase, endOffset=segBase);
                         if (MaybeCrash()) { return; }
                         DiscardWitnesses();
                         announce eProgressCompleted, writerId;

@@ -450,6 +450,7 @@ spec StartupReplayAndTruncation observes eRecordFormed,
 // observations on a strict majority, which makes that prefix recovery-stable
 // by quorum intersection even if writer acknowledgment has not yet run.
 spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
+    eRecoverySelected, eRecoveryCompleted,
     eEpochClaimed, eReadonlyOpened, eReadonlySnapshot,
     eReadonlyActiveSnapshot, eReadonlyRecord, eReadonlyLagged {
     var support: map[(offset: int, value: int, segment: int), set[int]];
@@ -463,6 +464,8 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
     var snapshotSegmentId: map[int, int];
     var snapshotSegmentEnd: map[int, int];
     var snapshotActive: map[int, bool];
+    var activeEmitted: map[int, tRecord];
+    var recovered: map[(writerId: int, offset: int), tRecord];
 
     start state Observing {
         on eRecordPersisted do (payload: (
@@ -480,6 +483,31 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
             writerId: int, record: tRecord
         )) {
             committed[payload.record.offset] = payload.record;
+        }
+
+        on eRecoverySelected do (payload: (
+            writerId: int, record: tRecord
+        )) {
+            recovered[(writerId=payload.writerId,
+                offset=payload.record.offset)] = payload.record;
+        }
+
+        on eRecoveryCompleted do (payload: (
+            writerId: int, segment: int, startOffset: int, endOffset: int
+        )) {
+            var offset: int;
+            // Emission creates a retention obligation even without a writer
+            // commit. Check the whole segment, including an empty recovery.
+            foreach (offset in keys(activeEmitted)) {
+                if (activeEmitted[offset].segment == payload.segment) {
+                    assert payload.startOffset <= offset &&
+                        offset < payload.endOffset &&
+                        (writerId=payload.writerId, offset=offset) in recovered &&
+                        recovered[(writerId=payload.writerId, offset=offset)] ==
+                            activeEmitted[offset],
+                        "recovery omitted or changed a readonly active record";
+                }
+            }
         }
 
         on eEpochClaimed do (payload: (epoch: int, writerId: int)) {
@@ -555,6 +583,11 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
                     snapshotSegmentBase[payload.reader] &&
                     key in support && sizeof(support[key]) >= 2,
                     "readonly follower emitted an active record without majority support";
+                if (payload.record.offset in activeEmitted) {
+                    assert activeEmitted[payload.record.offset] == payload.record,
+                        "readonly followers emitted different active records at one offset";
+                }
+                activeEmitted[payload.record.offset] = payload.record;
             } else {
                 assert payload.record.offset in committed &&
                     committed[payload.record.offset] == payload.record,

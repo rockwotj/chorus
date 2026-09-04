@@ -24,9 +24,11 @@ machine ReadonlyFollower {
     // fall between manifest refreshes.
     var cached: tManifestRecord;
     var haveCached: bool;
-    // Consecutive polls served from `cached`. Manifest refresh is driven by a
-    // timer, so a snapshot cannot go unrefreshed forever; bounding the run
-    // keeps that finite here.
+    // Consecutive polls served from `cached`. The bound of two is a
+    // finite-model restriction, not a production refresh guarantee.
+    // Production can advance the cursor on many polls under one snapshot
+    // between timed refreshes or while unavailable manifest reads retry.
+    // Those longer cursor-advancing runs are excluded from this model.
     var stalePolls: int;
 
     start state Following {
@@ -353,6 +355,69 @@ machine ReadonlyFollowerDriver {
     }
 }
 
+event eReadonlyWriterReady: bool;
+
+// This writer executes the claim, create, and append protocol but pauses
+// before commit notification. The driver crashes it after follower emission.
+machine ReadonlyUncommittedWriter {
+    start state Run {
+        entry (config: (
+            manifest: ManifestRegister, buckets: seq[ZonalBucket], parent: machine
+        )) {
+            var response: tManifestReadResponse;
+            var candidate: tManifestRecord;
+            var record: tRecord;
+            var zone: int;
+            send config.manifest, eManifestRead, (caller=this,);
+            receive { case eManifestReadResponse: (r: tManifestReadResponse) {
+                response = r;
+            } }
+            assert response.status == STATUS_OK;
+            candidate = response.rec;
+            candidate.epoch = candidate.epoch + 1;
+            candidate.owner = 1;
+            send config.manifest, eManifestCas, (
+                caller=this, expMetagen=response.metagen, rec=candidate);
+            receive { case eManifestCasResponse: (r: tManifestCasResponse) {
+                assert r.status == STATUS_OK;
+            } }
+            announce eEpochClaimed, (epoch=candidate.epoch, writerId=1);
+            zone = 0;
+            while (zone < 2) {
+                send config.buckets[zone], eCreateSegment, (
+                    caller=this, writerId=1, epoch=candidate.epoch,
+                    segment=0, gen=candidate.tailGen);
+                receive { case eCreateResponse: (r: tCreateResponse) {
+                    assert r.status == STATUS_OK;
+                } }
+                zone = zone + 1;
+            }
+            announce eSegmentOpened, (
+                segment=0, writerId=1, epoch=candidate.epoch,
+                gen=candidate.tailGen);
+            send config.parent, eReadonlyWriterReady, false;
+            receive { case eReadonlyContinue: {} }
+            record = (offset=0, value=750, segment=0);
+            announce eRecordFormed, (writerId=1, record=record);
+            zone = 0;
+            while (zone < 2) {
+                send config.buckets[zone], eAppend, (
+                    caller=this, writerId=1, epoch=candidate.epoch,
+                    gen=candidate.tailGen, record=record);
+                receive { case eAppendResponse: (r: tAppendResponse) {
+                    assert r.status == STATUS_OK;
+                } }
+                zone = zone + 1;
+            }
+            send config.parent, eReadonlyWriterReady, true;
+            receive { case eCrash: {} }
+            send config.parent, eWriterDone, (
+                writerId=1, committed=false, sealed=false, crashed=true);
+            raise halt;
+        }
+    }
+}
+
 machine ReadonlyActiveTailDriver {
     start state Init {
         entry {
@@ -360,6 +425,7 @@ machine ReadonlyActiveTailDriver {
             var buckets: seq[ZonalBucket];
             var manifest: ManifestRegister;
             var follower: ReadonlyFollower;
+            var writer: ReadonlyUncommittedWriter;
             var zone: int;
             var stopped: (
                 writerId: int, committed: bool,
@@ -369,7 +435,6 @@ machine ReadonlyActiveTailDriver {
                 reader: int, nextOffset: int,
                 emitted: int, lagged: bool
             );
-            var attempts: int;
 
             zone = 0;
             while (zone < 3) {
@@ -379,22 +444,28 @@ machine ReadonlyActiveTailDriver {
             }
             segmentBuckets += (0, buckets);
             manifest = new ManifestRegister((failures=0,));
-            new WriterProcess((
-                writerId=1, value=750,
-                buckets=buckets, segBase=0,
-                manifest=manifest, parent=this,
-                shouldSeal=false, recoverExisting=false,
-                crashBudget=0));
-            receive { case eWriterDone: (payload: (
-                writerId: int, committed: bool,
-                sealed: bool, crashed: bool
-            )) { stopped = payload; } }
-            assert stopped.committed && !stopped.sealed;
+            writer = new ReadonlyUncommittedWriter((
+                manifest=manifest, buckets=buckets, parent=this));
+            receive { case eReadonlyWriterReady: (persisted: bool) {
+                assert !persisted;
+            } }
 
             follower = new ReadonlyFollower((
                 reader=102, manifest=manifest,
                 segmentBuckets=segmentBuckets, nextOffset=0,
                 pauseAfterSnapshot=false, parent=this));
+            // Cache the manifest before append. The next poll can emit the
+            // new record using this same snapshot through the stale branch.
+            send follower, eReadonlyPoll;
+            receive { case eReadonlyPollDone: (payload: (
+                reader: int, nextOffset: int,
+                emitted: int, lagged: bool
+            )) { poll = payload; } }
+            assert poll.nextOffset == 0 && poll.emitted == 0 && !poll.lagged;
+            send writer, eReadonlyContinue;
+            receive { case eReadonlyWriterReady: (persisted: bool) {
+                assert persisted;
+            } }
             send follower, eReadonlyPoll;
             receive { case eReadonlyPollDone: (payload: (
                 reader: int, nextOffset: int,
@@ -404,7 +475,14 @@ machine ReadonlyActiveTailDriver {
                 !poll.lagged,
                 "readonly follower did not read the quorum-visible active tail";
 
-            // A later recovery must retain and seal the majority-visible frame.
+            // The writer stops without eRecordCommitted. Recovery must retain
+            // the record already delivered from the two durable copies.
+            send writer, eCrash;
+            receive { case eWriterDone: (payload: (
+                writerId: int, committed: bool,
+                sealed: bool, crashed: bool
+            )) { stopped = payload; } }
+            assert stopped.crashed && !stopped.committed && !stopped.sealed;
             new WriterProcess((
                 writerId=2, value=-1,
                 buckets=buckets, segBase=0,

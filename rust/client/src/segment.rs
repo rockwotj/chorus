@@ -872,6 +872,10 @@ mod recovery {
                 .open_existing_manifest()
                 .await?
                 .ok_or(Error::Uninitialized)?;
+            // Manifest creation precedes the first claim that installs a tail.
+            if manifest.record().tail_id.is_none() {
+                return Err(Error::Uninitialized);
+            }
             check_readonly_floor(manifest.record(), checkpoint)?;
             Ok(ReadOnlyFollower {
                 from: checkpoint,
@@ -2575,22 +2579,15 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
 
         observations[result.replica_index] = match result.read {
             Ok(read) => {
-                // A replica's own generation must not change while the
-                // follower is reading one active segment. If it does, the
-                // object was replaced underneath the session and this byte
-                // offset no longer denotes the same position, so the bytes
-                // must not be mixed with what was already published.
-                match state.generations[result.replica_index] {
-                    Some(seen) if seen != read.generation => {
-                        return Err(Error::InvalidSegmentData(format!(
-                            "active segment {} on zone {} moved from generation {seen} to {}",
-                            state.id, result.replica_index, read.generation
-                        )));
-                    }
-                    Some(_) => {}
-                    None => state.generations[result.replica_index] = Some(read.generation),
+                // Repair can replace one copy without changing the majority's
+                // emitted prefix. Skip the changed copy for this poll and
+                // require majority byte agreement again on subsequent polls.
+                match state.generations[result.replica_index].replace(read.generation) {
+                    Some(seen) if seen != read.generation => ActiveReadObservation::Failed,
+                    _ => ActiveReadObservation::Records(
+                        RecordFrame::decode_complete_prefix(&read.bytes).0,
+                    ),
                 }
-                ActiveReadObservation::Records(RecordFrame::decode_complete_prefix(&read.bytes).0)
             }
             // A replica without a range-read implementation never becomes a
             // usable observation, so treating it as a transient failure would

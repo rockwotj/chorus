@@ -33,6 +33,120 @@ async fn readonly_open_does_not_initialize_the_wal() {
 }
 
 #[tokio::test]
+async fn readonly_open_reports_uninitialized_before_the_first_manifest_claim() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let prefix = "readonly-unclaimed-wal";
+    let manifest_replica = manifest_factory.replica(&format!("{prefix}/manifest"));
+    let mut manifest = crate::manifest::Manifest::open(
+        Arc::new(crate::manifest_store::GcsManifestStore::new(
+            manifest_replica.clone(),
+        )),
+        test_config(),
+        Arc::new(crate::metrics::Metrics::new(
+            &crate::NoopMetricsRecorder,
+            factories.len(),
+        )),
+        factories.len(),
+        factories
+            .iter()
+            .map(|factory| factory.bucket_name().to_string())
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.record().epoch, 0);
+    assert!(manifest.record().tail_id.is_none());
+    let before = manifest_replica.stat().await.unwrap();
+    let volume = volume(factories, manifest_factory, prefix);
+    assert!(matches!(
+        volume
+            .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+            .await,
+        Err(Error::Uninitialized)
+    ));
+    let after = manifest_replica.stat().await.unwrap();
+    assert_eq!(after.metageneration, before.metageneration);
+    assert_eq!(after.metadata, before.metadata);
+
+    manifest.claim().await.unwrap();
+    assert!(volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn readonly_active_tail_survives_one_replaced_generation() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let prefix = "readonly-replaced-generation-wal";
+    let volume = volume(factories.clone(), manifest_factory.clone(), prefix);
+    let writer = volume.recover_writer().await.unwrap();
+    drop(writer);
+    let (tail, _) = manifest_frontier_ids(&manifest_factory, prefix).await;
+    let object = segment_object(prefix, &tail);
+    for factory in &factories {
+        append_raw_record(factory, &object, b"first").await;
+    }
+
+    // Only zones 0 and 1 can form the first quorum, so the follower must
+    // observe zone 0's original generation before its replacement.
+    servers[2].service.set_crashed(true).await;
+    let mut follower = volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.seqno, WalSeqNo::ZERO);
+    assert_eq!(first.payload, b"first".as_slice());
+
+    let replica = factories[0].replica(&object);
+    let original = replica.snapshot().await.unwrap();
+    let mut replacement = original.bytes.to_vec();
+    replacement.extend_from_slice(&record(b"minority-only").encode().unwrap());
+    let replaced = replica
+        .replace_appendable(&original, replacement.into(), original.metadata.clone())
+        .await
+        .unwrap();
+    assert_ne!(replaced.generation.unwrap(), original.generation);
+    servers[0].service.reset_operation_counts().await;
+
+    // With no new majority record, polling must survive the old session's
+    // failure, reopen it, and observe the replacement generation.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), follower.try_next())
+            .await
+            .is_err()
+    );
+    assert!(
+        servers[0]
+            .service
+            .operation_count(Operation::BidiRead)
+            .await
+            > 0
+    );
+    assert!(servers[0].service.operation_count(Operation::Read).await > 2);
+
+    servers[2].service.set_crashed(false).await;
+    for factory in &factories[1..] {
+        append_raw_record(factory, &object, b"second").await;
+        append_raw_record(factory, &object, b"third").await;
+    }
+    for (index, payload) in [(1, b"second".as_slice()), (2, b"third".as_slice())] {
+        let next = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seqno, WalSeqNo::record(index));
+        assert_eq!(next.payload, payload);
+    }
+}
+
+#[tokio::test]
 async fn readonly_follower_tracks_active_records_across_rotation_without_fencing_the_writer() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let writer_volume = volume(

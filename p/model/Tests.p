@@ -130,7 +130,7 @@ test tcReadonlyActiveTail [main=ReadonlyActiveTailDriver]:
     assert QuorumLinearizability, SingleWriterPerSegment,
         SealAndPrefixSafety, ManifestSafety,
         ReadonlyFollowerSafety in
-    (union { ReadonlyFollower }, { WriterProcess },
+    (union { ReadonlyFollower }, { ReadonlyUncommittedWriter }, { WriterProcess },
         { ZonalBucket }, { ManifestRegister },
         { ReadonlyActiveTailDriver });
 
