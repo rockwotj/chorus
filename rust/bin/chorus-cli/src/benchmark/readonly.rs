@@ -30,6 +30,8 @@ pub(crate) struct ReadOnlyArgs {
     records: usize,
     #[arg(long, default_value_t = 4096)]
     payload_bytes: usize,
+    /// Records the writer keeps in flight before awaiting a completion. The
+    /// engine's byte-bounded window and queue are sized from this.
     #[arg(long, default_value_t = 64)]
     pipeline_window: usize,
     /// Delay before the next active-tail read when the previous one delivered
@@ -207,19 +209,30 @@ pub(crate) async fn run(
     }
     while recovery.try_next().await?.is_some() {}
 
-    let active_segment_bytes = (args.payload_bytes + 4)
+    let encoded_record_bytes = args.payload_bytes + 4;
+    let active_segment_bytes = encoded_record_bytes
         .checked_mul(args.records)
         .and_then(|bytes| bytes.checked_mul(2))
         .context("readonly benchmark active segment size overflowed usize")?;
+    // `--pipeline-window` counts records this benchmark keeps in flight on the
+    // client side. The engine bounds admission by encoded bytes, so its window
+    // must admit at least that many encoded records, and its queue keeps the
+    // same eight-window headroom the record-count configuration had.
+    let pipeline_window_bytes = encoded_record_bytes
+        .checked_mul(args.pipeline_window)
+        .context("readonly benchmark pipeline window overflowed usize")?;
+    let queue_capacity_bytes = pipeline_window_bytes
+        .checked_mul(8)
+        .context("readonly benchmark queue capacity overflowed usize")?;
     let mut writer = recovery
         .start(WalEngineConfig {
-            queue_capacity: args.pipeline_window.saturating_mul(8),
+            queue_capacity_bytes,
             // The workload appends one fixed payload size. Raising this to the
             // library default would force `max_active_segment_bytes` to cover a
             // maximum-size record the benchmark never writes, which rejects
             // every small configuration.
             max_record_bytes: args.payload_bytes,
-            pipeline_window_records: args.pipeline_window,
+            pipeline_window_bytes,
             max_inflight_bytes: WalEngineConfig::default().max_inflight_bytes,
             max_replica_lag_bytes: WalEngineConfig::default().max_replica_lag_bytes,
             lane_stall_timeout: WalEngineConfig::default().lane_stall_timeout,
@@ -302,6 +315,8 @@ pub(crate) async fn run(
             "records": args.records,
             "payload_bytes": args.payload_bytes,
             "pipeline_window": args.pipeline_window,
+            "pipeline_window_bytes": pipeline_window_bytes,
+            "queue_capacity_bytes": queue_capacity_bytes,
             "active_segment_bytes": active_segment_bytes,
             "poll_interval_ms": args.poll_interval_ms,
             "manifest_poll_interval_ms": args.manifest_poll_interval_ms,
