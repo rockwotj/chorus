@@ -172,6 +172,10 @@ struct ActiveReadState {
     replicas: Vec<Arc<dyn Replica>>,
     inflight: FuturesUnordered<BoxFuture<'static, ActiveReadResult>>,
     inflight_offsets: Vec<Option<i64>>,
+    /// Abort handle for each replica's outstanding read task. A read may
+    /// outlive the poll that started it, but not the active state that owns
+    /// it: dropping this state aborts the tasks instead of detaching them.
+    abort_handles: Vec<Option<tokio::task::AbortHandle>>,
     /// Object generation each replica last reported for this active segment.
     /// Generations are per-object, so they are comparable across polls of one
     /// replica but never across replicas.
@@ -186,8 +190,19 @@ struct ActiveReadResult {
 
 enum ActiveReadObservation {
     Pending,
-    Failed,
+    /// The read produced no usable bytes this poll. Carries the transport
+    /// error when there was one, so a failure that can never clear on its own
+    /// can be reported instead of retried as a missing quorum.
+    Failed(Option<TransportError>),
     Records(Vec<RecordFrame>),
+}
+
+impl Drop for ActiveReadState {
+    fn drop(&mut self) {
+        for handle in self.abort_handles.iter().flatten() {
+            handle.abort();
+        }
+    }
 }
 
 enum ActiveReadDecision {
@@ -911,7 +926,16 @@ mod recovery {
                             continue;
                         }
                         let object = format!("{prefix}/segments/{}", segment.id);
-                        let frames = match read_sealed_segment(&factories, &object, &segment).await {
+                        // Only the pending seal can be listed before its copies
+                        // are finalized; older entries were finalized or repaired.
+                        let frames = match read_sealed_segment(
+                            &factories,
+                            &object,
+                            &segment,
+                            segment.seal_pending,
+                        )
+                        .await
+                        {
                             Ok(frames) => frames,
                             Err(Error::NoReadQuorum) => {
                                 tokio::time::sleep(poll_interval).await;
@@ -954,6 +978,7 @@ mod recovery {
                             replicas,
                             inflight: FuturesUnordered::new(),
                             inflight_offsets: vec![None; replica_count],
+                            abort_handles: vec![None; replica_count],
                             generations: vec![None; replica_count],
                         });
                     }
@@ -1718,8 +1743,8 @@ mod recovery {
                 let records = read_sealed_segment(
                     &factories,
                     &format!("{prefix}/segments/{}", segment.id),
-                    &segment,
-                )
+                    &segment, false,
+)
                 .await?;
                 for record in replay_records(&segment, &records, from, end)? {
                     yield record;
@@ -2494,10 +2519,22 @@ pub(crate) fn segment_object(prefix: &str, id: &str) -> String {
     format!("{prefix}/segments/{id}")
 }
 
+/// Read one sealed segment's committed records.
+///
+/// `accept_unfinalized_crc_match` lets a copy that is not yet finalized serve
+/// the read when its full bytes match the CRC32C the manifest committed for
+/// this segment. The manifest lists a seal before the writer finalizes the
+/// object, and a readonly follower cannot enforce that finalization, so
+/// without this a follower that needs the pending seal waits on writer-side
+/// enforcement even though the committed bytes are already readable. The
+/// committed CRC32C identifies the exact bytes, so the match carries the same
+/// guarantee finalization does for content. Recovery and repair pass `false`
+/// and keep requiring finalized copies.
 async fn read_sealed_segment(
     factories: &[Arc<dyn ReplicaFactory>],
     object: &str,
     segment: &SegmentDescriptor,
+    accept_unfinalized_crc_match: bool,
 ) -> Result<Vec<RecordFrame>, Error> {
     let replicas = replicas_for(factories, object);
     let expected_end = segment.end_record_index;
@@ -2522,14 +2559,19 @@ async fn read_sealed_segment(
             if snapshot.crc32c == Some(expected_crc32c)
                 && crc32c::crc32c(&snapshot.bytes) == expected_crc32c
             {
-                if let Some(records) = decoded_sealed_snapshot(&snapshot, expected_records) {
+                if let Some(records) = decoded_sealed_snapshot(
+                    &snapshot,
+                    expected_records,
+                    !accept_unfinalized_crc_match,
+                ) {
                     return Ok(records);
                 }
             }
             snapshots.push(snapshot);
         }
     }
-    snapshots.retain(|snapshot| decoded_sealed_snapshot(snapshot, expected_records).is_some());
+    snapshots
+        .retain(|snapshot| decoded_sealed_snapshot(snapshot, expected_records, true).is_some());
     let quorum = majority(replicas.len());
     if snapshots.len() < quorum {
         return Err(Error::NoReadQuorum);
@@ -2583,7 +2625,7 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
                 // emitted prefix. Skip the changed copy for this poll and
                 // require majority byte agreement again on subsequent polls.
                 match state.generations[result.replica_index].replace(read.generation) {
-                    Some(seen) if seen != read.generation => ActiveReadObservation::Failed,
+                    Some(seen) if seen != read.generation => ActiveReadObservation::Failed(None),
                     _ => ActiveReadObservation::Records(
                         RecordFrame::decode_complete_prefix(&read.bytes).0,
                     ),
@@ -2605,14 +2647,45 @@ async fn read_active_quorum(state: &mut ActiveReadState) -> Result<Vec<RecordFra
                     ),
                 });
             }
-            Err(_) => ActiveReadObservation::Failed,
+            Err(error) => ActiveReadObservation::Failed(Some(error)),
         };
         match active_read_decision(&observations, quorum)? {
             ActiveReadDecision::Pending => {}
             ActiveReadDecision::Frames(frames) => return Ok(frames),
-            ActiveReadDecision::NoReadQuorum => return Err(Error::NoReadQuorum),
+            ActiveReadDecision::NoReadQuorum => {
+                return Err(
+                    permanent_active_read_failure(&observations).unwrap_or(Error::NoReadQuorum)
+                );
+            }
         }
     }
+}
+
+/// A missing read quorum caused by a failure that no amount of polling can
+/// clear. Authorization and request-shape errors are reported to the caller;
+/// everything else is treated as a replica that may answer on a later poll,
+/// including a copy that is absent, replaced, or still being written.
+fn permanent_active_read_failure(observations: &[ActiveReadObservation]) -> Option<Error> {
+    observations
+        .iter()
+        .enumerate()
+        .find_map(|(zone, observation)| match observation {
+            ActiveReadObservation::Failed(Some(error))
+                if matches!(
+                    error.code,
+                    TransportCode::PermissionDenied
+                        | TransportCode::Unauthenticated
+                        | TransportCode::InvalidArgument
+                ) =>
+            {
+                Some(Error::Transport {
+                    zone,
+                    code: error.code,
+                    message: error.message.clone(),
+                })
+            }
+            _ => None,
+        })
 }
 
 fn ensure_active_reads(state: &mut ActiveReadState) {
@@ -2629,6 +2702,7 @@ fn start_active_read(state: &mut ActiveReadState, replica_index: usize) {
     let replica = Arc::clone(&state.replicas[replica_index]);
     state.inflight_offsets[replica_index] = Some(byte_offset);
     let task = tokio::spawn(async move { replica.read_range(byte_offset).await });
+    state.abort_handles[replica_index] = Some(task.abort_handle());
     state.inflight.push(
         async move {
             let read = task.await.unwrap_or_else(|error| {
@@ -2703,8 +2777,9 @@ fn active_read_decision(
 fn decoded_sealed_snapshot(
     snapshot: &ReplicaSnapshot,
     expected_records: u64,
+    require_finalized: bool,
 ) -> Option<Vec<RecordFrame>> {
-    if !snapshot.finalized || !valid_format(&snapshot.metadata) {
+    if (require_finalized && !snapshot.finalized) || !valid_format(&snapshot.metadata) {
         return None;
     }
     let records = RecordFrame::decode_all(&snapshot.bytes).ok()?;
@@ -3323,7 +3398,7 @@ mod maintenance {
         object: &str,
         segment: &SegmentDescriptor,
     ) -> Result<Vec<u8>, Error> {
-        let records = read_sealed_segment(factories, object, segment).await?;
+        let records = read_sealed_segment(factories, object, segment, false).await?;
         let mut bytes = Vec::new();
         for record in records {
             bytes.extend_from_slice(&record.encode()?);

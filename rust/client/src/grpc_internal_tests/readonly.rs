@@ -431,3 +431,112 @@ async fn readonly_open_rejects_a_zero_poll_interval() {
         ));
     }
 }
+
+#[tokio::test]
+async fn readonly_follower_reads_a_pending_seal_before_its_copies_are_finalized() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let writer_volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "readonly-pending-seal-wal",
+    );
+    let reader_volume = volume(factories, manifest_factory, "readonly-pending-seal-wal");
+    let mut writer = writer_volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"sealed-before-finalize").await;
+
+    // Park every finalization so the rotated segment is listed in the manifest
+    // as the pending seal while no copy is finalized yet.
+    for server in &servers[..3] {
+        server.service.inject_finalize_hold().await;
+    }
+    let rotation = tokio::spawn(async move {
+        writer.rotate().await.unwrap();
+        writer
+    });
+    // The writer folds the seal into the manifest before it finalizes. The fake
+    // counts a finalize request before parking it, so a nonzero count means
+    // the manifest already lists the seal while every copy is still open.
+    let finalize_requested = async {
+        loop {
+            let mut requested = 0;
+            for server in &servers[..3] {
+                requested += server
+                    .service
+                    .operation_count(Operation::BidiFinalize)
+                    .await;
+            }
+            if requested > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), finalize_requested)
+        .await
+        .expect("rotation must reach seal enforcement");
+
+    let mut follower = reader_volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .expect("a pending seal whose bytes match the committed CRC32C must be readable")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.seqno, WalSeqNo::record(0));
+    assert_eq!(first.payload, b"sealed-before-finalize".as_slice());
+
+    for server in &servers[..3] {
+        server.service.release_finalize_holds().await;
+    }
+    let mut writer = rotation.await.unwrap();
+    assert_eq!(append_one(&mut writer, b"after-finalize").await, 1);
+    let second = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.payload, b"after-finalize".as_slice());
+}
+
+#[tokio::test]
+async fn readonly_follower_reports_a_permission_error_instead_of_polling_forever() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let writer_volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "readonly-permission-wal",
+    );
+    let reader_volume = volume(factories, manifest_factory, "readonly-permission-wal");
+    let mut writer = writer_volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"unreadable").await;
+
+    // Every zonal range read is denied. That can never clear by polling, so
+    // the follower must surface it rather than treat it as a missing quorum.
+    for server in &servers[..3] {
+        for _ in 0..4 {
+            server
+                .service
+                .inject(Operation::Read, Code::PermissionDenied)
+                .await;
+        }
+    }
+    let mut follower = reader_volume
+        .open_readonly_with_config(WalSeqNo::ZERO, readonly_config())
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), follower.try_next())
+        .await
+        .expect("a denied read quorum must fail fast");
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::Transport {
+                code: TransportCode::PermissionDenied,
+                ..
+            })
+        ),
+        "expected PermissionDenied, got {outcome:?}"
+    );
+}

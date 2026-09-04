@@ -435,6 +435,7 @@ machine ReadonlyActiveTailDriver {
                 reader: int, nextOffset: int,
                 emitted: int, lagged: bool
             );
+            var attempts: int;
 
             zone = 0;
             while (zone < 3) {
@@ -494,6 +495,27 @@ machine ReadonlyActiveTailDriver {
                 sealed: bool, crashed: bool
             )) { stopped = payload; } }
             assert stopped.sealed;
+
+            // The sealed segment now holds a record the original writer never
+            // acknowledged. A follower replaying it from the start must emit
+            // that record from the sealed path.
+            follower = new ReadonlyFollower((
+                reader=103, manifest=manifest,
+                segmentBuckets=segmentBuckets, nextOffset=0,
+                pauseAfterSnapshot=false, parent=this));
+            attempts = 0;
+            poll = (reader=0, nextOffset=-1, emitted=0, lagged=false);
+            while (attempts < 3 && poll.nextOffset != 1) {
+                send follower, eReadonlyPoll;
+                receive { case eReadonlyPollDone: (payload: (
+                    reader: int, nextOffset: int,
+                    emitted: int, lagged: bool
+                )) { poll = payload; } }
+                assert !poll.lagged;
+                attempts = attempts + 1;
+            }
+            assert poll.nextOffset == 1,
+                "readonly follower did not replay a recovery-retained sealed record";
         }
     }
 }

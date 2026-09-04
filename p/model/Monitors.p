@@ -449,8 +449,8 @@ spec StartupReplayAndTruncation observes eRecordFormed,
 // published immutable prefix. Active records must be complete, identical
 // observations on a strict majority, which makes that prefix recovery-stable
 // by quorum intersection even if writer acknowledgment has not yet run.
-spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
-    eRecoverySelected, eRecoveryCompleted,
+spec ReadonlyFollowerSafety observes eRecordPersisted, eCanonicalPersisted,
+    eRecordCommitted, eRecoverySelected, eRecoveryCompleted,
     eEpochClaimed, eReadonlyOpened, eReadonlySnapshot,
     eReadonlyActiveSnapshot, eReadonlyRecord, eReadonlyLagged {
     var support: map[(offset: int, value: int, segment: int), set[int]];
@@ -466,10 +466,28 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
     var snapshotActive: map[int, bool];
     var activeEmitted: map[int, tRecord];
     var recovered: map[(writerId: int, offset: int), tRecord];
+    // Records a recovery selected for retention. A sealed segment may hold a
+    // record the original writer never acknowledged, so sealed replay is
+    // checked against this as well as against writer commits.
+    var retained: map[int, tRecord];
 
     start state Observing {
         on eRecordPersisted do (payload: (
             zone: int, writerId: int, record: tRecord, gen: int
+        )) {
+            var key: (offset: int, value: int, segment: int);
+            key = RecordKey(payload.record);
+            if (!(key in support)) {
+                support[key] = default(set[int]);
+            }
+            support[key] += (payload.zone);
+        }
+
+        // Recovery writes the canonical bytes back onto a quorum. Those copies
+        // support a follower's active read the same way the writer's own
+        // appends do.
+        on eCanonicalPersisted do (payload: (
+            zone: int, writerId: int, record: tRecord
         )) {
             var key: (offset: int, value: int, segment: int);
             key = RecordKey(payload.record);
@@ -490,6 +508,7 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
         )) {
             recovered[(writerId=payload.writerId,
                 offset=payload.record.offset)] = payload.record;
+            retained[payload.record.offset] = payload.record;
         }
 
         on eRecoveryCompleted do (payload: (
@@ -589,8 +608,10 @@ spec ReadonlyFollowerSafety observes eRecordPersisted, eRecordCommitted,
                 }
                 activeEmitted[payload.record.offset] = payload.record;
             } else {
-                assert payload.record.offset in committed &&
-                    committed[payload.record.offset] == payload.record,
+                assert (payload.record.offset in committed &&
+                        committed[payload.record.offset] == payload.record) ||
+                    (payload.record.offset in retained &&
+                        retained[payload.record.offset] == payload.record),
                     "readonly follower emitted a changed sealed record";
                 assert payload.reader in snapshotEnd &&
                     snapshotSegmentBase[payload.reader] <=
