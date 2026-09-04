@@ -5,7 +5,6 @@ fn readonly_config() -> ReadOnlyConfig {
     ReadOnlyConfig {
         poll_interval: Duration::from_millis(10),
         manifest_poll_interval: Duration::from_millis(10),
-        ..ReadOnlyConfig::default()
     }
 }
 

@@ -153,8 +153,6 @@ cargo run --release -p chorus-cli --bin chorus -- \
 The prefix must be unused. The benchmark fails if the workload rotates, ensuring
 the reported latency is active-tail delivery rather than sealed-segment replay.
 
-`--poll-interval-ms` applies only after a read that delivered no records.
-`--manifest-poll-interval-ms` paces manifest re-reads separately. Pass
-`--fixed-poll-cadence` to sleep the poll interval between every read, including
-reads that delivered records, which is the comparison point for how much of the
-measured latency the poll interval contributes.
+`--poll-interval-ms` applies only after a read that delivered no records; a
+read that delivered is followed immediately by the next one.
+`--manifest-poll-interval-ms` paces manifest re-reads separately.

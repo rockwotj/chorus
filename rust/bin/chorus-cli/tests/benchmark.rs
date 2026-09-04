@@ -138,41 +138,34 @@ async fn recovery_benchmark_keeps_phase_latencies_without_operation_counts() {
 
 #[tokio::test]
 async fn readonly_benchmark_delivers_every_record_through_the_active_tail() {
-    for cadence in [&["--fixed-poll-cadence"][..], &[][..]] {
-        let mut args = vec![
-            "readonly",
-            "--records",
-            "64",
-            "--payload-bytes",
-            "32",
-            "--pipeline-window",
-            "8",
-            "--poll-interval-ms",
-            "5",
-            "--manifest-poll-interval-ms",
-            "50",
-            "--timeout-seconds",
-            "20",
-        ];
-        args.extend_from_slice(cadence);
-        let report = benchmark(&args).await;
+    let report = benchmark(&[
+        "readonly",
+        "--records",
+        "64",
+        "--payload-bytes",
+        "32",
+        "--pipeline-window",
+        "8",
+        "--poll-interval-ms",
+        "5",
+        "--manifest-poll-interval-ms",
+        "50",
+        "--timeout-seconds",
+        "20",
+    ])
+    .await;
 
-        assert_eq!(report["benchmark"], "readonly-active-tail");
-        assert_eq!(report["writer"]["committed_records"], 64);
-        assert_eq!(report["subscriber"]["delivered_records"], 64);
-        assert_latency(&report["commit_to_subscribe_latency_us"]);
-        assert!(report["subscriber"]["record_iops"].as_f64().unwrap() > 0.0);
-        assert_eq!(
-            report["configuration"]["continuous_when_active"],
-            cadence.is_empty()
-        );
-        // The workload is sized to one active segment, so the follower must
-        // have observed every record without a rotation.
-        assert!(
-            report["configuration"]["active_segment_bytes"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-    }
+    assert_eq!(report["benchmark"], "readonly-active-tail");
+    assert_eq!(report["writer"]["committed_records"], 64);
+    assert_eq!(report["subscriber"]["delivered_records"], 64);
+    assert_latency(&report["commit_to_subscribe_latency_us"]);
+    assert!(report["subscriber"]["record_iops"].as_f64().unwrap() > 0.0);
+    // The workload is sized to one active segment, so the follower must
+    // have observed every record without a rotation.
+    assert!(
+        report["configuration"]["active_segment_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }

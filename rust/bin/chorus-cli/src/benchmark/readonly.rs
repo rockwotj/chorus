@@ -41,10 +41,6 @@ pub(crate) struct ReadOnlyArgs {
     /// Delay between readonly manifest re-reads.
     #[arg(long, default_value_t = 1000)]
     manifest_poll_interval_ms: u64,
-    /// Poll on a fixed cadence even while records are being delivered, instead
-    /// of reading again immediately after a read that produced records.
-    #[arg(long, default_value_t = false)]
-    fixed_poll_cadence: bool,
     /// Maximum wait for writer completion and follower catch-up.
     #[arg(long, default_value_t = 180)]
     timeout_seconds: u64,
@@ -249,7 +245,6 @@ pub(crate) async fn run(
             ReadOnlyConfig {
                 poll_interval: Duration::from_millis(args.poll_interval_ms),
                 manifest_poll_interval: Duration::from_millis(args.manifest_poll_interval_ms),
-                continuous_when_active: !args.fixed_poll_cadence,
             },
         )
         .await?;
@@ -320,7 +315,6 @@ pub(crate) async fn run(
             "active_segment_bytes": active_segment_bytes,
             "poll_interval_ms": args.poll_interval_ms,
             "manifest_poll_interval_ms": args.manifest_poll_interval_ms,
-            "continuous_when_active": !args.fixed_poll_cadence,
             "worker_threads": args.worker_threads,
         }
     });

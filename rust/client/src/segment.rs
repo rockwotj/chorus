@@ -103,19 +103,16 @@ pub struct SegmentedVolume {
 pub struct ReadOnlyConfig {
     /// Delay before the next active-tail read when the previous one produced
     /// no records, either because the follower is caught up or because no
-    /// complete frame is yet visible on a replica quorum.
+    /// complete frame is yet visible on a replica quorum. A read that produced
+    /// records is followed immediately by the next read, so this bounds how
+    /// often an idle follower re-reads the tail and does not sit in the
+    /// delivery path while the writer is active.
     pub poll_interval: Duration,
     /// Delay between manifest re-reads. The manifest changes only when the
     /// writer rotates, seals, or truncates, so this is normally much larger
     /// than `poll_interval`; polling it at the active-tail rate multiplies
     /// regional reads without observing anything new.
     pub manifest_poll_interval: Duration,
-    /// When set, a read that produced records is followed immediately by the
-    /// next read instead of by `poll_interval`. This keeps `poll_interval` out
-    /// of the commit-to-subscribe path while the writer is active, at the cost
-    /// of reading as fast as the replicas answer. Clear it to poll on a fixed
-    /// cadence regardless of whether records were delivered.
-    pub continuous_when_active: bool,
 }
 
 impl Default for ReadOnlyConfig {
@@ -123,7 +120,6 @@ impl Default for ReadOnlyConfig {
         Self {
             poll_interval: Duration::from_secs(1),
             manifest_poll_interval: Duration::from_secs(1),
-            continuous_when_active: true,
         }
     }
 }
@@ -1014,9 +1010,9 @@ mod recovery {
 
                     // A read that delivered records means the writer is active
                     // and more bytes may already be visible, so the next read
-                    // starts immediately. `poll_interval` then bounds only how
-                    // often an idle follower re-reads the tail.
-                    if !(delivered && config.continuous_when_active) {
+                    // starts immediately. `poll_interval` bounds only how often
+                    // an idle follower re-reads the tail.
+                    if !delivered {
                         tokio::time::sleep(poll_interval).await;
                     }
                     let update = { manifest_updates.borrow_and_update().clone() };

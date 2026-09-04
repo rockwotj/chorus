@@ -122,7 +122,6 @@ let mut follower = volume
         ReadOnlyConfig {
             poll_interval: Duration::from_millis(100),
             manifest_poll_interval: Duration::from_secs(1),
-            continuous_when_active: true,
         },
     )
     .await?;
@@ -148,15 +147,13 @@ seals, or truncates, so that interval is normally much larger than
 `poll_interval`; polling it at the active-tail rate multiplies regional reads
 without observing anything new.
 
-With `continuous_when_active` set, a read that delivered records is followed
-immediately by the next read, so `poll_interval` bounds only how often an idle
-follower re-reads the tail. While the writer is producing faster than one
-record per round trip, freshness is then the fastest matching majority's
-bidirectional-read and decoding latency. Once the follower catches up, the next
-record still waits up to `poll_interval` to be observed, which is the latency
-against request-rate tradeoff that interval controls. Clear
-`continuous_when_active` to poll on a fixed cadence regardless of delivery.
-Segment rotation is never required for delivery.
+A read that delivered records is followed immediately by the next read, so
+`poll_interval` bounds only how often an idle follower re-reads the tail. While
+the writer is producing faster than one record per round trip, freshness is the
+fastest matching majority's bidirectional-read and decoding latency. Once the
+follower catches up, the next record still waits up to `poll_interval` to be
+observed, which is the latency against request-rate tradeoff that interval
+controls. Segment rotation is never required for delivery.
 
 Followers do not register with the writer. Retain WAL history long enough for
 every replica to advance its own durable checkpoint. If truncation overtakes a
