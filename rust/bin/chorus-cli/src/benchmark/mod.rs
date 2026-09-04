@@ -5,11 +5,13 @@ use std::sync::{Arc, Mutex};
 use chorus_client::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 
 pub(crate) mod append;
+pub(crate) mod readonly;
 pub(crate) mod recovery;
 
 #[derive(Default)]
 pub(crate) struct BenchMetrics {
     counters: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    histogram_samples: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 impl BenchMetrics {
@@ -21,13 +23,31 @@ impl BenchMetrics {
             .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
+
+    /// Number of values recorded into `name`.
+    pub(crate) fn histogram_samples(&self, name: &str) -> u64 {
+        self.histogram_samples
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|samples| samples.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Segments sealed so far. Every rotation seals the segment it rotates
+    /// away from, so a non-zero count means the active segment moved.
+    pub(crate) fn seal_count(&self) -> u64 {
+        self.histogram_samples("chorus.wal.seal.duration_seconds")
+    }
 }
 
-struct BenchCounter(Arc<AtomicU64>);
+struct BenchCounter {
+    counter: Arc<AtomicU64>,
+}
 
 impl CounterFn for BenchCounter {
     fn increment(&self, value: u64) {
-        self.0.fetch_add(value, Ordering::Relaxed);
+        self.counter.fetch_add(value, Ordering::SeqCst);
     }
 }
 
@@ -45,6 +65,16 @@ impl HistogramFn for NoopMetric {
     fn record(&self, _value: f64) {}
 }
 
+struct BenchHistogram {
+    samples: Arc<AtomicU64>,
+}
+
+impl HistogramFn for BenchHistogram {
+    fn record(&self, _value: f64) {
+        self.samples.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl MetricsRecorder for BenchMetrics {
     fn register_counter(
         &self,
@@ -59,7 +89,7 @@ impl MetricsRecorder for BenchMetrics {
             .entry(name.to_string())
             .or_default()
             .clone();
-        Arc::new(BenchCounter(metric))
+        Arc::new(BenchCounter { counter: metric })
     }
 
     fn register_gauge(
@@ -82,11 +112,36 @@ impl MetricsRecorder for BenchMetrics {
 
     fn register_histogram(
         &self,
-        _name: &str,
+        name: &str,
         _description: &str,
         _labels: &[(&str, &str)],
         _boundaries: &[f64],
     ) -> Arc<dyn HistogramFn> {
-        Arc::new(NoopMetric)
+        let samples = self
+            .histogram_samples
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        Arc::new(BenchHistogram { samples })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_metrics_count_seals() {
+        let metrics = BenchMetrics::default();
+        let seals =
+            metrics.register_histogram("chorus.wal.seal.duration_seconds", "test", &[], &[]);
+
+        assert_eq!(metrics.seal_count(), 0);
+        seals.record(0.5);
+        seals.record(1.5);
+
+        assert_eq!(metrics.seal_count(), 2);
     }
 }

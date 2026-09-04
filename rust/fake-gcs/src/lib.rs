@@ -20,9 +20,10 @@ use proto::bidi_write_object_request::{Data, FirstMessage};
 use proto::bidi_write_object_response::WriteStatus;
 use proto::storage_server::{Storage, StorageServer};
 use proto::{
-    BidiReadObjectRequest, BidiReadObjectResponse, BidiWriteObjectRequest, BidiWriteObjectResponse,
-    DeleteObjectRequest, Empty, GetObjectRequest, ListObjectsRequest, ListObjectsResponse, Object,
-    ReadObjectRequest, ReadObjectResponse, Timestamp, UpdateObjectRequest,
+    BidiReadObjectRequest, BidiReadObjectResponse, BidiReadObjectSpec, BidiWriteObjectRequest,
+    BidiWriteObjectResponse, DeleteObjectRequest, Empty, GetObjectRequest, ListObjectsRequest,
+    ListObjectsResponse, Object, ObjectRangeData, ReadObjectRequest, ReadObjectResponse, ReadRange,
+    Timestamp, UpdateObjectRequest,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -30,7 +31,12 @@ pub enum Operation {
     Delete,
     Get,
     List,
+    /// One content range served, whether over `ReadObject` or as one range
+    /// message on a `BidiReadObject` stream.
     Read,
+    /// One `BidiReadObject` stream opened. A follower polling an active object
+    /// opens one stream per replica and then charges `Read` per poll.
+    BidiRead,
     Update,
     BidiWrite,
     BidiCreate,
@@ -56,6 +62,7 @@ impl Operation {
             Self::BidiAppendFlush => 9,
             Self::BidiFinalize => 10,
             Self::BidiGuardedReplace => 11,
+            Self::BidiRead => 12,
         }
     }
 }
@@ -690,6 +697,76 @@ impl FakeGcs {
         Ok(())
     }
 
+    async fn bidi_read_metadata(&self, spec: &BidiReadObjectSpec) -> Result<Object, Status> {
+        let state = self.inner.lock().await;
+        let object = state
+            .objects
+            .get(&object_key(&spec.bucket, &spec.object))
+            .ok_or_else(|| Status::not_found("object"))?;
+        check_bidi_read_preconditions(object, spec)?;
+        if crc32c::crc32c(&object.bytes) != object.integrity_crc32c {
+            return Err(Status::data_loss("stored object CRC32C mismatch"));
+        }
+        Ok(object.to_session_proto())
+    }
+
+    async fn bidi_read_range(
+        &self,
+        spec: &BidiReadObjectSpec,
+        range: ReadRange,
+        include_metadata: bool,
+    ) -> Result<BidiReadObjectResponse, Status> {
+        // Each range charges Read for counting, latency, and fault injection,
+        // preserving recovery's one Read per full-object read. The first gRPC
+        // range also incurs BidiRead at stream open; later ranges and the
+        // in-process path incur only Read.
+        self.before(Operation::Read).await?;
+        if range.read_length < 0 {
+            return Err(Status::out_of_range("negative read length"));
+        }
+        let state = self.inner.lock().await;
+        let object = state
+            .objects
+            .get(&object_key(&spec.bucket, &spec.object))
+            .ok_or_else(|| Status::not_found("object"))?;
+        check_bidi_read_preconditions(object, spec)?;
+        if crc32c::crc32c(&object.bytes) != object.integrity_crc32c {
+            return Err(Status::data_loss("stored object CRC32C mismatch"));
+        }
+        let len = object.bytes.len();
+        let start = if range.read_offset < 0 {
+            len.saturating_sub(range.read_offset.unsigned_abs() as usize)
+        } else {
+            usize::try_from(range.read_offset).unwrap_or(usize::MAX)
+        };
+        if start > len {
+            return Err(Status::out_of_range("read offset"));
+        }
+        let limit = if range.read_length == 0 {
+            len - start
+        } else {
+            usize::try_from(range.read_length).unwrap_or(usize::MAX)
+        };
+        let end = len.min(start.saturating_add(limit));
+        let content = object.bytes[start..end].to_vec();
+        Ok(BidiReadObjectResponse {
+            object_data_ranges: vec![ObjectRangeData {
+                checksummed_data: Some(proto::ChecksummedData {
+                    crc32c: Some(crc32c::crc32c(&content)),
+                    content,
+                }),
+                read_range: Some(ReadRange {
+                    read_offset: start as i64,
+                    read_length: (end - start) as i64,
+                    read_id: range.read_id,
+                }),
+                range_end: true,
+            }],
+            metadata: include_metadata.then(|| object.to_session_proto()),
+            read_handle: None,
+        })
+    }
+
     /// Fault-inject and compute the operation latency WITHOUT sleeping.
     ///
     /// `before` is exactly this followed by [`Self::sleep_charged`]. The
@@ -1104,6 +1181,36 @@ impl FakeGcs {
         Ok(stored.bytes.clone())
     }
 
+    /// Read the currently visible suffix of an appendable object through the
+    /// in-process equivalent of `BidiReadObject`.
+    /// Each read reports the current generation instead of retaining a session
+    /// generation. Followers discard a changed-generation observation, so both
+    /// this path and a gRPC session reopened after replacement are supported.
+    pub async fn sim_bidi_read_bytes(
+        &self,
+        bucket: &str,
+        object: &str,
+        offset: i64,
+    ) -> Result<(i64, Vec<u8>), Status> {
+        self.before(Operation::Read).await?;
+        if offset < 0 {
+            return Err(Status::invalid_argument("negative read offset"));
+        }
+        let state = self.inner.lock().await;
+        let stored = state
+            .objects
+            .get(&object_key(bucket, object))
+            .ok_or_else(|| Status::not_found("object"))?;
+        if crc32c::crc32c(&stored.bytes) != stored.integrity_crc32c {
+            return Err(Status::data_loss("stored object CRC32C mismatch"));
+        }
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start > stored.bytes.len() {
+            return Err(Status::out_of_range("read offset"));
+        }
+        Ok((stored.generation, stored.bytes[start..].to_vec()))
+    }
+
     async fn close_stream_after_response(&self, operation: Operation) -> Result<(), Status> {
         let mut state = self.inner.lock().await;
         let Some(code) = state
@@ -1225,8 +1332,8 @@ impl<T> Drop for TaskResponseStream<T> {
 #[tonic::async_trait]
 impl Storage for FakeGcs {
     type ReadObjectStream = ResponseStream<ReadObjectResponse>;
-    type BidiWriteObjectStream = ResponseStream<BidiWriteObjectResponse>;
     type BidiReadObjectStream = ResponseStream<BidiReadObjectResponse>;
+    type BidiWriteObjectStream = ResponseStream<BidiWriteObjectResponse>;
 
     async fn delete_object(
         &self,
@@ -1384,72 +1491,105 @@ impl Storage for FakeGcs {
     /// reads over this API because `ReadObject` stalls opening its stream
     /// against real appendable objects, so the fake has to implement it or the
     /// recovery tests exercise a path production no longer takes.
+    ///
+    /// The stream stays open across messages: the first message carries the
+    /// object spec, and each later message asks for another range on the same
+    /// object. Readonly followers poll an active object over one such stream
+    /// per zone.
     async fn bidi_read_object(
         &self,
         request: Request<tonic::Streaming<BidiReadObjectRequest>>,
     ) -> Result<Response<Self::BidiReadObjectStream>, Status> {
-        self.before(Operation::Read).await?;
-        let mut inbound = request.into_inner();
-        let first = inbound
+        // Opening a gRPC stream charges BidiRead for counting, latency, and
+        // fault injection in addition to the first range's Read charge. Later
+        // ranges and the in-process path incur only the per-range Read charge.
+        self.before(Operation::BidiRead).await?;
+        let mut requests = request.into_inner();
+        let first = requests
             .message()
             .await?
-            .ok_or_else(|| Status::invalid_argument("empty bidi read stream"))?;
-        let spec = first
+            .ok_or_else(|| Status::invalid_argument("missing BidiReadObject request"))?;
+        let mut spec = first
             .read_object_spec
-            .ok_or_else(|| Status::invalid_argument("first message must set read_object_spec"))?;
-        let state = self.inner.lock().await;
-        let object = state
-            .objects
-            .get(&object_key(&spec.bucket, &spec.object))
-            .ok_or_else(|| Status::not_found("object"))?;
-        check_name(object, &spec.bucket, &spec.object)?;
-        if crc32c::crc32c(&object.bytes) != object.integrity_crc32c {
-            return Err(Status::data_loss("stored object CRC32C mismatch"));
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("first read request requires object spec"))?;
+        if spec.generation == 0 {
+            // Bind every range to the opening generation. The fake stores only
+            // the current object, so replacement fails the existing generation
+            // precondition and requires the client to open a new session.
+            spec.generation = self.bidi_read_metadata(&spec).await?.generation;
         }
-        if spec.generation != 0 && spec.generation != object.generation {
-            return Err(Status::failed_precondition("generation mismatch"));
-        }
-        if spec
-            .if_generation_match
-            .is_some_and(|value| value != object.generation)
-        {
-            return Err(Status::failed_precondition("generation mismatch"));
-        }
-        if spec
-            .if_metageneration_match
-            .is_some_and(|value| value != object.metageneration)
-        {
-            return Err(Status::failed_precondition("metageneration mismatch"));
-        }
-        // A zero offset and length requests the whole object, which is the only
-        // shape chorus asks for.
-        let range = first.read_ranges.first().copied().unwrap_or_default();
-        let start = usize::try_from(range.read_offset.max(0)).unwrap_or(usize::MAX);
-        if start > object.bytes.len() {
-            return Err(Status::out_of_range("read offset"));
-        }
-        let limit = if range.read_length <= 0 {
-            object.bytes.len() - start
-        } else {
-            usize::try_from(range.read_length).unwrap_or(usize::MAX)
-        };
-        let end = object.bytes.len().min(start.saturating_add(limit));
-        let response = BidiReadObjectResponse {
-            object_data_ranges: vec![proto::ObjectRangeData {
-                checksummed_data: Some(proto::ChecksummedData {
-                    content: object.bytes[start..end].to_vec(),
-                    crc32c: Some(crc32c::crc32c(&object.bytes[start..end])),
-                }),
-                read_range: Some(proto::ReadRange {
-                    read_offset: range.read_offset,
-                    read_length: (end - start) as i64,
-                    read_id: range.read_id,
-                }),
-                range_end: true,
-            }],
-            metadata: Some(object.to_proto()),
-        };
-        Ok(Response::new(Box::pin(tokio_stream::iter([Ok(response)]))))
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let service = self.clone();
+        let task = tokio::spawn(async move {
+            let mut next = Some(first);
+            let mut include_metadata = true;
+            loop {
+                let request = match next.take() {
+                    Some(request) => request,
+                    None => match requests.message().await {
+                        Ok(Some(request)) => request,
+                        Ok(None) => break,
+                        Err(status) => {
+                            let _ = tx.send(Err(status)).await;
+                            break;
+                        }
+                    },
+                };
+                if request.read_object_spec.is_some() && !include_metadata {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "object spec is only valid in the first read request",
+                        )))
+                        .await;
+                    break;
+                }
+                if request.read_ranges.is_empty() && include_metadata {
+                    match service.bidi_read_metadata(&spec).await {
+                        Ok(metadata) => {
+                            if tx
+                                .send(Ok(BidiReadObjectResponse {
+                                    object_data_ranges: Vec::new(),
+                                    metadata: Some(metadata),
+                                    read_handle: None,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(status) => {
+                            let _ = tx.send(Err(status)).await;
+                            break;
+                        }
+                    }
+                    include_metadata = false;
+                    continue;
+                }
+                for range in request.read_ranges {
+                    match service
+                        .bidi_read_range(&spec, range, include_metadata)
+                        .await
+                    {
+                        Ok(response) => {
+                            include_metadata = false;
+                            if tx.send(Ok(response)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(status) => {
+                            let _ = tx.send(Err(status)).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(TaskResponseStream {
+            inner: ReceiverStream::new(rx),
+            task,
+        })))
     }
 
     async fn update_object(
@@ -2027,6 +2167,32 @@ fn check_name(object: &StoredObject, bucket: &str, name: &str) -> Result<(), Sta
     }
 }
 
+fn check_bidi_read_preconditions(
+    object: &StoredObject,
+    spec: &BidiReadObjectSpec,
+) -> Result<(), Status> {
+    check_name(object, &spec.bucket, &spec.object)?;
+    if spec.generation != 0 && spec.generation != object.generation {
+        return Err(Status::failed_precondition("generation mismatch"));
+    }
+    if spec
+        .if_generation_match
+        .is_some_and(|value| value != object.generation)
+        || spec
+            .if_generation_not_match
+            .is_some_and(|value| value == object.generation)
+        || spec
+            .if_metageneration_match
+            .is_some_and(|value| value != object.metageneration)
+        || spec
+            .if_metageneration_not_match
+            .is_some_and(|value| value == object.metageneration)
+    {
+        return Err(Status::failed_precondition("read precondition mismatch"));
+    }
+    Ok(())
+}
+
 fn object_key(bucket: &str, object: &str) -> String {
     format!("{bucket}\0{object}")
 }
@@ -2060,8 +2226,9 @@ impl StoredObject {
             bucket: self.bucket.clone(),
             generation: self.generation,
             metageneration: self.metageneration,
-            // Live GCS does not expose flushed appendable bytes through
-            // GetObject.size until the object is finalized.
+            // Keep metadata tail-blind in the fake so protocol code cannot
+            // accidentally substitute GetObject.size for write-session
+            // persisted_size. Live visibility has varied over time.
             size: if self.finalized {
                 self.bytes.len() as i64
             } else {
@@ -2807,6 +2974,93 @@ mod tests {
         let error = rejected.message().await.unwrap_err();
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert_eq!(error.message(), "The object has already been finalized.");
+    }
+
+    #[tokio::test]
+    async fn bidi_read_session_rejects_replacement_and_reopens_with_new_generation() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let name = "replaced-during-read";
+        let mut create = create_request(bucket, name);
+        create.data = request(0, b"old", crc32c::crc32c(b"old")).data;
+        let mut writes = client
+            .bidi_write_object(tokio_stream::iter([create]))
+            .await
+            .unwrap()
+            .into_inner();
+        writes.message().await.unwrap().unwrap();
+
+        let first = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: bucket.into(),
+                object: name.into(),
+                ..Default::default()
+            }),
+            read_ranges: vec![ReadRange {
+                read_length: 3,
+                ..Default::default()
+            }],
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(first.clone()).await.unwrap();
+        let mut reads = client
+            .bidi_read_object(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let opened = reads.message().await.unwrap().unwrap();
+        let old_generation = opened.metadata.unwrap().generation;
+        assert_eq!(
+            opened.object_data_ranges[0]
+                .checksummed_data
+                .as_ref()
+                .unwrap()
+                .content,
+            b"old"
+        );
+
+        let mut replace = create_request(bucket, name);
+        let Some(FirstMessage::WriteObjectSpec(spec)) = replace.first_message.as_mut() else {
+            unreachable!();
+        };
+        spec.if_generation_match = Some(old_generation);
+        replace.data = request(0, b"new", crc32c::crc32c(b"new")).data;
+        let mut replacements = client
+            .bidi_write_object(tokio_stream::iter([replace]))
+            .await
+            .unwrap()
+            .into_inner();
+        replacements.message().await.unwrap().unwrap();
+        tx.send(BidiReadObjectRequest {
+            read_object_spec: None,
+            read_ranges: first.read_ranges.clone(),
+        })
+        .await
+        .unwrap();
+        let status = reads.message().await.unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), "generation mismatch");
+
+        let mut reopened = client
+            .bidi_read_object(tokio_stream::iter([first]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = reopened.message().await.unwrap().unwrap();
+        assert_ne!(response.metadata.unwrap().generation, old_generation);
+        assert_eq!(
+            response.object_data_ranges[0]
+                .checksummed_data
+                .as_ref()
+                .unwrap()
+                .content,
+            b"new"
+        );
+        assert_eq!(server.service.operation_count(Operation::BidiRead).await, 2);
+        assert_eq!(server.service.operation_count(Operation::Read).await, 3);
     }
 
     #[tokio::test]

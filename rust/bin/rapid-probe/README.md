@@ -56,7 +56,7 @@ Each probe uses unique scratch object names; T6 creates two objects:
 | T4 | metadata CAS does not revoke an already-open stream |
 | T5 | finalization rejects a subsequent append open |
 | T6 | newly created segment-like objects are immediately visible to listing |
-| T7 | reports open-object read and size visibility, then verifies the finalized bytes are readable |
+| T7 | requires `BidiReadObject` to return flushed open-object bytes, reports ordinary read/size visibility, then verifies finalized reads |
 | T8 | reports whether 100 per-record flushed appends on one session encounter throttling |
 | T9 | measures sequential flush latency, per-message-flush burst pacing, and one-final-flush group durability |
 | T10 | reports outcomes for 256 KiB, 1 MiB, 2 MiB, 2 MiB + 1 byte, and 4 MiB write messages |
@@ -72,8 +72,8 @@ The probe also exercises two service-specific transport requirements:
 - zonal bidi writes may return `ABORTED` with a
   `BidiWriteObjectRedirectedError`; its routing token must be replayed in
   `x-goog-request-params`;
-- the durable tail of an open appendable object comes from write-response
-  `persisted_size`, not `GetObject.size`.
+- writer-lane durability still comes from write-response `persisted_size`;
+  readonly clients observe open bytes independently through `BidiReadObject`.
 
 Expected rejections and failures include the observed gRPC status code and
 message. Successful characterization results report their relevant sizes or
@@ -109,6 +109,10 @@ The repository records these historical live-service results for
   `INVALID_ARGUMENT` stating that `append_object_spec.generation` must be
   specified. Recovery therefore retains an explicit current-generation lookup
   followed by exact-generation takeover.
+- On June 23, 2026, T7 returned all 16 flushed bytes from the unfinalized
+  appendable object through `BidiReadObject`. That run also exposed the bytes
+  through ordinary `ReadObject` and `GetObject.size`; Chorus readonly following
+  nevertheless uses the explicit bidirectional-read API.
 
 These observations are evidence for those runs, not a permanent provider
 contract. Preserve new output with validation records.

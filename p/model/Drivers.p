@@ -258,7 +258,8 @@ machine HistoricalMaintenanceRepairDriver {
             // applied before the repair coordinator reads the zones.
             send buckets[1], eCorruptRecord, (offset=0,);
             send buckets[1], eRead, (
-                caller=this, segment=historical.base, gen=-1);
+                caller=this, segment=historical.base, gen=-1,
+                readonly=false);
             receive { case eReadResponse: (r: tReadResponse) {
                 dataResponse = r;
             } }

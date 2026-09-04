@@ -301,6 +301,7 @@ pub(crate) struct Metrics {
 pub(crate) struct TransportRpcMetrics {
     pub(crate) snapshot: Histogram,
     pub(crate) stat: Histogram,
+    pub(crate) read_range: Histogram,
     pub(crate) create_appendable: Histogram,
     pub(crate) create_append_session: Histogram,
     pub(crate) resume_tail: Histogram,
@@ -337,6 +338,7 @@ impl TransportRpcMetrics {
         Self {
             snapshot: rpc("snapshot"),
             stat: rpc("stat"),
+            read_range: rpc("read_range"),
             create_appendable: rpc("create_appendable"),
             create_append_session: rpc("create_append_session"),
             resume_tail: rpc("resume_tail"),

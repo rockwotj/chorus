@@ -29,6 +29,12 @@
 //! repaired in place, and maintenance never advances the database's checkpoint
 //! floor autonomously. See the `database_wal`
 //! example for the complete lifecycle.
+//! Independent read-replica processes can call
+//! [`SegmentedVolume::open_readonly`] to follow sealed history and the
+//! quorum-visible active tail without claiming a writer epoch. The follower
+//! automatically polls with bidirectional range reads and returns
+//! [`Error::ReadOnlyLagged`] if writer truncation overtakes its durable
+//! checkpoint.
 //! Every fallible public operation returns [`Error`].
 //!
 //! # Operational constraints
@@ -92,7 +98,8 @@ pub use metrics::{
 };
 pub use protocol::ClientConfig;
 pub use segment::{
-    Recovery, RecoveryTimings, RepairReport, SegmentedVolume, TruncationReport, WalRecord, WalSeqNo,
+    ReadOnlyConfig, ReadOnlyFollower, Recovery, RecoveryTimings, RepairReport, SegmentedVolume,
+    TruncationReport, WalRecord, WalSeqNo,
 };
 pub use transport::TransportCode;
 
@@ -100,8 +107,8 @@ pub use transport::TransportCode;
 /// supplies an in-memory `ReplicaFactory` in place of the gRPC transport.
 #[cfg(feature = "dst-support")]
 pub use transport::{
-    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaSnapshot,
-    TransportError,
+    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaRangeRead,
+    ReplicaSnapshot, TransportError,
 };
 
 /// Helpers for repository probes that intentionally share transport details.
