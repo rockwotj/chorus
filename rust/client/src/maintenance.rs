@@ -51,6 +51,17 @@ pub(crate) enum MaintenanceCmd {
         floor: WalSeqNo,
         response: oneshot::Sender<Result<TruncationReport, Error>>,
     },
+    /// Retained-range GC, independent of this writer's startup replay point.
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
+}
+
+#[cfg(feature = "slatedb")]
+pub(crate) struct GcRequest {
+    pub retain_from: u64,
+    pub min_age: Duration,
+    pub dry_run: bool,
+    pub response: oneshot::Sender<Result<TruncationReport, Error>>,
 }
 
 /// Control handle owned by the [`crate::WalHandle`]; dropping it ends the
@@ -120,6 +131,24 @@ impl MaintenanceHandle {
 
     pub(crate) fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    #[cfg(feature = "slatedb")]
+    pub(crate) async fn collect(
+        &self,
+        retain_from: u64,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<TruncationReport, Error> {
+        let (response, receiver) = oneshot::channel();
+        self.enqueue(MaintenanceCmd::Collect(GcRequest {
+            retain_from,
+            min_age,
+            dry_run,
+            response,
+        }))
+        .await?;
+        receiver.await.map_err(|_| Error::Closed)?
     }
 }
 
@@ -311,6 +340,17 @@ async fn execute_command(
                 let _ = response.send(result.clone());
             }
         }
+        #[cfg(feature = "slatedb")]
+        ReadyCommandKind::Collect(request) => {
+            task.adopt_catalog(catalog_rx);
+            let result = task
+                .collect_once(request.retain_from, request.min_age, request.dry_run)
+                .await;
+            if result.is_err() {
+                task.manifest = None;
+            }
+            let _ = request.response.send(result);
+        }
     }
 }
 
@@ -325,6 +365,8 @@ enum PendingGroup {
         segment: Box<SwappedSegment>,
         enforced: oneshot::Sender<()>,
     },
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
 }
 
 #[derive(Default)]
@@ -353,6 +395,8 @@ enum ReadyCommandKind {
         floor: WalSeqNo,
         responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
     },
+    #[cfg(feature = "slatedb")]
+    Collect(GcRequest),
 }
 
 impl PendingCommands {
@@ -368,6 +412,12 @@ impl PendingCommands {
             MaintenanceCmd::RepairSegment(segment) => self.push_repair(segment),
             MaintenanceCmd::Truncate { floor, response } => {
                 self.push_truncation(floor, response);
+            }
+            #[cfg(feature = "slatedb")]
+            MaintenanceCmd::Collect(request) => {
+                // Retention snapshots, dry runs, and age gates must not be
+                // coalesced with each other or ordinary truncation requests.
+                self.groups.push_back(PendingGroup::Collect(request));
             }
         }
     }
@@ -435,7 +485,17 @@ impl PendingCommands {
                             queued_requests: 1,
                         });
                     }
-                    Some(PendingGroup::Work(_)) | None => continue,
+                    _ => unreachable!("front group was a seal"),
+                },
+                #[cfg(feature = "slatedb")]
+                PendingGroup::Collect(_) => match self.groups.pop_front() {
+                    Some(PendingGroup::Collect(request)) => {
+                        return Some(ReadyCommand {
+                            kind: ReadyCommandKind::Collect(request),
+                            queued_requests: 1,
+                        })
+                    }
+                    _ => unreachable!("front group was a collection"),
                 },
             }
         }
@@ -871,6 +931,111 @@ impl MaintenanceState {
         Ok(report)
     }
 
+    #[cfg(feature = "slatedb")]
+    async fn collect_once(
+        &mut self,
+        retain_from: u64,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<TruncationReport, Error> {
+        let record = self
+            .ensure_manifest()
+            .await?
+            .refreshed_record()
+            .await
+            .map_err(Error::from)?;
+        // Authorize only copies already older than min_age. All replicas must
+        // answer: a repaired copy can be younger than the quorum's originals.
+        // A zero age explicitly disables this gate (and permits degraded-zone
+        // truncation); normal tombstone cleanup still retries committed deletes.
+        let mut too_young = HashSet::new();
+        let mut ages_known = true;
+        if !min_age.is_zero() {
+            let now = std::time::SystemTime::now();
+            let prefix = format!("{}/segments/", self.prefix);
+            let listings = futures::future::join_all(
+                self.factories.iter().map(|factory| factory.list(&prefix)),
+            )
+            .await;
+            for listing in listings {
+                match listing {
+                    Ok(objects) => {
+                        for object in objects {
+                            if !older_than(object.last_modified, now, min_age) {
+                                too_young.insert(object.name);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        ages_known = false;
+                        tracing::warn!(%error, "SlateDB WAL GC cannot verify replica ages; deferring new truncation");
+                    }
+                }
+            }
+        }
+        let mut floor = record.trunc;
+        for (index, entry) in record.segments.iter().enumerate() {
+            let end = record
+                .segments
+                .get(index + 1)
+                .map_or(record.tail_base, |next| next.base);
+            if end <= record.trunc {
+                continue;
+            } // Already-authorized deletion tombstone.
+            let sealed = self
+                .catalog
+                .iter()
+                .any(|segment| segment.id == entry.id && !segment.seal_pending);
+            if end > retain_from
+                || !sealed
+                || !ages_known
+                || too_young.contains(&crate::segment::segment_object(&self.prefix, &entry.id))
+            {
+                break;
+            }
+            floor = end;
+        }
+        if dry_run {
+            tracing::info!(
+                current_floor = record.trunc,
+                proposed_floor = floor,
+                retain_from,
+                "SlateDB WAL GC dry run"
+            );
+            return Ok(TruncationReport {
+                deleted_objects: 0,
+                deleted_segments: 0,
+            });
+        }
+        let before = self
+            .catalog
+            .iter()
+            .map(|segment| segment.base_record_index)
+            .collect();
+        let mut manifest = self
+            .manifest
+            .take()
+            .ok_or_else(|| Error::Internal("GC manifest disappeared".into()))?;
+        // Unlike truncate_before, this authority comes from ALL retained
+        // manifests, not the current writer's replay checkpoint. Never use
+        // checkpoint_floor here: it may be ahead of an older retained manifest.
+        let mut retention_floor = record.trunc;
+        let result = truncate_pass(
+            &self.factories,
+            &self.prefix,
+            &mut self.catalog,
+            &mut retention_floor,
+            &mut manifest,
+            WalSeqNo::record(floor),
+        )
+        .await;
+        self.manifest = Some(manifest);
+        if result.is_ok() {
+            self.remember_catalog_deletions(before);
+        }
+        result
+    }
+
     fn remember_catalog_deletions(&mut self, before: HashSet<u64>) {
         for gone in before {
             if !self
@@ -893,9 +1058,37 @@ async fn tick(interval: &mut Option<Interval>) {
     }
 }
 
+#[cfg(feature = "slatedb")]
+fn older_than(
+    last_modified: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    min_age: Duration,
+) -> bool {
+    last_modified
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age > min_age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "slatedb")]
+    #[test]
+    fn gc_age_requires_known_time_strictly_older_than_cutoff() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let age = Duration::from_secs(60);
+        let now = UNIX_EPOCH + Duration::from_secs(120);
+        assert!(super::older_than(
+            Some(now - age - Duration::from_nanos(1)),
+            now,
+            age
+        ));
+        assert!(!super::older_than(Some(now - age), now, age));
+        assert!(!super::older_than(Some(now), now, age));
+        assert!(!super::older_than(Some(now + age), now, age));
+        assert!(!super::older_than(None, now, age));
+    }
 
     fn segment(base: u64) -> SegmentDescriptor {
         SegmentDescriptor {
@@ -968,6 +1161,8 @@ mod tests {
                 ReadyCommandKind::SealSegment { .. } | ReadyCommandKind::Truncate { .. } => {
                     panic!("flood coalescer emitted an unexpected command");
                 }
+                #[cfg(feature = "slatedb")]
+                ReadyCommandKind::Collect(_) => panic!("no collections were queued"),
             }
         }
         assert_eq!(repaired, (0..8).step_by(2).collect::<Vec<_>>());

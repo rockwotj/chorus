@@ -83,6 +83,8 @@ mod metrics;
 mod protocol;
 mod record;
 mod segment;
+#[cfg(feature = "slatedb")]
+pub mod slatedb;
 mod transport;
 
 #[cfg(test)]

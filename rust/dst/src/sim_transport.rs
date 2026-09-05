@@ -173,6 +173,20 @@ impl ReplicaFactory for InMemoryReplicaFactory {
                 generation: object.generation,
                 size: object.size,
                 finalized: object.finalize_time.is_some(),
+                last_modified: object.update_time.and_then(|time| {
+                    if !(-62_135_596_800..=253_402_300_799).contains(&time.seconds)
+                        || !(0..1_000_000_000).contains(&time.nanos)
+                    {
+                        return None;
+                    }
+                    let seconds = std::time::Duration::from_secs(time.seconds.unsigned_abs());
+                    let base = if time.seconds < 0 {
+                        std::time::UNIX_EPOCH.checked_sub(seconds)
+                    } else {
+                        std::time::UNIX_EPOCH.checked_add(seconds)
+                    }?;
+                    base.checked_add(std::time::Duration::from_nanos(time.nanos as u64))
+                }),
                 crc32c: object
                     .checksums
                     .as_ref()
