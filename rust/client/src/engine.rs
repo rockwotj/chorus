@@ -249,6 +249,43 @@ impl Future for AppendCompletion {
     }
 }
 
+enum Completion {
+    Receipt(oneshot::Sender<Result<AppendReceipt, Error>>),
+    #[cfg(feature = "slatedb")]
+    Notify(CommitNotification),
+}
+
+impl Completion {
+    fn send(self, result: Result<AppendReceipt, Error>) {
+        match self {
+            Self::Receipt(sender) => {
+                let _ = sender.send(result);
+            }
+            #[cfg(feature = "slatedb")]
+            Self::Notify(mut notification) => (notification.0.take().unwrap())(result),
+        }
+    }
+}
+
+// Only the adapter's nonblocking progress publisher runs here, never SlateDB
+// listeners. This replaces a per-record oneshot for watermark-based consumers.
+#[cfg(feature = "slatedb")]
+type CommitCallback = Box<dyn FnOnce(Result<AppendReceipt, Error>) + Send>;
+
+#[cfg(feature = "slatedb")]
+struct CommitNotification(Option<CommitCallback>);
+
+#[cfg(feature = "slatedb")]
+impl Drop for CommitNotification {
+    fn drop(&mut self) {
+        if let Some(notify) = self.0.take() {
+            // Aborting/panicking must also release durability waiters. Like a
+            // dropped oneshot sender, this does not claim the write rolled back.
+            notify(Err(Error::Closed));
+        }
+    }
+}
+
 /// Starts the background append pipeline and maintenance task.
 pub struct WalEngine;
 
@@ -292,7 +329,7 @@ struct AdmittedAppend {
     admitted_at: tokio::time::Instant,
     _inflight_bytes: OwnedSemaphorePermit,
     queue_slot: Option<QueueSlot>,
-    completion: oneshot::Sender<Result<AppendReceipt, Error>>,
+    completion: Completion,
 }
 
 /// The queue budget one admitted record holds until dispatch.
@@ -575,6 +612,38 @@ impl WalHandle {
         seqno: WalSeqNo,
         record: Bytes,
     ) -> Result<AppendCompletion, Error> {
+        self.enqueue_inner(seqno, record, || {
+            let (sender, receiver) = oneshot::channel();
+            (Completion::Receipt(sender), AppendCompletion { receiver })
+        })
+        .await
+    }
+
+    /// Publish ordered completion directly into the adapter's latest-progress
+    /// state, without allocating or queuing an individual completion future.
+    /// The callback must not block or invoke external listeners.
+    #[cfg(feature = "slatedb")]
+    pub(crate) async fn enqueue_append_notifying(
+        &mut self,
+        seqno: WalSeqNo,
+        record: Bytes,
+        notify: impl FnOnce(Result<AppendReceipt, Error>) + Send + 'static,
+    ) -> Result<(), Error> {
+        self.enqueue_inner(seqno, record, || {
+            (
+                Completion::Notify(CommitNotification(Some(Box::new(notify)))),
+                (),
+            )
+        })
+        .await
+    }
+
+    async fn enqueue_inner<T>(
+        &mut self,
+        seqno: WalSeqNo,
+        record: Bytes,
+        on_admit: impl FnOnce() -> (Completion, T),
+    ) -> Result<T, Error> {
         if self.sender.is_closed() {
             return Err(Error::Closed);
         }
@@ -645,7 +714,9 @@ impl WalHandle {
             .map_err(|_| Error::Closed)?;
         let queue_slot =
             QueueSlot::new(queue_permit, Arc::clone(&self.queued_bytes), encoded_bytes);
-        let (completion, receiver) = oneshot::channel();
+        // Construct the notification only after all admission waits. Cancelling
+        // a blocked admission must not publish a failure or consume a WAL ID.
+        let (completion, admitted) = on_admit();
         self.sender
             .send(Command::Append(AdmittedAppend {
                 seqno,
@@ -661,7 +732,7 @@ impl WalHandle {
 
         self.total_admitted_bytes = admission_end_bytes;
         self.next_seqno += 1;
-        Ok(AppendCompletion { receiver })
+        Ok(admitted)
     }
 
     /// Advance the application checkpoint floor and delete eligible sealed
@@ -1611,7 +1682,7 @@ fn complete_append(append: AdmittedAppend, metrics: &Metrics) {
     metrics
         .append_commit_latency
         .record_duration(append.admitted_at.elapsed());
-    let _ = append.completion.send(Ok(AppendReceipt {
+    append.completion.send(Ok(AppendReceipt {
         seqno: append.seqno,
     }));
     metrics.committed_records.increment();
@@ -1656,5 +1727,5 @@ fn fail_completion_batches(
 
 fn fail_append(append: AdmittedAppend, error: Error, metrics: &Metrics) {
     metrics.append_failures.increment();
-    let _ = append.completion.send(Err(error));
+    append.completion.send(Err(error));
 }

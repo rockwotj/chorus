@@ -8,6 +8,8 @@ use std::time::Duration;
 
 #[path = "gc_tests.rs"]
 mod gc_tests;
+#[path = "progress_tests.rs"]
+mod progress_tests;
 #[path = "reader_tests.rs"]
 mod reader_tests;
 
@@ -281,7 +283,7 @@ async fn pipelined_appends_notify_only_after_quorum_and_flush_is_a_barrier() {
     );
     assert_eq!(observer.status().unwrap().last_flushed_wal_id, 1);
     assert_eq!(observer.status().unwrap().buffered_wal_entries_count, 3);
-    assert!(observer.status().unwrap().estimated_bytes > 0);
+    assert_eq!(observer.status().unwrap().estimated_bytes, 0);
     servers[0].service.release_flush_holds().await;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), &mut barrier)
@@ -307,13 +309,16 @@ async fn pipelined_appends_notify_only_after_quorum_and_flush_is_a_barrier() {
     assert!(matches!(status.closed_reason, Some(WalError::Closed)));
     assert!(observer.subscribe(Arc::new(|_| {})).is_err());
     let events = events.lock().unwrap();
-    assert_eq!(events.len(), 4);
-    for (index, event) in events[..3].iter().enumerate() {
-        assert!(
-            matches!(event, WalEvent::WalFlushed(status) if status.last_flushed_wal_id == index as u64 + 2)
-        );
+    let mut previous = 1;
+    for event in &events[..events.len() - 1] {
+        let WalEvent::WalFlushed(status) = event else {
+            panic!("unexpected close before the final durable prefix");
+        };
+        assert!(status.last_flushed_wal_id > previous);
+        previous = status.last_flushed_wal_id;
     }
-    assert!(matches!(events[3], WalEvent::WalClosed(_)));
+    assert_eq!(previous, 4);
+    assert!(matches!(events.last(), Some(WalEvent::WalClosed(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

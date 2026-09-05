@@ -9,6 +9,9 @@
 //! maps to SlateDB WAL file ID `n + 1` (ID zero means no WAL). Thus SlateDB's
 //! exclusive `replay_after_wal_id` is exactly Chorus's inclusive replay index.
 //! Admission is pipelined; only ordered quorum completions publish durability.
+//! Chorus owns WAL admission backpressure. `WalStatus::estimated_bytes` is zero
+//! to opt out of SlateDB's WAL-buffer accounting. Durable progress is coalesced
+//! by WAL ID; there is no separately bounded adapter completion queue.
 //!
 //! This implements writer initialization, bounded streaming recovery, writes,
 //! flush barriers, observation, close, and `WalGc`. Wire a clone of the same
@@ -74,6 +77,7 @@
 
 mod codec;
 mod gc;
+mod progress;
 mod reader;
 #[cfg(test)]
 mod tests;
@@ -88,12 +92,11 @@ use slatedb::wal::{
     WalStatusListener, WalWriter, WriterInit, WriterInitResult, WriterManifest,
 };
 use slatedb::RowEntry;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
-    AppendCompletion, Error, ReadOnlyConfig, Recovery, SegmentedVolume, WalEngineConfig, WalHandle,
-    WalSeqNo,
+    Error, ReadOnlyConfig, Recovery, SegmentedVolume, WalEngineConfig, WalHandle, WalSeqNo,
 };
 
 /// A SlateDB WAL initializer, reader, and collector for a dedicated Chorus volume.
@@ -188,7 +191,6 @@ fn writer_and_replay_with_gc(
     config: WalEngineConfig,
     gc: gc::Registry,
 ) -> Result<WriterInitResult, WalError> {
-    // Validate before constructing bounded channels (whose zero capacity panics).
     config.validate().map_err(wal_error)?;
     let next_index = recovery.end.record_index;
     next_index
@@ -210,12 +212,13 @@ fn writer_and_replay_with_gc(
         wal_writer: Box::new(Writer {
             ready: Some(ready_rx),
             handle: None,
-            pending: None,
-            completions: None,
+            progress: None,
+            notifications: None,
             runtime: None,
             observer,
             next_index,
             last_admitted_seq: None,
+            total_rows: 0,
             config,
         }),
     })
@@ -315,6 +318,20 @@ impl WalIterator for Replay {
 struct State {
     status: WalStatus,
     listeners: Vec<WalStatusListener>,
+    admitted_rows: u128,
+    committed_rows: u128,
+}
+
+impl State {
+    fn update_buffered_rows(&mut self) {
+        // A fast commit can be published before append() records admission.
+        // Cumulative counters make either ordering safe, including coalescing.
+        self.status.buffered_wal_entries_count = self
+            .admitted_rows
+            .saturating_sub(self.committed_rows)
+            .try_into()
+            .unwrap_or(usize::MAX);
+    }
 }
 
 #[derive(Default)]
@@ -342,6 +359,8 @@ impl Observer {
                     buffered_wal_entries_count: 0,
                 },
                 listeners: Vec::new(),
+                admitted_rows: 0,
+                committed_rows: 0,
             })),
             events: Arc::new(Mutex::new(Notifications::default())),
             changed: watch::channel(()).0,
@@ -361,15 +380,23 @@ impl Observer {
         });
     }
 
-    fn committed(&self, pending: &Pending) {
+    fn admitted(&self, total_rows: u128) {
+        let mut state = self.state.lock().unwrap();
+        state.admitted_rows = total_rows;
+        state.update_buffered_rows();
+    }
+
+    fn committed(&self, position: &progress::Position) {
         self.notify(|state| {
-            if state.status.closed_reason.is_some() {
+            if state.status.closed_reason.is_some()
+                || position.wal_id <= state.status.last_flushed_wal_id
+            {
                 return None;
             }
-            state.status.last_flushed_wal_id = pending.wal_id;
-            state.status.last_flushed_seq = Some(pending.seq);
-            state.status.estimated_bytes -= pending.bytes;
-            state.status.buffered_wal_entries_count -= pending.rows;
+            state.status.last_flushed_wal_id = position.wal_id;
+            state.status.last_flushed_seq = Some(position.seq);
+            state.committed_rows = position.total_rows;
+            state.update_buffered_rows();
             Some((
                 WalEvent::WalFlushed(state.status.clone()),
                 state.listeners.clone(),
@@ -453,23 +480,16 @@ impl WalObserver for Observer {
     }
 }
 
-struct Pending {
-    completion: AppendCompletion,
-    wal_id: u64,
-    seq: u64,
-    bytes: usize,
-    rows: usize,
-}
-
 struct Writer {
     ready: Option<oneshot::Receiver<StartedHandle>>,
     handle: Option<WalHandle>,
-    pending: Option<mpsc::Sender<Pending>>,
-    completions: Option<JoinHandle<()>>,
+    progress: Option<watch::Sender<progress::Progress>>,
+    notifications: Option<JoinHandle<()>>,
     runtime: Option<tokio::runtime::Handle>,
     observer: Observer,
     next_index: u64,
     last_admitted_seq: Option<u64>,
+    total_rows: u128,
     config: WalEngineConfig,
 }
 
@@ -488,34 +508,25 @@ impl Writer {
             .map_err(|_| internal_error("consume the complete SlateDB replay iterator first"))?;
         self.ready = None;
         let handle = started.handle.take().unwrap();
-        // The engine bounds admission by bytes, so bound this completion queue
-        // by the number of maximum-size records that fit the same budget.
-        // `WalEngineConfig::validate` requires the budget to hold one such
-        // record, so the divisor never yields zero.
-        let capacity = self
-            .config
-            .queue_capacity_bytes
-            .div_euclid(self.config.max_record_bytes)
-            .max(1);
-        let (sender, mut receiver) = mpsc::channel::<Pending>(capacity);
+        let (sender, receiver) = watch::channel(progress::Progress::default());
         self.runtime = Some(tokio::runtime::Handle::current());
-        let observer = self.observer.clone();
-        self.completions = Some(tokio::spawn(async move {
-            while let Some(mut pending) = receiver.recv().await {
-                match (&mut pending.completion).await {
-                    Ok(_) => observer.committed(&pending),
-                    Err(error) => {
-                        // An ambiguous write is never retried with the same ID.
-                        // Stop the database and let takeover resolve its prefix.
-                        observer.close(wal_error(error));
-                        break;
-                    }
-                }
-            }
-        }));
-        self.pending = Some(sender);
+        self.notifications = Some(tokio::spawn(progress::forward(
+            receiver,
+            self.observer.clone(),
+        )));
+        self.progress = Some(sender);
         self.handle = Some(handle);
         Ok(())
+    }
+
+    fn fail(&self, error: WalError) {
+        if let Some(updates) = &self.progress {
+            updates.send_modify(|progress| progress.fail(error));
+            let progress = updates.borrow().clone();
+            self.observer.progress(&progress);
+        } else {
+            self.observer.close(error);
+        }
     }
 
     async fn append_inner(&mut self, rows: &[RowEntry]) -> Result<(), WalError> {
@@ -535,39 +546,34 @@ impl Writer {
             .checked_add(2)
             .ok_or_else(|| internal_error("WAL ID space exhausted"))?;
         self.start().await?;
-        let bytes = payload.len();
-        // Reserve notification capacity BEFORE admission. Once Chorus admits
-        // the record there is no cancellation point until its completion is
-        // transferred to the independently running ordered completion task.
-        let slot = self
-            .pending
-            .as_ref()
-            .unwrap()
-            .reserve()
-            .await
-            .map_err(|_| WalError::Closed)?;
-        self.observer.status().map_err(WalError::from)?;
-        let completion = self
-            .handle
+        if self.progress.as_ref().unwrap().is_closed() {
+            return Err(internal_error("WAL notification task stopped"));
+        }
+        let total_rows = self
+            .total_rows
+            .checked_add(rows.len() as u128)
+            .ok_or_else(|| internal_error("WAL row count overflowed"))?;
+        let position = progress::Position {
+            wal_id: self.next_index + 1,
+            seq,
+            total_rows,
+        };
+        // Only the engine's byte budgets gate admission. The callback stays
+        // with that admitted record and updates one coalescing progress slot.
+        self.handle
             .as_mut()
             .unwrap()
-            .enqueue_append(WalSeqNo::record(self.next_index), payload)
+            .enqueue_append_notifying(
+                WalSeqNo::record(self.next_index),
+                payload,
+                progress::completion(self.progress.as_ref().unwrap().clone(), position),
+            )
             .await
             .map_err(wal_error)?;
         self.next_index += 1;
         self.last_admitted_seq = Some(seq);
-        {
-            let mut state = self.observer.state.lock().unwrap();
-            state.status.estimated_bytes += bytes;
-            state.status.buffered_wal_entries_count += rows.len();
-        }
-        slot.send(Pending {
-            completion,
-            wal_id: self.next_index,
-            seq,
-            bytes,
-            rows: rows.len(),
-        });
+        self.total_rows = total_rows;
+        self.observer.admitted(total_rows);
         Ok(())
     }
 }
@@ -577,7 +583,7 @@ impl WalWriter for Writer {
     async fn append(&mut self, write_batch: &[RowEntry]) -> Result<(), WalError> {
         let result = self.append_inner(write_batch).await;
         if let Err(error) = &result {
-            self.observer.close(error.clone());
+            self.fail(error.clone());
         }
         result
     }
@@ -605,16 +611,18 @@ impl WalWriter for Writer {
                 }
             }
         }
-        // Shutdown drains the engine independently of the completion task.
+        // Shutdown drains the engine independently of the notification task.
         let mut result = match self.handle.take() {
             Some(handle) => handle.shutdown().await.map_err(wal_error),
             None => Ok(()),
         };
         self.ready = None;
-        self.pending = None;
-        if let Some(task) = self.completions.take() {
+        self.progress = None;
+        if let Some(task) = self.notifications.take() {
             if let Err(error) = task.await {
-                result = Err(internal_error(&format!("completion task failed: {error}")));
+                result = Err(internal_error(&format!(
+                    "notification task failed: {error}"
+                )));
             }
         }
         if let Err(status) = self.observer.status() {
@@ -630,10 +638,10 @@ impl WalWriter for Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        if let Some(task) = self.completions.take() {
+        if let Some(task) = self.notifications.take() {
             task.abort();
         }
-        self.observer.close(WalError::Closed);
+        self.fail(WalError::Closed);
         if let Some(handle) = self.handle.take() {
             if let Some(runtime) = &self.runtime {
                 // A dropped Db/build failure must not leave a detached writer.
