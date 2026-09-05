@@ -90,6 +90,7 @@ impl From<&SegmentDescriptor> for CatalogSegment {
 /// WAL namespace: the zonal replica factories for segment data (one per
 /// zone) plus one regional factory hosting the manifest control register.
 pub struct SegmentedVolume {
+    archive: Option<crate::archive::ArchiveConfig>,
     factories: Vec<Arc<dyn ReplicaFactory>>,
     manifest_store: Arc<dyn ManifestStore>,
     bucket_names: Vec<String>,
@@ -334,6 +335,9 @@ pub(crate) struct DeadSegmentSweepReport {
 /// chain, the replay boundary, and the identity the writer starts from.
 struct RecoveredWriterState {
     sealed_segments: Vec<SegmentDescriptor>,
+    /// Captured with the adopted hot directory, before recovery CAS retries can
+    /// refresh the manifest. A newer root can overlap `sealed_segments`.
+    archive_root: Option<crate::archive::ArchiveRoot>,
     base_record_index: u64,
     checkpoint_floor: u64,
     active_id: String,
@@ -449,6 +453,7 @@ impl Recovery {
 
 /// Low-level recovered chain used by the engine and internal tests.
 pub(crate) struct SegmentedWriter {
+    archive: Option<crate::archive::ArchiveConfig>,
     manifest: Manifest,
     factories: Vec<Arc<dyn ReplicaFactory>>,
     prefix: String,
@@ -819,6 +824,7 @@ mod recovery {
                 .collect();
             let replica_count = factories.len();
             Ok(Self {
+                archive: None,
                 factories,
                 manifest_store,
                 bucket_names,
@@ -832,9 +838,57 @@ mod recovery {
             majority(self.factories.len())
         }
 
+        /// Enable automatic archival. The immutable store must be scoped to a
+        /// stable namespace unique to this WAL. Enabling is persisted during
+        /// writer recovery; subsequent opens require the same archive store.
+        /// History before that activation's checkpoint is not recoverable from
+        /// the archive. The newest seal is always retained for finalization.
+        pub fn with_archive(
+            mut self,
+            store: Arc<dyn crate::ArchiveStore>,
+            policy: crate::ArchivePolicy,
+        ) -> Result<Self, Error> {
+            if policy.keep_sealed_segments == 0
+                || !crate::archive::valid_namespace(store.namespace())
+            {
+                return Err(Error::InvalidConfig(
+                    "archive requires a stable namespace and at least one hot sealed segment",
+                ));
+            }
+            // Reserve room for the active/pending pipeline's next folds as
+            // well as the configured target. Otherwise the target itself
+            // could prevent archival from ever relieving a full register.
+            if !crate::manifest::directory_has_room_for(
+                0,
+                policy.keep_sealed_segments.saturating_add(2),
+                self.manifest_store.max_directory_bytes(),
+            ) {
+                return Err(Error::InvalidConfig(
+                    "archive hot target exceeds manifest capacity",
+                ));
+            }
+            self.archive = Some(crate::archive::ArchiveConfig { store, policy });
+            Ok(self)
+        }
+
+        fn check_archive(&self, record: &ManifestRecord) -> Result<(), Error> {
+            if let Some(state) = &record.archive {
+                if self
+                    .archive
+                    .as_ref()
+                    .is_none_or(|config| config.store.namespace() != state.namespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "volume requires its configured archive namespace",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
         /// Open the manifest register for this WAL prefix.
         async fn open_manifest(&self) -> Result<Manifest, Error> {
-            Manifest::open(
+            let manifest = Manifest::open(
                 Arc::clone(&self.manifest_store),
                 self.client_config.clone(),
                 Arc::clone(&self.metrics),
@@ -842,11 +896,13 @@ mod recovery {
                 self.bucket_names.clone(),
             )
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)?;
+            self.check_archive(manifest.record())?;
+            Ok(manifest)
         }
 
         async fn open_existing_manifest(&self) -> Result<Option<Manifest>, Error> {
-            Manifest::open_existing(
+            let manifest = Manifest::open_existing(
                 Arc::clone(&self.manifest_store),
                 self.client_config.clone(),
                 Arc::clone(&self.metrics),
@@ -854,7 +910,11 @@ mod recovery {
                 self.bucket_names.clone(),
             )
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)?;
+            if let Some(manifest) = &manifest {
+                self.check_archive(manifest.record())?;
+            }
+            Ok(manifest)
         }
 
         /// Open a non-coordinating follower at `checkpoint`.
@@ -865,8 +925,10 @@ mod recovery {
         ///
         /// The application must retain WAL history until every follower has
         /// durably advanced its own checkpoint. No reader registration is
-        /// performed; if truncation overtakes this checkpoint, the stream
-        /// returns [`crate::Error::ReadOnlyLagged`].
+        /// performed; without archival, truncation overtaking this checkpoint
+        /// returns [`crate::Error::ReadOnlyLagged`]. With archival, the earliest
+        /// readable position is the floor recorded when archival was enabled.
+        /// Drop the stream to stop early; no reader registration needs cleanup.
         pub async fn open_readonly(&self, checkpoint: WalSeqNo) -> Result<ReadOnlyFollower, Error> {
             self.open_readonly_with_config(checkpoint, ReadOnlyConfig::default())
                 .await
@@ -900,6 +962,7 @@ mod recovery {
             checkpoint: WalSeqNo,
             config: ReadOnlyConfig,
         ) -> StartupReplayStream {
+            let volume = self.clone();
             let factories = self.factories.clone();
             let prefix = self.prefix.clone();
             let metrics = Arc::clone(&self.metrics);
@@ -912,7 +975,16 @@ mod recovery {
                 let mut record = initial_record?;
                 let mut active = None;
                 'follow: loop {
+                    volume.check_archive(&record)?;
                     check_readonly_floor(&record, next)?;
+                    if let Some(root) = record.archive.as_ref().and_then(|state| state.root.clone()) {
+                        let mut archived = volume.scan_archive(root, next, WalSeqNo::record(record.tail_base));
+                        while let Some(wal_record) = archived.next().await {
+                            let wal_record = wal_record?;
+                            next = wal_record.next_seqno();
+                            yield wal_record;
+                        }
+                    }
                     let sealed_end = WalSeqNo::record(record.tail_base);
                     let segments = readonly_segments(&record)?;
                     for segment in segments {
@@ -921,15 +993,9 @@ mod recovery {
                         {
                             continue;
                         }
-                        let object = format!("{prefix}/segments/{}", segment.id);
                         // Only the pending seal can be listed before its copies
                         // are finalized; older entries were finalized or repaired.
-                        let frames = match read_sealed_segment(
-                            &factories,
-                            &object,
-                            &segment,
-                            segment.seal_pending,
-                        )
+                        let frames = match volume.read_available_segment(&segment, segment.seal_pending)
                         .await
                         {
                             Ok(frames) => frames,
@@ -1102,7 +1168,12 @@ mod recovery {
                 replay_end = end.record_index,
                 "WAL recovery replay range prepared"
             );
-            let inner = self.scan_sealed_range(&writer_state.sealed_segments, checkpoint, end);
+            let inner = self.scan_sealed_range(
+                &writer_state.sealed_segments,
+                checkpoint,
+                end,
+                writer_state.archive_root.clone(),
+            );
             Ok(Recovery {
                 from: checkpoint,
                 end,
@@ -1152,6 +1223,7 @@ mod recovery {
                 &writer_state.sealed_segments,
                 checkpoint,
                 WalSeqNo::record(writer_state.base_record_index),
+                writer_state.archive_root.clone(),
             );
             while let Some(record) = replay.next().await {
                 record?;
@@ -1164,6 +1236,12 @@ mod recovery {
             checkpoint: WalSeqNo,
             manifest: &mut Manifest,
         ) -> Result<RecoveredWriterState, Error> {
+            // A concurrent recovery can bind an archive between our initial
+            // manifest read and the successful epoch claim.
+            self.check_archive(manifest.record())?;
+            if let Some(config) = &self.archive {
+                manifest.configure_archive(config.store.namespace()).await?;
+            }
             let adopted: ManifestRecord = manifest.record().clone();
             let claimed_epoch = adopted.epoch;
             let bootstrap_id = segment_id(claimed_epoch, 0);
@@ -1177,7 +1255,7 @@ mod recovery {
             if checkpoint.record_index < adopted.trunc {
                 return Err(Error::InvalidCatalog(format!(
                     "checkpoint {} lies below the committed truncation floor {}: \
-                 those records were deleted after the database checkpointed them",
+                 use a readonly stream for historical archival replay",
                     checkpoint.record_index, adopted.trunc
                 )));
             }
@@ -1232,7 +1310,14 @@ mod recovery {
                 chain.push((entry.id.clone(), entry.base, end, entry.crc32c));
             }
             if let Some((_, first_base, _, _)) = chain.first() {
-                if *first_base > checkpoint.record_index && *first_base > adopted.trunc {
+                if *first_base > checkpoint.record_index
+                    && *first_base > adopted.trunc
+                    && !adopted
+                        .archive
+                        .as_ref()
+                        .and_then(|a| a.root.as_ref())
+                        .is_some_and(|r| r.start <= checkpoint.record_index && r.end >= *first_base)
+                {
                     return Err(Error::InvalidCatalog(format!(
                         "oldest segment starts at {first_base}, after checkpoint boundary {}",
                         checkpoint.record_index
@@ -1631,6 +1716,7 @@ mod recovery {
             }
             Ok(RecoveredWriterState {
                 sealed_segments,
+                archive_root: adopted.archive.as_ref().and_then(|a| a.root.clone()),
                 base_record_index: next_record_index,
                 checkpoint_floor,
                 active_id,
@@ -1649,6 +1735,7 @@ mod recovery {
         ) -> Result<SegmentedWriter, Error> {
             let RecoveredWriterState {
                 sealed_segments,
+                archive_root: _,
                 base_record_index,
                 checkpoint_floor,
                 active_id,
@@ -1697,6 +1784,7 @@ mod recovery {
             manifest.validate_owner().await.map_err(Error::from)?;
             let spare_registered = pending_fold.is_none();
             Ok(SegmentedWriter {
+                archive: self.archive.clone(),
                 factories: self.factories.clone(),
                 prefix: self.prefix.clone(),
                 client_config: self.client_config.clone(),
@@ -1725,22 +1813,22 @@ mod recovery {
             segments: &[SegmentDescriptor],
             from: WalSeqNo,
             end: WalSeqNo,
+            archive_root: Option<crate::archive::ArchiveRoot>,
         ) -> StartupReplayStream {
             debug_assert!(from.record_index <= end.record_index);
             let segments = segments.to_vec();
-            let factories = self.factories.clone();
-            let prefix = self.prefix.clone();
+            let volume = self.clone();
             async_stream::try_stream! {
+            if let Some(root) = archive_root {
+                let mut archived = volume.scan_archive(root, from, end);
+                while let Some(record) = archived.next().await { yield record?; }
+            }
             for segment in segments {
                 let segment_end = segment.end_record_index;
                 if segment_end < from.record_index || segment.base_record_index >= end.record_index {
                     continue;
                 }
-                let records = read_sealed_segment(
-                    &factories,
-                    &format!("{prefix}/segments/{}", segment.id),
-                    &segment, false,
-)
+                let records = volume.read_available_segment(&segment, false)
                 .await?;
                 for record in replay_records(&segment, &records, from, end)? {
                     yield record;
@@ -1748,6 +1836,72 @@ mod recovery {
             }
         }
         .boxed()
+        }
+
+        fn scan_archive(
+            &self,
+            root: crate::archive::ArchiveRoot,
+            from: WalSeqNo,
+            end: WalSeqNo,
+        ) -> StartupReplayStream {
+            let config = self.archive.clone();
+            async_stream::try_stream! {
+                let config = config.ok_or(Error::InvalidConfig("archive store missing"))?;
+                let catalog = crate::archive::ArchiveCatalog::new(config.store.clone());
+                let mut entries = catalog.scan_from(root, from.record_index);
+                while let Some(entry) = entries.next().await {
+                    let entry = entry?;
+                    if entry.start >= end.record_index { break; }
+                    let frames = read_archived_segment(config.store.as_ref(), &entry).await?;
+                    let segment = archived_descriptor(&entry);
+                    for record in replay_records(&segment, &frames, from, end)? { yield record; }
+                }
+            }
+            .boxed()
+        }
+
+        async fn read_available_segment(
+            &self,
+            segment: &SegmentDescriptor,
+            pending: bool,
+        ) -> Result<Vec<RecordFrame>, Error> {
+            let hot = read_sealed_segment(
+                &self.factories,
+                &segment_object(&self.prefix, &segment.id),
+                segment,
+                pending,
+            )
+            .await;
+            if hot.is_ok() || self.archive.is_none() {
+                return hot;
+            }
+            // A cached hot descriptor can be evicted during a read. Only a
+            // published catalog entry with the exact identity authorizes fallback.
+            let manifest = self
+                .open_existing_manifest()
+                .await?
+                .ok_or(Error::Uninitialized)?;
+            if let Some(root) = manifest
+                .record()
+                .archive
+                .as_ref()
+                .and_then(|state| state.root.clone())
+            {
+                let config = self.archive.as_ref().unwrap();
+                let mut entries = crate::archive::ArchiveCatalog::new(config.store.clone())
+                    .scan_from(root, segment.base_record_index);
+                if let Some(entry) = entries.next().await {
+                    let entry = entry?;
+                    if entry.id == segment.id
+                        && entry.start == segment.base_record_index
+                        && entry.end == segment.end_record_index + 1
+                        && entry.crc32c == segment.crc32c
+                    {
+                        return read_archived_segment(config.store.as_ref(), &entry).await;
+                    }
+                }
+            }
+            hot
         }
 
         async fn finalized_segment_descriptor(
@@ -2140,6 +2294,16 @@ mod writer {
                 .refreshed_record()
                 .await
                 .map_err(Error::from)?;
+            if let Some(root) = self
+                .manifest
+                .record()
+                .archive
+                .as_ref()
+                .and_then(|a| a.root.as_ref())
+            {
+                self.sealed_segments
+                    .retain(|segment| segment.base_record_index >= root.end);
+            }
             Ok(self.rotation_due(max_segment_bytes))
         }
 
@@ -2472,6 +2636,7 @@ mod writer {
             repair_interval: Option<std::time::Duration>,
         ) -> crate::maintenance::MaintenanceConfig {
             crate::maintenance::MaintenanceConfig {
+                archive: self.archive.clone(),
                 factories: self.factories.clone(),
                 manifest_store: self.manifest.store(),
                 bucket_names: self.manifest.bucket_names().to_vec(),
@@ -3353,7 +3518,10 @@ mod maintenance {
         manifest: &mut Manifest,
     ) -> Result<TruncationReport, Error> {
         let record = manifest.record().clone();
-        let floor = record.trunc;
+        let floor = record
+            .archive
+            .as_ref()
+            .map_or(record.trunc, |archive| archive.start);
         let directory = record.segments.clone();
         // A swap whose maintenance seal has not settled yet is published with
         // `seal_pending` in the chain snapshot (the engine sends the snapshot
@@ -3514,6 +3682,146 @@ pub(crate) use maintenance::{
     truncate_pass,
 };
 
+fn archived_descriptor(entry: &crate::archive::ArchivedSegment) -> SegmentDescriptor {
+    SegmentDescriptor {
+        id: entry.id.clone(),
+        base_record_index: entry.start,
+        end_record_index: entry.end - 1,
+        crc32c: entry.crc32c,
+        copies: 0,
+        finalized_copies: 0,
+        seal_pending: false,
+    }
+}
+
+async fn read_archived_segment(
+    store: &dyn crate::ArchiveStore,
+    entry: &crate::archive::ArchivedSegment,
+) -> Result<Vec<RecordFrame>, Error> {
+    let bytes = crate::archive::read_all(store, &entry.object).await?;
+    if crc32c::crc32c(&bytes) != entry.crc32c {
+        return Err(Error::InvalidSegmentData(
+            "archived segment CRC32C mismatch".into(),
+        ));
+    }
+    let frames = RecordFrame::decode_all(&bytes)?;
+    if frames.len() as u64 != entry.end - entry.start {
+        return Err(Error::InvalidSegmentData(
+            "archived segment record count mismatch".into(),
+        ));
+    }
+    Ok(frames)
+}
+
+/// A bounded archive step. Only a predecessor of the current seal can move:
+/// the next fold proves that predecessor's finalization gate completed.
+pub(crate) async fn archive_one(
+    config: &crate::archive::ArchiveConfig,
+    factories: &[Arc<dyn ReplicaFactory>],
+    prefix: &str,
+    manifest: &mut Manifest,
+) -> Result<bool, Error> {
+    let record = manifest.refreshed_record().await?;
+    let state = record
+        .archive
+        .as_ref()
+        .ok_or(Error::InvalidConfig("archive not enabled"))?;
+    if state.namespace != config.store.namespace() {
+        return Err(Error::InvalidConfig("archive namespace mismatch"));
+    }
+    let Some(second) = record.segments.get(1) else {
+        return Ok(false);
+    };
+    let first = &record.segments[0];
+    if second.base <= state.start
+        || record.seal_id.as_deref() == Some(first.id.as_str())
+        || (record.segments.len() <= config.policy.keep_sealed_segments
+            && second.base > record.trunc)
+    {
+        return Ok(false);
+    }
+    let descriptor = SegmentDescriptor {
+        id: first.id.clone(),
+        base_record_index: first.base,
+        end_record_index: second.base - 1,
+        crc32c: first.crc32c,
+        copies: 0,
+        finalized_copies: 0,
+        seal_pending: false,
+    };
+    let frames = read_sealed_segment(
+        factories,
+        &segment_object(prefix, &first.id),
+        &descriptor,
+        false,
+    )
+    .await?;
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend_from_slice(&frame.encode()?);
+    }
+    let bytes = Bytes::from(bytes);
+    let object = crate::ArchiveObjectRef::for_bytes("segments", &bytes);
+    config
+        .store
+        .put_if_absent(&object, crate::archive::bytes_stream(bytes))
+        .await?;
+    let entry = crate::archive::ArchivedSegment {
+        id: first.id.clone(),
+        start: first.base,
+        end: second.base,
+        crc32c: first.crc32c,
+        object,
+    };
+    let catalog = crate::archive::ArchiveCatalog::new(config.store.clone());
+    let root = catalog
+        .prepare_append(state.root.as_ref(), entry.clone())
+        .await?;
+    Ok(manifest
+        .publish_archive(state.root.as_ref(), &root, &entry)
+        .await?)
+}
+
+/// The durable catalog doubles as the zonal cleanup work list. One unavailable
+/// zone holds the cleanup cursor, not a hot directory slot. No bucket listing
+/// is used and no active/pending name can be selected by this path.
+pub(crate) async fn cleanup_archived_one(
+    config: &crate::archive::ArchiveConfig,
+    factories: &[Arc<dyn ReplicaFactory>],
+    prefix: &str,
+    manifest: &mut Manifest,
+) -> Result<(), Error> {
+    let record = manifest.refreshed_record().await?;
+    let Some(state) = &record.archive else {
+        return Ok(());
+    };
+    let Some(root) = &state.root else {
+        return Ok(());
+    };
+    let mut entries = crate::archive::ArchiveCatalog::new(config.store.clone())
+        .scan_from(root.clone(), state.cleaned);
+    let Some(entry) = entries.next().await else {
+        return Ok(());
+    };
+    let entry = entry?;
+    let mut all_absent = true;
+    for replica in replicas_for(factories, &segment_object(prefix, &entry.id)) {
+        match replica.stat().await {
+            Ok(snapshot) => match replica.delete(snapshot.generation).await {
+                Ok(()) => {}
+                Err(error) if error.code == TransportCode::NotFound => {}
+                Err(_) => all_absent = false,
+            },
+            Err(error) if error.code == TransportCode::NotFound => {}
+            Err(_) => all_absent = false,
+        }
+    }
+    if all_absent {
+        manifest.archive_cleaned(entry.end).await?;
+    }
+    Ok(())
+}
+
 fn replay_records(
     segment: &SegmentDescriptor,
     frames: &[RecordFrame],
@@ -3535,10 +3843,14 @@ fn replay_records(
 }
 
 fn check_readonly_floor(record: &ManifestRecord, next: WalSeqNo) -> Result<(), Error> {
-    if next.record_index < record.trunc {
+    let floor = record
+        .archive
+        .as_ref()
+        .map_or(record.trunc, |archive| archive.start);
+    if next.record_index < floor {
         return Err(Error::ReadOnlyLagged {
             next,
-            truncation_floor: WalSeqNo::record(record.trunc),
+            truncation_floor: WalSeqNo::record(floor),
         });
     }
     Ok(())

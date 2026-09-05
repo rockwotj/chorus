@@ -120,6 +120,10 @@ type tDirectoryEntry = (
 // empty or absent never reuses the name: it commits tailGen+1 through the
 // register (the implementation mints a fresh successor id via commit_view), so
 // bytes under a retired name can never rejoin the log.
+// Immutable catalog identity is a finite surrogate for the production root
+// reference; pages/data are modeled by ArchiveLifecycle below.
+type tArchiveRecord = (enabled: bool, startOffset: int, root: int, end: int, cleaned: int);
+
 type tManifestRecord = (
     epoch: int,
     owner: int,
@@ -131,6 +135,7 @@ type tManifestRecord = (
     sealEnd: int,
     sealSum: int,
     trunc: int,
+    archive: tArchiveRecord,
     directory: seq[tDirectoryEntry]
 );
 type tManifestReadRequest = (caller: machine);
@@ -186,6 +191,9 @@ event eManifestRead: tManifestReadRequest;
 event eManifestReadResponse: tManifestReadResponse;
 event eManifestCas: tManifestCasRequest;
 event eManifestCasResponse: tManifestCasResponse;
+event eArchiveEnable: (caller: machine);
+event eArchivePublish: (caller: machine, expMetagen: int, previous: int,
+    root: int, segmentEntry: tDirectoryEntry, end: int);
 event eDirectoryRemove: tDirectoryRemoveRequest;
 event eDirectoryRemoveResponse: tDirectoryRemoveResponse;
 

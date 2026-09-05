@@ -133,17 +133,17 @@ while let Some(record) = follower.try_next().await? {
 ```
 
 Readonly open never creates the manifest, claims a writer epoch, opens append
-streams, repairs data, or changes the truncation floor. It reads only immutable
-segments already published in the manifest directory plus the manifest-selected
-active appendable object through GCS `BidiReadObject`. A complete active frame
+streams, repairs data, or changes the truncation floor. It reads immutable
+segments published in the hot directory or archive catalog, plus the
+manifest-selected active appendable object through GCS `BidiReadObject`. A complete active frame
 is emitted only when identical bytes are visible on a strict majority, so a
 minority-only or partial suffix is never exposed. The follower keeps one
 `BidiReadObject` RPC open per zone for the current active object, sends a new
 range message on each poll, and returns as soon as the first matching strict
 majority responds; a slow remaining request stays in flight for a later poll.
 Manifest refresh runs independently on `manifest_poll_interval` and does not
-delay active-tail delivery. The manifest changes only when the writer rotates,
-seals, or truncates, so that interval is normally much larger than
+delay active-tail delivery. The manifest changes on rotation, sealing,
+truncation, archival, and maintenance rather than on each append, so that interval is normally much larger than
 `poll_interval`; polling it at the active-tail rate multiplies regional reads
 without observing anything new.
 
@@ -155,7 +155,10 @@ follower catches up, the next record still waits up to `poll_interval` to be
 observed, which is the latency against request-rate tradeoff that interval
 controls. Segment rotation is never required for delivery.
 
-Followers do not register with the writer. Retain WAL history long enough for
+Followers do not register with the writer. Drop the stream to stop at an
+application-selected sequence number. With archival enabled, followers can
+read history back to the floor recorded at archive activation, independently
+of subsequent checkpoint advances. Without archival, retain WAL history long enough for
 every replica to advance its own durable checkpoint. If truncation overtakes a
 follower, the stream returns `Error::ReadOnlyLagged` rather than skipping
 records; resnapshot that replica before reopening it at a newer checkpoint.
@@ -184,11 +187,65 @@ can implement `ManifestStore` and use
 Spanner, SQL, or another strongly consistent compare-and-swap store. Segment
 data remains in the zonal buckets.
 
+## Archival and long retention
+
+Attach an immutable `ArchiveStore` and choose the hot sealed-segment target:
+
+```rust,ignore
+use chorus_client::{ArchivePolicy, GcsArchiveStore};
+use std::sync::Arc;
+
+let archive = Arc::new(GcsArchiveStore::new(regional_factory, "orders/archive")?);
+let volume = volume.with_archive(archive, ArchivePolicy {
+    keep_sealed_segments: 8,
+})?;
+```
+
+Maintenance uploads finalized segments and immutable catalog pages, then
+atomically publishes the catalog root and removes the old hot directory entry.
+Only afterward does it delete the redundant zonal copies. The count is a
+placement target, not a deletion policy: archived history is retained
+indefinitely. The minimum is one because the latest seal remains a recovery
+finalization witness. Upload failures retain hot data; continued archive
+unavailability can still cause non-poisoning directory backpressure.
+After archival or truncation frees directory capacity, the engine retries a
+failed manifest refresh until it can reconsider blocked rotation. Periodic
+archive work and queued seal/truncate commands also alternate priority when
+maintenance is overdue, so either class of work continues to make progress.
+
+The control manifest stores one bounded root reference. The copy-on-write
+catalog has bounded pages and logarithmic seek/append cost; readers do not load
+the complete archive directory. `ArchiveStore` provides immutable conditional
+uploads and streaming reads (optionally by byte range), and is shared by WAL
+objects and catalog pages. It does not expose mutable whole-history manifests.
+
+`GcsBodyManifestStore` separately implements the existing `ManifestStore` with
+a generation-CAS GCS object body and a configurable directory budget. Pass it
+to `SegmentedVolume::new_with_manifest_store` when the hot register needs more
+capacity. Each update replaces that bounded body; it is not the archive index.
+Do not switch a running volume between metadata and body storage in place.
+
+Enabling archival persists format 2 and the backing namespace during recovery.
+Old clients reject this format. All subsequent opens must supply the same
+archive namespace. Already-truncated history is not restored. Writer recovery
+still requires the current database checkpoint; use a readonly stream for
+historical replay into a separate restored database. PITR also requires an
+application snapshot and transaction/time mapping; Chorus stores opaque records.
+
+Archive objects, including superseded and uncommitted catalog pages, are not
+garbage-collected in this version. Do not configure bucket lifecycle deletion
+for the archive prefix. Reads validate the complete segment's length, SHA-256,
+CRC32C, and framing before yielding records, so memory is bounded by a segment
+and the catalog traversal, not by retained history.
+
+See [the archival safety argument](../../p/ARCHIVE_SAFETY.md) for the publication
+protocol, proof assumptions, and verification commands.
+
 ## Important behavior
 
 - Segment rotation and immutable sealed-segment repair are automatic.
-- Truncation and replacement deletion are permanent. Archive sealed history
-  first if the application needs point-in-time recovery.
+- Without archival, truncation and replacement deletion are permanent. Enable
+  archival before advancing checkpoints if historical WAL replay is required.
 - `Error::ActiveSegmentFull` is non-poisoning backpressure and does not consume
   the attempted sequence number.
 - `SegmentedVolume::new_with_metrics_recorder` connects Chorus to an

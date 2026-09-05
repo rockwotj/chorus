@@ -26,15 +26,17 @@
 //! The register also carries the sealed segment directory
 //! (`chorus.segments`): every committed seal joins it in the seal's own CAS,
 //! and truncation removes an entry only after the segment's copy is
-//! confirmed deleted on every zone. The directory is the chain authority —
-//! recovery adopts it without listing buckets or re-reading sealed bytes —
-//! and its byte budget caps how many sealed segments the WAL retains.
+//! confirmed deleted on every zone. With archival enabled, publishing the
+//! immutable archive root removes the corresponding hot entry in the same CAS,
+//! before redundant zonal cleanup. The root and hot directory together are
+//! the chain authority; the directory budget bounds hot metadata, not history.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
+use crate::archive::{ArchiveRoot, ArchiveState, ArchivedSegment};
 use crate::manifest_store::{ManifestStore, ManifestStoreError, ManifestVersion};
 use crate::metrics::Metrics;
 use crate::protocol::{retry_sleep, ClientConfig, ProtocolError, SUPPORTED_REPLICA_COUNTS};
@@ -43,7 +45,8 @@ use crate::protocol::{retry_sleep, ClientConfig, ProtocolError, SUPPORTED_REPLIC
 pub(crate) const MANIFEST_OBJECT: &str = "manifest";
 
 const META_FORMAT: &str = "chorus.format";
-/// The one supported register format. Structural validation does the real
+/// The non-archival register format; archival activation upgrades it to 2.
+/// Structural validation does the real
 /// gating: a register without the authoritative `chorus.segments` directory,
 /// a directory entry that lacks its CRC32C, or the ordered `chorus.buckets`
 /// replica binding is rejected at decode rather than migrated. Development
@@ -61,6 +64,7 @@ const META_SEAL_DIGEST: &str = "chorus.seal_digest";
 const META_TRUNC: &str = "chorus.trunc";
 const META_SEGMENTS: &str = "chorus.segments";
 const META_BUCKETS: &str = "chorus.buckets";
+const META_ARCHIVE: &str = "chorus.archive";
 
 const MAX_CAS_ROUNDS: usize = 16;
 
@@ -82,6 +86,7 @@ pub(crate) struct DirectoryEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// The manifest register contents.
 pub(crate) struct ManifestRecord {
+    pub archive: Option<ArchiveState>,
     /// Highest writer epoch granted.
     pub epoch: u64,
     /// Random incarnation id the epoch was granted to.
@@ -148,6 +153,7 @@ fn validate_bucket_names(buckets: &[String]) -> Result<(), ProtocolError> {
 impl ManifestRecord {
     fn initial(buckets: Vec<String>) -> Self {
         Self {
+            archive: None,
             epoch: 0,
             owner: String::new(),
             tail_base: 0,
@@ -239,6 +245,13 @@ impl ManifestRecord {
             ),
             (META_BUCKETS.to_string(), self.buckets.join(",")),
         ]);
+        if let Some(archive) = &self.archive {
+            metadata.insert(META_FORMAT.into(), "2".into());
+            metadata.insert(
+                META_ARCHIVE.into(),
+                serde_json::to_string(archive).expect("serializable archive state"),
+            );
+        }
         if let Some(tail_id) = &self.tail_id {
             metadata.insert(META_TAIL_ID.to_string(), tail_id.clone());
         }
@@ -258,9 +271,12 @@ impl ManifestRecord {
     }
 
     fn decode(metadata: &HashMap<String, String>) -> Result<Self, ProtocolError> {
-        if metadata.get(META_FORMAT).map(String::as_str) != Some(FORMAT_VERSION) {
+        let format = metadata.get(META_FORMAT).map(String::as_str);
+        if !matches!(format, Some("1" | "2"))
+            || (format == Some("2")) != metadata.contains_key(META_ARCHIVE)
+        {
             return Err(ProtocolError::InvalidManifest(
-                "manifest does not use chorus.format=1".into(),
+                "unsupported or inconsistent chorus.format".into(),
             ));
         }
         let segments = Self::decode_segments(metadata.get(META_SEGMENTS).ok_or_else(|| {
@@ -286,6 +302,14 @@ impl ManifestRecord {
             ProtocolError::InvalidManifest("manifest lacks chorus.buckets".into())
         })?)?;
         let record = Self {
+            archive: metadata
+                .get(META_ARCHIVE)
+                .map(|value| {
+                    serde_json::from_str(value).map_err(|e| {
+                        ProtocolError::InvalidManifest(format!("invalid archive state: {e}"))
+                    })
+                })
+                .transpose()?,
             epoch: field(META_EPOCH)?,
             owner: metadata.get(META_OWNER).cloned().unwrap_or_default(),
             tail_base: field(META_TAIL_BASE)?,
@@ -304,6 +328,36 @@ impl ManifestRecord {
 
     fn validate(&self) -> Result<(), ProtocolError> {
         let invalid = |message: String| ProtocolError::InvalidManifest(message);
+        if let Some(archive) = &self.archive {
+            if !crate::archive::valid_namespace(&archive.namespace)
+                || serde_json::to_vec(archive).map_or(true, |bytes| bytes.len() > 1024)
+                || archive.start > self.trunc
+                || archive.cleaned < archive.start
+            {
+                return Err(invalid("invalid archive binding or boundaries".into()));
+            }
+            if let Some(root) = &archive.root {
+                if root.format != 1
+                    || root.height > 16
+                    || root.object.byte_len > 64 * 1024
+                    || root.object.key.len() > 80
+                    || root.start > archive.start
+                    || root.end <= archive.start
+                    || root.end > self.tail_base
+                    || archive.cleaned > root.end
+                    || self
+                        .segments
+                        .first()
+                        .is_none_or(|entry| entry.base != root.end)
+                {
+                    return Err(invalid(
+                        "archive root does not join the hot directory".into(),
+                    ));
+                }
+            } else if archive.cleaned != archive.start {
+                return Err(invalid("archive cleanup without a published root".into()));
+            }
+        }
         if self.seal_base.is_some() != self.seal_digest.is_some() {
             return Err(invalid(
                 "seal_base and seal_digest must appear together".into(),
@@ -382,6 +436,15 @@ impl ManifestRecord {
         ids: &HashSet<String>,
         witnessed_floor: u64,
     ) -> Result<(), ProtocolError> {
+        if self
+            .archive
+            .as_ref()
+            .is_some_and(|archive| witnessed_floor > archive.start)
+        {
+            return Err(ProtocolError::InvalidManifest(
+                "unarchived history cannot be removed by truncation".into(),
+            ));
+        }
         if witnessed_floor > self.trunc {
             return Err(ProtocolError::InvalidManifest(format!(
                 "segment removal floor {witnessed_floor} exceeds committed truncation floor {}",
@@ -1061,6 +1124,106 @@ impl Manifest {
         .await
     }
 
+    pub(crate) async fn configure_archive(&mut self, namespace: &str) -> Result<(), ProtocolError> {
+        let epoch = self.epoch;
+        let owner = self.owner.clone();
+        self.cas_transform(ProtocolError::ManifestUnavailable, |record| {
+            Self::check_claim(record, epoch, &owner)?;
+            if let Some(archive) = &record.archive {
+                if archive.namespace != namespace {
+                    return Err(ProtocolError::InvalidManifest(
+                        "archive namespace mismatch".into(),
+                    ));
+                }
+                return Ok(CasTransform::Done(()));
+            }
+            let mut next = record.clone();
+            next.archive = Some(ArchiveState {
+                namespace: namespace.into(),
+                start: record.trunc,
+                cleaned: record.trunc,
+                root: None,
+            });
+            Ok(CasTransform::Update {
+                record: Box::new(next),
+                value: (),
+            })
+        })
+        .await
+    }
+
+    /// Publish only a verified, contiguous oldest seal. Revalidate its exact
+    /// identity and parent root on every CAS retry. The current seal remains hot
+    /// because recovery may still need to enforce its finalization.
+    pub(crate) async fn publish_archive(
+        &mut self,
+        previous: Option<&ArchiveRoot>,
+        root: &ArchiveRoot,
+        segment: &ArchivedSegment,
+    ) -> Result<bool, ProtocolError> {
+        self.cas_transform(ProtocolError::ManifestUnavailable, |record| {
+            let Some(archive) = &record.archive else {
+                return Err(ProtocolError::InvalidManifest(
+                    "archive not configured".into(),
+                ));
+            };
+            if archive.root.as_ref() == Some(root) {
+                return Ok(CasTransform::Done(true));
+            }
+            if archive.root.as_ref() != previous {
+                return Ok(CasTransform::Done(false));
+            }
+            let Some(first) = record.segments.first() else {
+                return Ok(CasTransform::Done(false));
+            };
+            let Some(second) = record.segments.get(1) else {
+                return Ok(CasTransform::Done(false));
+            };
+            if first.id != segment.id
+                || first.base != segment.start
+                || first.crc32c != segment.crc32c
+                || second.base != segment.end
+                || record.seal_id.as_deref() == Some(first.id.as_str())
+                || root.end != segment.end
+                || root.start != previous.map_or(segment.start, |old| old.start)
+            {
+                return Ok(CasTransform::Done(false));
+            }
+            let mut next = record.clone();
+            next.archive.as_mut().unwrap().root = Some(root.clone());
+            next.segments.remove(0);
+            Ok(CasTransform::Update {
+                record: Box::new(next),
+                value: true,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn archive_cleaned(&mut self, end: u64) -> Result<(), ProtocolError> {
+        self.cas_transform(ProtocolError::ManifestUnavailable, |record| {
+            let archive = record
+                .archive
+                .as_ref()
+                .ok_or_else(|| ProtocolError::InvalidManifest("archive not configured".into()))?;
+            if archive.cleaned >= end {
+                return Ok(CasTransform::Done(()));
+            }
+            if archive.root.as_ref().is_none_or(|root| end > root.end) {
+                return Err(ProtocolError::InvalidManifest(
+                    "archive cleanup exceeds published root".into(),
+                ));
+            }
+            let mut next = record.clone();
+            next.archive.as_mut().unwrap().cleaned = end;
+            Ok(CasTransform::Update {
+                record: Box::new(next),
+                value: (),
+            })
+        })
+        .await
+    }
+
     /// Drop directory entries whose every zonal copy is confirmed deleted.
     /// Epoch-free like [`Self::raise_trunc`] — the truncator discipline only
     /// removes entries wholly below `witnessed_floor`, which must itself be no
@@ -1196,6 +1359,7 @@ mod tests {
 
     fn valid_record() -> ManifestRecord {
         ManifestRecord {
+            archive: None,
             epoch: 7,
             owner: "abc".into(),
             tail_base: 10,

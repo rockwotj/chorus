@@ -27,6 +27,7 @@ FIELD_GROUPS = (
     ("sealed directory", {"segments"}, {"directory"}),
     ("pending segment", {"pending_id"}, {"pending"}),
     ("deployment topology", {"buckets"}, set()),
+    ("archive binding root and cleanup", {"archive"}, {"archive"}),
 )
 
 
