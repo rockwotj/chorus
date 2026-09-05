@@ -168,7 +168,7 @@ startup replay, reader, and garbage-collection interfaces. It is disabled by def
 does not compile SlateDB or enable its object-store providers/caches.
 
 The adapter targets SlateDB 0.16. Applications must depend on the same SlateDB
-major version to share the trait types:
+minor version to share the trait types:
 
 ```toml
 [dependencies]
