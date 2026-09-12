@@ -153,6 +153,7 @@ impl MaintenanceHandle {
 }
 
 pub(crate) struct MaintenanceConfig {
+    pub archive: Option<crate::archive::ArchiveConfig>,
     pub factories: Vec<Arc<dyn ReplicaFactory>>,
     pub manifest_store: Arc<dyn ManifestStore>,
     pub bucket_names: Vec<String>,
@@ -167,11 +168,19 @@ pub(crate) fn start(
     config: MaintenanceConfig,
     catalog: watch::Receiver<Vec<SegmentDescriptor>>,
     metrics: Arc<Metrics>,
+    rotation_recheck: mpsc::Sender<()>,
 ) -> (MaintenanceHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(MAINTENANCE_COMMAND_CAPACITY);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task_metrics = Arc::clone(&metrics);
-    let task = tokio::spawn(run(config, catalog, rx, shutdown_rx, task_metrics));
+    let task = tokio::spawn(run(
+        config,
+        catalog,
+        rx,
+        shutdown_rx,
+        task_metrics,
+        rotation_recheck,
+    ));
     (
         MaintenanceHandle {
             tx,
@@ -183,6 +192,9 @@ pub(crate) fn start(
 }
 
 struct MaintenanceState {
+    archive: Option<crate::archive::ArchiveConfig>,
+    archived_end: u64,
+    rotation_recheck: mpsc::Sender<()>,
     factories: Vec<Arc<dyn ReplicaFactory>>,
     manifest_store: Arc<dyn ManifestStore>,
     bucket_names: Vec<String>,
@@ -214,8 +226,16 @@ async fn run(
     mut commands: mpsc::Receiver<MaintenanceCmd>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
+    rotation_recheck: mpsc::Sender<()>,
 ) {
+    let periodic_repair = config.repair_interval.is_some();
+    let repair_interval = config
+        .repair_interval
+        .or_else(|| config.archive.as_ref().map(|_| Duration::from_secs(1)));
     let mut task = MaintenanceState {
+        archive: config.archive,
+        archived_end: 0,
+        rotation_recheck,
         factories: config.factories,
         manifest_store: config.manifest_store,
         bucket_names: config.bucket_names,
@@ -229,7 +249,7 @@ async fn run(
         manifest: None,
         metrics,
     };
-    let mut interval = config.repair_interval.map(|period| {
+    let mut interval = repair_interval.map(|period| {
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         interval
@@ -239,22 +259,25 @@ async fn run(
     // repair never spends work on a tombstone the committed floor already
     // made unreachable.
     let mut pending = PendingCommands::default();
-    if maintenance_pass_or_shutdown(&mut task, &mut catalog_rx, &mut shutdown).await {
+    if maintenance_pass_or_shutdown(&mut task, &mut catalog_rx, &mut shutdown, true).await {
         commands.close();
         while let Some(command) = next_command(&mut commands, &mut pending).await {
             execute_command(&mut task, &mut catalog_rx, command).await;
         }
         return;
     }
+    let mut command_turn = false;
     loop {
-        // `biased` keeps the poll order deterministic (an unbiased `select!`
-        // randomizes its starting branch per call). Shutdown wins even when
-        // every maintenance pass overruns a hot interval. An overdue tick then
-        // wins before each logical command, so a sustained command flood cannot
-        // starve autonomous cleanup and repair.
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
+        match next_maintenance_event(
+            &mut commands,
+            &mut pending,
+            &mut shutdown,
+            &mut interval,
+            command_turn,
+        )
+        .await
+        {
+            MaintenanceEvent::Shutdown => {
                 // Graceful shutdown is signaled only after the engine has
                 // stopped producing seals. Close ingress, then drain every
                 // buffered command without periodic ticks interleaving; a
@@ -262,16 +285,29 @@ async fn run(
                 commands.close();
                 break;
             }
-            () = tick(&mut interval) => {
-                if maintenance_pass_or_shutdown(&mut task, &mut catalog_rx, &mut shutdown).await {
+            MaintenanceEvent::Tick => {
+                if maintenance_pass_or_shutdown(
+                    &mut task,
+                    &mut catalog_rx,
+                    &mut shutdown,
+                    periodic_repair,
+                )
+                .await
+                {
                     commands.close();
                     break;
                 }
+                // The next ready command wins over another overdue tick. After
+                // that command, an overdue tick wins again. This gives both
+                // autonomous maintenance and command work deterministic
+                // progress even when every pass exceeds the timer period.
+                command_turn = true;
             }
-            command = next_command(&mut commands, &mut pending) => match command {
-                Some(command) => execute_command(&mut task, &mut catalog_rx, command).await,
-                None => return,
-            },
+            MaintenanceEvent::Command(Some(command)) => {
+                execute_command(&mut task, &mut catalog_rx, command).await;
+                command_turn = false;
+            }
+            MaintenanceEvent::Command(None) => return,
         }
     }
 
@@ -280,10 +316,41 @@ async fn run(
     }
 }
 
+enum MaintenanceEvent {
+    Shutdown,
+    Tick,
+    Command(Option<ReadyCommand>),
+}
+
+async fn next_maintenance_event(
+    commands: &mut mpsc::Receiver<MaintenanceCmd>,
+    pending: &mut PendingCommands,
+    shutdown: &mut watch::Receiver<bool>,
+    interval: &mut Option<Interval>,
+    command_turn: bool,
+) -> MaintenanceEvent {
+    if command_turn {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => MaintenanceEvent::Shutdown,
+            command = next_command(commands, pending) => MaintenanceEvent::Command(command),
+            () = tick(interval) => MaintenanceEvent::Tick,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => MaintenanceEvent::Shutdown,
+            () = tick(interval) => MaintenanceEvent::Tick,
+            command = next_command(commands, pending) => MaintenanceEvent::Command(command),
+        }
+    }
+}
+
 async fn maintenance_pass_or_shutdown(
     task: &mut MaintenanceState,
     catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
     shutdown: &mut watch::Receiver<bool>,
+    repair: bool,
 ) -> bool {
     tokio::select! {
         biased;
@@ -293,7 +360,9 @@ async fn maintenance_pass_or_shutdown(
             task.adopt_catalog(catalog_rx);
             task.sweep_dead_segments_once().await;
             task.cleanup_tombstones_once().await;
-            task.repair_once().await;
+            task.archive_once().await;
+            // Archive retries must not re-enable disabled periodic repair.
+            if repair { task.repair_once().await; }
         } => false,
     }
 }
@@ -314,6 +383,7 @@ async fn execute_command(
         ReadyCommandKind::SealSegment { segment, enforced } => {
             task.seal_segment(*segment, enforced, catalog_rx).await;
             task.adopt_catalog(catalog_rx);
+            task.archive_once().await;
         }
         ReadyCommandKind::Truncate { floor, responses } => {
             task.adopt_catalog(catalog_rx);
@@ -665,7 +735,12 @@ impl MaintenanceState {
     fn adopt_catalog(&mut self, rx: &mut watch::Receiver<Vec<SegmentDescriptor>>) {
         let snapshot = rx.borrow_and_update().clone();
         let mut merged = snapshot;
-        merged.retain(|segment| !self.deleted.contains(&segment.base_record_index));
+        merged.retain(|segment| {
+            segment.base_record_index >= self.archived_end
+                && !self.deleted.contains(&segment.base_record_index)
+        });
+        self.deleted.retain(|base| *base >= self.archived_end);
+        self.sealed.retain(|base| *base >= self.archived_end);
         for segment in &mut merged {
             if segment.seal_pending && self.sealed.contains(&segment.base_record_index) {
                 segment.seal_pending = false;
@@ -772,10 +847,56 @@ impl MaintenanceState {
         }
     }
 
+    async fn archive_once(&mut self) {
+        let Some(config) = self.archive.clone() else {
+            return;
+        };
+        if let Err(error) = self.ensure_manifest().await {
+            tracing::warn!(%error, "archive manifest unavailable");
+            return;
+        }
+        let mut manifest = self.manifest.take().unwrap();
+        let result =
+            crate::segment::archive_one(&config, &self.factories, &self.prefix, &mut manifest)
+                .await;
+        if let Some(root) = manifest
+            .record()
+            .archive
+            .as_ref()
+            .and_then(|a| a.root.as_ref())
+        {
+            self.archived_end = root.end;
+            self.catalog
+                .retain(|segment| segment.base_record_index >= root.end);
+        }
+        match result {
+            Ok(true) => {
+                let _ = self.rotation_recheck.try_send(());
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "archival deferred; hot copies retained"),
+        }
+        if let Err(error) = crate::segment::cleanup_archived_one(
+            &config,
+            &self.factories,
+            &self.prefix,
+            &mut manifest,
+        )
+        .await
+        {
+            tracing::warn!(%error, "archived zonal cleanup deferred");
+        }
+        self.manifest = Some(manifest);
+    }
+
     async fn repair_once(&mut self) {
         let floor = match self.ensure_manifest().await {
             Ok(manifest) => match manifest.refreshed_record().await {
-                Ok(record) => record.trunc,
+                Ok(record) => record
+                    .archive
+                    .as_ref()
+                    .and_then(|a| a.root.as_ref())
+                    .map_or(record.trunc, |r| r.end.max(record.trunc)),
                 Err(error) => {
                     tracing::warn!(%error, "repair manifest refresh unavailable");
                     self.manifest = None;
@@ -837,7 +958,11 @@ impl MaintenanceState {
     async fn repair_segment_once(&mut self, segment: SegmentDescriptor) {
         let floor = match self.ensure_manifest().await {
             Ok(manifest) => match manifest.refreshed_record().await {
-                Ok(record) => record.trunc,
+                Ok(record) => record
+                    .archive
+                    .as_ref()
+                    .and_then(|a| a.root.as_ref())
+                    .map_or(record.trunc, |r| r.end.max(record.trunc)),
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -928,6 +1053,7 @@ impl MaintenanceState {
         self.manifest = Some(manifest);
         let report = result?;
         self.remember_catalog_deletions(before);
+        self.archive_once().await;
         Ok(report)
     }
 
@@ -1170,5 +1296,39 @@ mod tests {
             repaired_requests + queued_requests,
             MAINTENANCE_COMMAND_CAPACITY
         );
+    }
+
+    #[tokio::test]
+    async fn overdue_maintenance_tick_yields_once_to_a_queued_command() {
+        let (tx, mut rx) = mpsc::channel(MAINTENANCE_COMMAND_CAPACITY);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let mut pending = PendingCommands::default();
+        let mut interval = Some(tokio::time::interval(Duration::from_millis(10)));
+
+        assert!(matches!(
+            next_maintenance_event(&mut rx, &mut pending, &mut shutdown, &mut interval, false)
+                .await,
+            MaintenanceEvent::Tick
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (response, _receiver) = oneshot::channel();
+        tx.send(MaintenanceCmd::Truncate {
+            floor: WalSeqNo::record(1),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_maintenance_event(&mut rx, &mut pending, &mut shutdown, &mut interval, true).await,
+            MaintenanceEvent::Command(Some(ReadyCommand {
+                kind: ReadyCommandKind::Truncate { .. },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            next_maintenance_event(&mut rx, &mut pending, &mut shutdown, &mut interval, false)
+                .await,
+            MaintenanceEvent::Tick
+        ));
     }
 }

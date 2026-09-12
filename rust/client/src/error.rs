@@ -16,6 +16,9 @@ use crate::transport::{TransportCode, TransportError};
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Archive storage, integrity, or availability failure.
+    #[error(transparent)]
+    Archive(#[from] crate::archive::ArchiveError),
     /// The background WAL task was aborted, failed, or shut down.
     #[error("WAL engine is closed")]
     Closed,

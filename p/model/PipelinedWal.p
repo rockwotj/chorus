@@ -43,7 +43,7 @@ machine PipelinedWriter {
                 pending=view.pending,
                 sealBase=view.sealBase, sealId=view.sealId,
                 sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-                directory=view.directory);
+                archive=view.archive, directory=view.directory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=viewMetagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -207,7 +207,7 @@ machine PipelinedWriter {
                 tailGen=view.tailGen, pending=view.pending,
                 sealBase=0, sealId=1, sealEnd=2,
                 sealSum=record0.value * 1 + record1.value * 2,
-                trunc=view.trunc, directory=nextDirectory);
+                trunc=view.trunc, archive=view.archive, directory=nextDirectory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=viewMetagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -290,7 +290,7 @@ machine PipelinedWriter {
                     tailGen=view.tailGen, pending=view.pending,
                     sealBase=2, sealId=21, sealEnd=3,
                     sealSum=record2.value, trunc=view.trunc,
-                    directory=nextDirectory);
+                    archive=view.archive, directory=nextDirectory);
                 send manifest, eManifestCas, (
                     caller=this, expMetagen=viewMetagen, rec=next);
                 receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -465,7 +465,7 @@ machine PendingSegmentWriter {
             pending=view.pending,
             sealBase=view.sealBase, sealId=view.sealId,
             sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-            directory=view.directory);
+            archive=view.archive, directory=view.directory);
         send manifest, eManifestCas, (
             caller=this, expMetagen=readResponse.metagen, rec=next);
         receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -517,7 +517,7 @@ machine PendingSegmentWriter {
             pending=id,
             sealBase=view.sealBase, sealId=view.sealId,
             sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-            directory=view.directory);
+            archive=view.archive, directory=view.directory);
         send manifest, eManifestCas, (
             caller=this, expMetagen=viewMetagen, rec=next);
         receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -583,7 +583,7 @@ machine PendingSegmentWriter {
         next = (epoch=epoch, owner=writerId,
             tailBase=1, tailGen=view.pending, pending=refill,
             sealBase=0, sealId=0, sealEnd=1, sealSum=400,
-            trunc=view.trunc, directory=nextDirectory);
+            trunc=view.trunc, archive=view.archive, directory=nextDirectory);
         send manifest, eManifestCas, (
             caller=this, expMetagen=viewMetagen, rec=next);
         receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -656,7 +656,7 @@ machine DirectoryRotation {
                 pending=view.pending,
                 sealBase=view.sealBase, sealId=view.sealId,
                 sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-                directory=view.directory);
+                archive=view.archive, directory=view.directory);
             send payload.manifest, eManifestCas, (
                 caller=this, expMetagen=readResponse.metagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -738,7 +738,7 @@ machine DirectoryRotation {
                 pending=view.pending,
                 sealBase=payload.base, sealId=sealId,
                 sealEnd=payload.base + 1, sealSum=payload.value,
-                trunc=view.trunc, directory=nextDirectory);
+                trunc=view.trunc, archive=view.archive, directory=nextDirectory);
             send payload.manifest, eManifestCas, (
                 caller=this, expMetagen=casResponse.metagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -858,7 +858,7 @@ machine DirectoryCleanupCoordinator {
                     pending=current.pending,
                     sealBase=current.sealBase, sealId=current.sealId,
                     sealEnd=current.sealEnd, sealSum=current.sealSum,
-                    trunc=payload.floor, directory=current.directory);
+                    trunc=payload.floor, archive=current.archive, directory=current.directory);
                 send payload.manifest, eManifestCas, (
                     caller=this, expMetagen=currentMetagen, rec=next);
                 receive { case eManifestCasResponse: (
@@ -1083,7 +1083,7 @@ machine TruncationCoordinator {
                     sealId=readResponse.rec.sealId,
                     sealEnd=readResponse.rec.sealEnd,
                     sealSum=readResponse.rec.sealSum, trunc=2,
-                    directory=readResponse.rec.directory);
+                    archive=readResponse.rec.archive, directory=readResponse.rec.directory);
                 send payload.manifest, eManifestCas, (
                     caller=this, expMetagen=readResponse.metagen, rec=next);
                 receive { case eManifestCasResponse: (r: tManifestCasResponse) {

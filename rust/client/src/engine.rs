@@ -514,17 +514,18 @@ impl WalEngine {
         // published through the watch channel and an epoch-free manifest
         // handle of its own.
         let (catalog_tx, catalog_rx) = watch::channel(writer.sealed_segments_snapshot());
+        let (rotation_recheck, rotation_rechecks) = mpsc::channel(1);
         let (maintenance, maintenance_task) = crate::maintenance::start(
             writer.maintenance_config(config.repair_interval),
             catalog_rx,
             Arc::clone(&metrics),
+            rotation_recheck.clone(),
         );
         let (active_capacity_tx, active_capacity) = watch::channel(ActiveSegmentCapacity {
             admission_start_bytes: 0,
             existing_bytes: active_segment_bytes,
             seal_room: active_segment_seal_room,
         });
-        let (rotation_recheck, rotation_rechecks) = mpsc::channel(1);
         let (provision_requests, provision_attempts) = mpsc::channel::<ProvisionAttempt>(1);
         let (provision_results_tx, provision_results) = mpsc::channel(1);
         let (provisioner_shutdown, provisioner_shutdown_rx) = watch::channel(false);
@@ -952,6 +953,7 @@ async fn run_engine(
                 successor_due: false,
             });
     let mut rotation_rechecks_open = true;
+    let mut rotation_recheck_retry: Option<Pin<Box<Sleep>>> = None;
     // Spare provisioning runs on a dedicated worker; its result channel is a
     // `select!` wake source, so a swap waiting on a slow spare can never park
     // the engine. `spare_requested` keeps at most one attempt outstanding.
@@ -1314,24 +1316,45 @@ async fn run_engine(
             request = rotation_rechecks.recv(), if rotation_rechecks_open => {
                 match request {
                     Some(()) => {
-                        match writer.refresh_rotation_due(config.max_segment_bytes).await {
-                            Ok(due) => {
-                                rotation.release_fold_capacity_block();
-                                rotation.mark_due(due);
-                                active_capacity.send_modify(|capacity| {
-                                    capacity.seal_room =
-                                        writer.active_segment_has_seal_room();
-                                });
-                            }
+                        match refresh_rotation_capacity(
+                            &mut writer,
+                            config.max_segment_bytes,
+                            &mut rotation,
+                            &active_capacity,
+                        ).await {
+                            Ok(()) => rotation_recheck_retry = None,
                             Err(error) => {
                                 tracing::warn!(
                                     %error,
-                                    "failed to refresh rotation eligibility after truncation"
+                                    "failed to refresh rotation eligibility after capacity change; will retry"
                                 );
+                                rotation_recheck_retry = Some(Box::pin(tokio::time::sleep(
+                                    rotation_recheck_retry_delay(&client_config),
+                                )));
                             }
                         }
                     }
                     None => rotation_rechecks_open = false,
+                }
+            }
+            () = wait_rotation_recheck_retry(&mut rotation_recheck_retry), if rotation_recheck_retry.is_some() => {
+                rotation_recheck_retry = None;
+                match refresh_rotation_capacity(
+                    &mut writer,
+                    config.max_segment_bytes,
+                    &mut rotation,
+                    &active_capacity,
+                ).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "failed to refresh rotation eligibility after retry; will retry"
+                        );
+                        rotation_recheck_retry = Some(Box::pin(tokio::time::sleep(
+                            rotation_recheck_retry_delay(&client_config),
+                        )));
+                    }
                 }
             }
             // provisioning results arrive the same way: with every caller
@@ -1433,6 +1456,32 @@ async fn run_engine(
         tracing::warn!("WAL engine stopped without graceful shutdown");
     }
     metrics.queue_bytes.set(0);
+}
+
+async fn refresh_rotation_capacity(
+    writer: &mut SegmentedWriter,
+    max_segment_bytes: usize,
+    rotation: &mut Rotation,
+    active_capacity: &watch::Sender<ActiveSegmentCapacity>,
+) -> Result<(), Error> {
+    let due = writer.refresh_rotation_due(max_segment_bytes).await?;
+    rotation.release_fold_capacity_block();
+    rotation.mark_due(due);
+    active_capacity.send_modify(|capacity| {
+        capacity.seal_room = writer.active_segment_has_seal_room();
+    });
+    Ok(())
+}
+
+fn rotation_recheck_retry_delay(config: &crate::ClientConfig) -> Duration {
+    crate::protocol::retry_delay(config, config.max_retries).max(Duration::from_millis(20))
+}
+
+async fn wait_rotation_recheck_retry(retry: &mut Option<Pin<Box<Sleep>>>) {
+    match retry {
+        Some(retry) => retry.as_mut().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// What the rotation wake arm of the engine's `select!` observed: the two

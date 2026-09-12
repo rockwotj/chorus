@@ -1,4 +1,75 @@
 use super::*;
+use std::sync::atomic::Ordering;
+
+struct FailFirstReadAfterRemoval {
+    inner: Arc<dyn crate::ManifestStore>,
+    last_segments: std::sync::Mutex<Option<String>>,
+    armed: std::sync::atomic::AtomicBool,
+    fail_next_read: std::sync::atomic::AtomicBool,
+    failed_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl FailFirstReadAfterRemoval {
+    fn remember(&self, state: &crate::VersionedManifest) {
+        *self.last_segments.lock().unwrap() = state.fields.get("chorus.segments").cloned();
+    }
+
+    fn entry_count(encoded: Option<&String>) -> usize {
+        encoded.map_or(0, |value| {
+            if value.is_empty() {
+                0
+            } else {
+                value.matches(',').count() + 1
+            }
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ManifestStore for FailFirstReadAfterRemoval {
+    fn max_directory_bytes(&self) -> usize {
+        self.inner.max_directory_bytes()
+    }
+
+    async fn read(&self) -> Result<Option<crate::VersionedManifest>, crate::ManifestStoreError> {
+        if self.fail_next_read.swap(false, Ordering::SeqCst) {
+            self.failed_reads.fetch_add(1, Ordering::SeqCst);
+            return Err(crate::ManifestStoreError::Unavailable(
+                "injected capacity refresh failure".into(),
+            ));
+        }
+        let state = self.inner.read().await?;
+        if let Some(state) = &state {
+            self.remember(state);
+        }
+        Ok(state)
+    }
+
+    async fn create(
+        &self,
+        fields: HashMap<String, String>,
+    ) -> Result<crate::VersionedManifest, crate::ManifestStoreError> {
+        let state = self.inner.create(fields).await?;
+        self.remember(&state);
+        Ok(state)
+    }
+
+    async fn update(
+        &self,
+        version: crate::ManifestVersion,
+        fields: HashMap<String, String>,
+    ) -> Result<crate::VersionedManifest, crate::ManifestStoreError> {
+        let before = self.last_segments.lock().unwrap().clone();
+        let state = self.inner.update(version, fields).await?;
+        let removed = Self::entry_count(state.fields.get("chorus.segments"))
+            < Self::entry_count(before.as_ref());
+        self.remember(&state);
+        if removed && self.armed.swap(false, Ordering::SeqCst) {
+            self.fail_next_read.store(true, Ordering::SeqCst);
+        }
+        Ok(state)
+    }
+}
 
 #[tokio::test]
 async fn caller_numbered_appends_admit_in_order_and_refill_the_pipeline() {
@@ -384,7 +455,26 @@ async fn engine_configuration_is_validated_without_panicking() {
 #[tokio::test]
 async fn active_segment_ceiling_backpressures_cleanly_until_truncation_frees_rotation() {
     let (_servers, factories, manifest_factory) = factory_cluster().await;
-    let volume = volume(factories, manifest_factory, "active-segment-ceiling-wal");
+    let prefix = "active-segment-ceiling-wal";
+    let manifest = Arc::new(FailFirstReadAfterRemoval {
+        inner: Arc::new(crate::manifest_store::GcsManifestStore::new(
+            manifest_factory.replica(&format!("{prefix}/manifest")),
+        )),
+        last_segments: std::sync::Mutex::new(None),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        fail_next_read: std::sync::atomic::AtomicBool::new(false),
+        failed_reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let volume = SegmentedVolume::new_with_factories_and_manifest_store(
+        factories,
+        manifest.clone(),
+        prefix,
+        ClientConfig {
+            max_retries: 0,
+            retry_base: Duration::ZERO,
+        },
+    )
+    .unwrap();
     let mut writer = volume.recover_writer().await.unwrap();
 
     // Fill the real register directory with one-record sealed segments. The
@@ -437,11 +527,19 @@ async fn active_segment_ceiling_backpressures_cleanly_until_truncation_frees_rot
         Err(Error::ActiveSegmentFull { .. })
     ));
 
+    manifest.armed.store(true, Ordering::SeqCst);
     let report = handle
         .truncate_before(WalSeqNo::record(active_base))
         .await
         .unwrap();
     assert!(report.deleted_segments > 0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manifest.failed_reads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first post-truncation capacity refresh did not fail");
     let completion = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match handle
@@ -454,7 +552,7 @@ async fn active_segment_ceiling_backpressures_cleanly_until_truncation_frees_rot
         }
     })
     .await
-    .expect("rotation did not resume after truncation freed directory capacity")
+    .expect("retained refresh retry did not resume rotation after truncation")
     .unwrap();
     completion.await.unwrap();
     shutdown_engine(handle).await;
