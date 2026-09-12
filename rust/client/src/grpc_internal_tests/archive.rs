@@ -399,10 +399,28 @@ async fn archive_gcs_streams_immutable_objects_and_body_manifest_cas() {
     assert_eq!(chunks.concat(), bytes[123..456]);
     let mut conflicting = ArchiveObjectRef::for_bytes("segments", b"different");
     conflicting.key = object.key.clone();
-    assert!(store
-        .put_if_absent(&conflicting, bytes_stream(Bytes::from_static(b"different")))
+    assert!(matches!(
+        store
+            .put_if_absent(&conflicting, bytes_stream(Bytes::from_static(b"different")))
+            .await,
+        Err(crate::ArchiveError::Corrupt(_))
+    ));
+    let corrupt_bytes = Bytes::from_static(b"genuine-corruption-error");
+    let corrupt = ArchiveObjectRef::for_bytes("segments", &corrupt_bytes);
+    server
+        .service
+        .inject(Operation::BidiWrite, Code::DataLoss)
+        .await;
+    assert!(matches!(
+        store
+            .put_if_absent(&corrupt, bytes_stream(corrupt_bytes.clone()))
+            .await,
+        Err(crate::ArchiveError::Corrupt(_))
+    ));
+    store
+        .put_if_absent(&corrupt, bytes_stream(corrupt_bytes))
         .await
-        .is_err());
+        .unwrap();
     let manifest = GcsBodyManifestStore::new(factory, "manifest", 100_000).unwrap();
     let first = manifest
         .create(HashMap::from([("payload".into(), "x".repeat(9000))]))

@@ -56,6 +56,17 @@ impl Drop for UploadTask {
     }
 }
 
+enum WriteError {
+    Conflict,
+    Archive(ArchiveError),
+}
+
+impl From<ArchiveError> for WriteError {
+    fn from(error: ArchiveError) -> Self {
+        Self::Archive(error)
+    }
+}
+
 async fn stat(replica: &GrpcReplica) -> Result<Object, Status> {
     let request = replica
         .request(GetObjectRequest {
@@ -121,7 +132,7 @@ fn write_bytes(
     generation: i64,
     expected: ArchiveObjectRef,
     mut contents: ArchiveByteStream,
-) -> BoxFuture<'static, Result<Object, ArchiveError>> {
+) -> BoxFuture<'static, Result<Object, WriteError>> {
     async move {
     let resource = Object { bucket: replica.bucket.clone(), name: replica.object.clone(), content_type: "application/octet-stream".into(), ..Default::default() };
     let upload_error = Arc::new(std::sync::Mutex::new(None));
@@ -163,15 +174,15 @@ fn write_bytes(
     }));
     let request = replica.request(ReceiverStream::new(rx)).map_err(archive_error)?;
     let result = replica.client.clone().write_object(request).await;
-    if let Some(error) = upload_error.lock().unwrap().take() { return Err(error); }
+    if let Some(error) = upload_error.lock().unwrap().take() { return Err(error.into()); }
     let response = result.map_err(|status| {
         if matches!(status.code(), Code::AlreadyExists | Code::FailedPrecondition) {
-            ArchiveError::Corrupt("conditional write conflict".into())
-        } else { status_error(status) }
+            WriteError::Conflict
+        } else { WriteError::Archive(status_error(status)) }
     })?.into_inner();
     match response.write_status {
         Some(write_object_response::WriteStatus::Resource(object)) => Ok(object),
-        _ => Err(ArchiveError::Unavailable("write response omitted object identity".into())),
+        _ => Err(ArchiveError::Unavailable("write response omitted object identity".into()).into()),
     }
     }.boxed()
 }
@@ -235,12 +246,12 @@ impl ArchiveStore for GcsArchiveStore {
         let replica = self.replica(object)?;
         match write_bytes(replica, 0, object.clone(), contents).await {
             Ok(_) => Ok(()),
-            Err(ArchiveError::Corrupt(message)) if message == "conditional write conflict" => {
+            Err(WriteError::Conflict) => {
                 // Check the entire existing object, not merely user metadata.
                 crate::archive::read_all(self, object).await?;
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(WriteError::Archive(error)) => Err(error),
         }
     }
     async fn read(
@@ -306,15 +317,17 @@ impl GcsBodyManifestStore {
         )
         .await
         .map_err(|e| match e {
-            ArchiveError::Corrupt(message) if message == "conditional write conflict" => {
+            WriteError::Conflict => {
                 if generation == 0 {
                     ManifestStoreError::AlreadyExists
                 } else {
                     ManifestStoreError::Conflict
                 }
             }
-            ArchiveError::Unavailable(message) => ManifestStoreError::Unavailable(message),
-            error => ManifestStoreError::Backend(error.to_string()),
+            WriteError::Archive(ArchiveError::Unavailable(message)) => {
+                ManifestStoreError::Unavailable(message)
+            }
+            WriteError::Archive(error) => ManifestStoreError::Backend(error.to_string()),
         })?;
         Ok(VersionedManifest {
             version: ManifestVersion(object.generation as u64),
