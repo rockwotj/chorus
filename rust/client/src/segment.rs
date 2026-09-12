@@ -1859,27 +1859,32 @@ mod recovery {
             }
             let mut groups: HashMap<Vec<u8>, Vec<ReplicaSnapshot>> = HashMap::new();
             for snapshot in finalized {
-                if RecordFrame::decode_all(&snapshot.bytes).is_ok() {
-                    groups
-                        .entry(snapshot.bytes.clone())
-                        .or_default()
-                        .push(snapshot);
-                }
+                groups
+                    .entry(snapshot.bytes.clone())
+                    .or_default()
+                    .push(snapshot);
             }
-            let Some((canonical_bytes, finalized)) = groups
+            let Some((canonical_bytes, record_count, finalized)) = groups
                 .into_iter()
-                .filter(|(_, copies)| copies.len() >= self.quorum())
-                .filter(|(bytes, _)| {
-                    expected_records.is_none_or(|expected| {
-                        RecordFrame::decode_all(bytes)
-                            .is_ok_and(|records| records.len() as u64 == expected)
-                    })
+                .filter_map(|(bytes, copies)| {
+                    RecordFrame::validate_all(&bytes)
+                        .ok()
+                        .map(|record_count| (bytes, record_count, copies))
                 })
-                .max_by(|(left, _), (right, _)| left.len().cmp(&right.len()).then(left.cmp(right)))
+                .filter(|(_, _, copies)| copies.len() >= self.quorum())
+                .filter(|(_, record_count, _)| {
+                    expected_records
+                        .is_none_or(|expected| u64::try_from(*record_count).ok() == Some(expected))
+                })
+                .max_by(|(left, _, _), (right, _, _)| {
+                    left.len().cmp(&right.len()).then(left.cmp(right))
+                })
             else {
                 return Ok(None);
             };
-            let record_count = RecordFrame::decode_all(&canonical_bytes)?.len() as u64;
+            let record_count = u64::try_from(record_count).map_err(|_| {
+                Error::InvalidCatalog("finalized segment record count does not fit in u64".into())
+            })?;
             let Some(last_record_offset) = record_count.checked_sub(1) else {
                 return Err(Error::InvalidCatalog(format!(
                     "finalized segment {base_record_index} is empty"

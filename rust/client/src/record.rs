@@ -1,4 +1,4 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Internal durable envelope for one opaque application record.
@@ -34,11 +34,36 @@ impl RecordFrame {
     }
 
     /// Decode every record in a complete segment byte slice.
-    pub fn decode_all(mut input: &[u8]) -> Result<Vec<Self>, RecordError> {
+    ///
+    /// The borrowed input is copied once into shared storage rather than once
+    /// per payload. Callers that already own [`Bytes`] should use the internal
+    /// owned form to avoid that segment-level copy as well.
+    pub fn decode_all(input: &[u8]) -> Result<Vec<Self>, RecordError> {
+        Self::decode_all_bytes(Bytes::copy_from_slice(input))
+    }
+
+    /// Decode every record from an owned segment without copying its payloads.
+    ///
+    /// Each returned payload is a slice of `input`, so retaining one record
+    /// retains the complete backing allocation. This is intended for complete
+    /// segment reads whose records have the same lifetime as the read buffer.
+    pub(crate) fn decode_all_bytes(mut input: Bytes) -> Result<Vec<Self>, RecordError> {
         let mut records = Vec::new();
         while !input.is_empty() {
-            let (record, consumed) = Self::decode_one(input)?;
+            let (record, consumed) = Self::decode_one_bytes(&input)?;
             records.push(record);
+            input.advance(consumed);
+        }
+        Ok(records)
+    }
+
+    /// Validate a complete segment and return its record count without
+    /// allocating or copying payload bytes.
+    pub(crate) fn validate_all(mut input: &[u8]) -> Result<usize, RecordError> {
+        let mut records = 0usize;
+        while !input.is_empty() {
+            let consumed = Self::decoded_len(input)?;
+            records += 1;
             input = &input[consumed..];
         }
         Ok(records)
@@ -64,6 +89,26 @@ impl RecordFrame {
     }
 
     fn decode_one(input: &[u8]) -> Result<(Self, usize), RecordError> {
+        let total_len = Self::decoded_len(input)?;
+        Ok((
+            Self {
+                payload: Bytes::copy_from_slice(&input[Self::HEADER_LEN..total_len]),
+            },
+            total_len,
+        ))
+    }
+
+    fn decode_one_bytes(input: &Bytes) -> Result<(Self, usize), RecordError> {
+        let total_len = Self::decoded_len(input)?;
+        Ok((
+            Self {
+                payload: input.slice(Self::HEADER_LEN..total_len),
+            },
+            total_len,
+        ))
+    }
+
+    fn decoded_len(input: &[u8]) -> Result<usize, RecordError> {
         if input.len() < Self::HEADER_LEN {
             return Err(RecordError::Truncated);
         }
@@ -74,12 +119,7 @@ impl RecordFrame {
         if input.len() < total_len {
             return Err(RecordError::Truncated);
         }
-        Ok((
-            Self {
-                payload: Bytes::copy_from_slice(&input[Self::HEADER_LEN..total_len]),
-            },
-            total_len,
-        ))
+        Ok(total_len)
     }
 }
 
@@ -151,5 +191,80 @@ mod tests {
                 payload: Bytes::new()
             }]
         );
+    }
+
+    #[test]
+    fn owned_decode_shares_the_input_allocation() {
+        let first = RecordFrame {
+            payload: Bytes::from_static(b"alpha"),
+        }
+        .encode()
+        .unwrap();
+        let second = RecordFrame {
+            payload: Bytes::from_static(b"beta"),
+        }
+        .encode()
+        .unwrap();
+        let mut input = BytesMut::with_capacity(first.len() + second.len());
+        input.extend_from_slice(&first);
+        input.extend_from_slice(&second);
+        let input = input.freeze();
+        let first_payload = input[RecordFrame::HEADER_LEN..].as_ptr();
+        let second_payload = input[first.len() + RecordFrame::HEADER_LEN..].as_ptr();
+
+        let records = RecordFrame::decode_all_bytes(input.clone()).unwrap();
+
+        assert_eq!(records[0].payload.as_ptr(), first_payload);
+        assert_eq!(records[1].payload.as_ptr(), second_payload);
+        drop(input);
+        assert_eq!(records[0].payload.as_ref(), b"alpha");
+        assert_eq!(records[1].payload.as_ref(), b"beta");
+    }
+
+    #[test]
+    fn owned_decode_preserves_validation_errors() {
+        for malformed in [
+            Bytes::from_static(&[0, 0, 0]),
+            Bytes::from_static(&[0, 0, 0, 3]),
+            Bytes::from_static(&[0, 0, 0, 8, 1, 2]),
+        ] {
+            assert_eq!(
+                RecordFrame::decode_all_bytes(malformed.clone()).unwrap_err(),
+                RecordFrame::decode_all(&malformed).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validation_counts_without_decoding_payloads() {
+        let expected = [
+            RecordFrame {
+                payload: Bytes::from_static(b"alpha"),
+            },
+            RecordFrame {
+                payload: Bytes::new(),
+            },
+            RecordFrame {
+                payload: Bytes::from_static(b"omega"),
+            },
+        ];
+        let bytes: Vec<u8> = expected
+            .iter()
+            .flat_map(|record| record.encode().unwrap())
+            .collect();
+
+        assert_eq!(RecordFrame::validate_all(&bytes), Ok(expected.len()));
+        assert_eq!(RecordFrame::validate_all(&[]), Ok(0));
+        assert_eq!(
+            RecordFrame::validate_all(&bytes),
+            RecordFrame::decode_all(&bytes).map(|records| records.len())
+        );
+
+        for malformed in [&[0, 0, 0][..], &[0, 0, 0, 3][..], &[0, 0, 0, 8, 1, 2][..]] {
+            assert_eq!(
+                RecordFrame::validate_all(malformed).unwrap_err(),
+                RecordFrame::decode_all(malformed).unwrap_err()
+            );
+        }
     }
 }
