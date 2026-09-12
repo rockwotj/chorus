@@ -57,6 +57,18 @@ impl RecordFrame {
         Ok(records)
     }
 
+    /// Validate a complete segment and return its record count without
+    /// allocating or copying payload bytes.
+    pub(crate) fn validate_all(mut input: &[u8]) -> Result<usize, RecordError> {
+        let mut records = 0usize;
+        while !input.is_empty() {
+            let consumed = Self::decoded_len(input)?;
+            records += 1;
+            input = &input[consumed..];
+        }
+        Ok(records)
+    }
+
     /// Decode the contiguous well-formed prefix of an appendable object.
     ///
     /// A partial or malformed tail terminates the prefix. Recovery never scans
@@ -219,6 +231,39 @@ mod tests {
             assert_eq!(
                 RecordFrame::decode_all_bytes(malformed.clone()).unwrap_err(),
                 RecordFrame::decode_all(&malformed).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validation_counts_without_decoding_payloads() {
+        let expected = [
+            RecordFrame {
+                payload: Bytes::from_static(b"alpha"),
+            },
+            RecordFrame {
+                payload: Bytes::new(),
+            },
+            RecordFrame {
+                payload: Bytes::from_static(b"omega"),
+            },
+        ];
+        let bytes: Vec<u8> = expected
+            .iter()
+            .flat_map(|record| record.encode().unwrap())
+            .collect();
+
+        assert_eq!(RecordFrame::validate_all(&bytes), Ok(expected.len()));
+        assert_eq!(RecordFrame::validate_all(&[]), Ok(0));
+        assert_eq!(
+            RecordFrame::validate_all(&bytes),
+            RecordFrame::decode_all(&bytes).map(|records| records.len())
+        );
+
+        for malformed in [&[0, 0, 0][..], &[0, 0, 0, 3][..], &[0, 0, 0, 8, 1, 2][..]] {
+            assert_eq!(
+                RecordFrame::validate_all(malformed).unwrap_err(),
+                RecordFrame::decode_all(malformed).unwrap_err()
             );
         }
     }
