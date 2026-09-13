@@ -33,6 +33,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Adapter uses only the public Chorus API
+        run: cargo check -p chorus-adapter-api-check --lib
       - name: Tests
         run: cargo test --workspace --all-features
       - name: Client without optional integrations

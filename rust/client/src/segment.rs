@@ -894,14 +894,18 @@ mod recovery {
             })
         }
 
-        /// Resolve a finite, quorum-visible end without fencing or following
-        /// future writes. SlateDB uses this to bound a reader's startup replay.
-        /// Object metadata cannot supply the length of an appendable tail.
-        #[cfg(feature = "slatedb")]
-        pub(crate) async fn readonly_end(
+        /// Sample a finite exclusive replay boundary without claiming writer ownership.
+        ///
+        /// The result is at least `checkpoint`. With `through`, sealed history
+        /// covering that exclusive boundary is sufficient: the active tail need
+        /// not be available and the result need not be the latest end. Without
+        /// it, sample the quorum-visible active prefix without following new writes.
+        /// This does not pin retention; concurrent truncation can invalidate a
+        /// later read. A checkpoint below truncation returns [`Error::ReadOnlyLagged`].
+        pub async fn readonly_end(
             &self,
             checkpoint: WalSeqNo,
-            through: Option<u64>,
+            through: Option<WalSeqNo>,
         ) -> Result<WalSeqNo, Error> {
             let mut manifest = self
                 .open_existing_manifest()
@@ -913,7 +917,7 @@ mod recovery {
             let base = record.tail_base;
             // A bounded read entirely in published sealed history does not
             // depend on the active tail's availability.
-            if through.is_some_and(|end| end <= base) {
+            if through.is_some_and(|end| end.record_index <= base) {
                 return Ok(WalSeqNo::record(base.max(checkpoint.record_index)));
             }
             let object = format!("{}/segments/{tail_id}", self.prefix);

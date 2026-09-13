@@ -55,7 +55,7 @@ impl Drop for Startup {
 
 #[derive(Clone)]
 pub(super) struct Connection {
-    pub handle: crate::engine::GcHandle,
+    pub handle: crate::WalGcHandle,
     pub observer: Observer,
 }
 
@@ -112,7 +112,11 @@ impl WalGc for ChorusWal {
         connection.observer.status().map_err(WalError::from)?;
         connection
             .handle
-            .collect(retain_from(&referenced_ranges), min_age, dry_run)
+            .collect(
+                crate::WalSeqNo::record(retain_from(&referenced_ranges)),
+                min_age,
+                dry_run,
+            )
             .await
             .map_err(wal_error)?;
         Ok(())

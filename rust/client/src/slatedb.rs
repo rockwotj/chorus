@@ -75,11 +75,16 @@
 //! }
 //! ```
 
+#[path = "slatedb/codec.rs"]
 mod codec;
+#[path = "slatedb/gc.rs"]
 mod gc;
+#[path = "slatedb/progress.rs"]
 mod progress;
+#[path = "slatedb/reader.rs"]
 mod reader;
 #[cfg(test)]
+#[path = "slatedb/tests.rs"]
 mod tests;
 
 use std::collections::VecDeque;

@@ -52,11 +52,9 @@ pub(crate) enum MaintenanceCmd {
         response: oneshot::Sender<Result<TruncationReport, Error>>,
     },
     /// Retained-range GC, independent of this writer's startup replay point.
-    #[cfg(feature = "slatedb")]
     Collect(GcRequest),
 }
 
-#[cfg(feature = "slatedb")]
 pub(crate) struct GcRequest {
     pub retain_from: u64,
     pub min_age: Duration,
@@ -133,7 +131,6 @@ impl MaintenanceHandle {
         let _ = self.shutdown.send(true);
     }
 
-    #[cfg(feature = "slatedb")]
     pub(crate) async fn collect(
         &self,
         retain_from: u64,
@@ -340,7 +337,6 @@ async fn execute_command(
                 let _ = response.send(result.clone());
             }
         }
-        #[cfg(feature = "slatedb")]
         ReadyCommandKind::Collect(request) => {
             task.adopt_catalog(catalog_rx);
             let result = task
@@ -365,7 +361,6 @@ enum PendingGroup {
         segment: Box<SwappedSegment>,
         enforced: oneshot::Sender<()>,
     },
-    #[cfg(feature = "slatedb")]
     Collect(GcRequest),
 }
 
@@ -395,7 +390,6 @@ enum ReadyCommandKind {
         floor: WalSeqNo,
         responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
     },
-    #[cfg(feature = "slatedb")]
     Collect(GcRequest),
 }
 
@@ -413,7 +407,6 @@ impl PendingCommands {
             MaintenanceCmd::Truncate { floor, response } => {
                 self.push_truncation(floor, response);
             }
-            #[cfg(feature = "slatedb")]
             MaintenanceCmd::Collect(request) => {
                 // Retention snapshots, dry runs, and age gates must not be
                 // coalesced with each other or ordinary truncation requests.
@@ -487,7 +480,6 @@ impl PendingCommands {
                     }
                     _ => unreachable!("front group was a seal"),
                 },
-                #[cfg(feature = "slatedb")]
                 PendingGroup::Collect(_) => match self.groups.pop_front() {
                     Some(PendingGroup::Collect(request)) => {
                         return Some(ReadyCommand {
@@ -931,7 +923,6 @@ impl MaintenanceState {
         Ok(report)
     }
 
-    #[cfg(feature = "slatedb")]
     async fn collect_once(
         &mut self,
         retain_from: u64,
@@ -968,7 +959,7 @@ impl MaintenanceState {
                     }
                     Err(error) => {
                         ages_known = false;
-                        tracing::warn!(%error, "SlateDB WAL GC cannot verify replica ages; deferring new truncation");
+                        tracing::warn!(%error, "WAL GC cannot verify replica ages; deferring new truncation");
                     }
                 }
             }
@@ -1058,7 +1049,6 @@ async fn tick(interval: &mut Option<Interval>) {
     }
 }
 
-#[cfg(feature = "slatedb")]
 fn older_than(
     last_modified: Option<std::time::SystemTime>,
     now: std::time::SystemTime,
@@ -1073,7 +1063,6 @@ fn older_than(
 mod tests {
     use super::*;
 
-    #[cfg(feature = "slatedb")]
     #[test]
     fn gc_age_requires_known_time_strictly_older_than_cutoff() {
         use std::time::{Duration, UNIX_EPOCH};
@@ -1161,7 +1150,6 @@ mod tests {
                 ReadyCommandKind::SealSegment { .. } | ReadyCommandKind::Truncate { .. } => {
                     panic!("flood coalescer emitted an unexpected command");
                 }
-                #[cfg(feature = "slatedb")]
                 ReadyCommandKind::Collect(_) => panic!("no collections were queued"),
             }
         }
