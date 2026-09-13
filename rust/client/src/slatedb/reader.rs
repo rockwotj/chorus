@@ -34,7 +34,7 @@ impl WalReader for ChorusWal {
             if let Some(last) = last {
                 let end = self
                     .volume
-                    .readonly_end(WalSeqNo::record(next_index), Some(last))
+                    .readonly_end(WalSeqNo::record(next_index), Some(WalSeqNo::record(last)))
                     .await
                     .map_err(wal_error)?;
                 if last > end.record_index {

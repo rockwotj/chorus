@@ -92,6 +92,66 @@ async fn public_api_appends_and_replays_records() {
     assert_eq!(records[2].next_seqno(), WalSeqNo::record(3));
 }
 
+#[tokio::test]
+async fn public_adapter_capabilities_work_without_optional_features() {
+    use chorus_client::{Error, WalGcHandle};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let config = WalEngineConfig::default();
+    config.validate().unwrap();
+    let (_servers, volume) = volume("public-adapter-api", Arc::new(NoopMetricsRecorder)).await;
+    let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
+    assert!(recovery.try_next().await.unwrap().is_none());
+    let mut handle = recovery.start(config).await.unwrap();
+    let gc: WalGcHandle = handle.gc_handle();
+    let rejected_called = Arc::new(AtomicBool::new(false));
+    let observed = rejected_called.clone();
+    assert!(handle
+        .enqueue_append_notifying(
+            WalSeqNo::record(1),
+            Bytes::from_static(b"rejected"),
+            move |_| {
+                observed.store(true, Ordering::SeqCst);
+            }
+        )
+        .await
+        .is_err());
+    assert!(!rejected_called.load(Ordering::SeqCst));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .enqueue_append_notifying(
+            WalSeqNo::ZERO,
+            Bytes::from_static(b"accepted"),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        )
+        .await
+        .unwrap();
+    let receipt = tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.seqno, WalSeqNo::ZERO);
+    assert_eq!(
+        volume.readonly_end(WalSeqNo::ZERO, None).await.unwrap(),
+        WalSeqNo::record(1)
+    );
+    let report = gc
+        .collect(WalSeqNo::record(1), Duration::ZERO, true)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted_objects, 0);
+    assert_eq!(report.deleted_segments, 0);
+    handle.shutdown().await.unwrap();
+    assert!(matches!(
+        gc.collect(WalSeqNo::record(1), Duration::ZERO, false).await,
+        Err(Error::Closed)
+    ));
+}
+
 #[derive(Default)]
 struct Registrations(Mutex<BTreeSet<(String, &'static str)>>);
 
