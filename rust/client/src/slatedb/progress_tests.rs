@@ -105,7 +105,9 @@ async fn writer_without_consumer(
     let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
     assert!(recovery.try_next().await.unwrap().is_none());
     let handle = recovery.start(config.clone()).await.unwrap();
-    let (updates, receiver) = watch::channel(progress::Progress::default());
+    let handle = coordination::Handle::start(handle, 0);
+    let updates = handle.progress.clone();
+    let receiver = updates.subscribe();
     (
         Writer {
             ready: None,

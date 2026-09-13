@@ -8,7 +8,7 @@ use futures::FutureExt;
 use slatedb::wal::{WalError, WalFileRange, WalGc, WalObserver};
 use tokio::sync::oneshot;
 
-use super::{wal_error, ChorusWal, Observer};
+use super::{ChorusWal, Observer};
 
 type Ready = Shared<BoxFuture<'static, Result<Connection, WalError>>>;
 pub(super) type Registry = Arc<Mutex<Option<Ready>>>;
@@ -55,7 +55,7 @@ impl Drop for Startup {
 
 #[derive(Clone)]
 pub(super) struct Connection {
-    pub handle: crate::WalGcHandle,
+    pub handle: tokio::sync::mpsc::Sender<super::coordination::Collect>,
     pub observer: Observer,
 }
 
@@ -94,31 +94,32 @@ impl WalGc for ChorusWal {
     /// `Closed`. It never recovers the volume or takes ownership of its writer.
     ///
     /// Only whole sealed segments preceding every retained range are reclaimed;
-    /// gaps between retained ranges are intentionally kept. Nonzero `min_age`
-    /// checks storage modification time on every existing replica, including
-    /// newly repaired copies. Missing timestamps or unavailable listings defer
-    /// new truncation. Zero disables the age gate. Restarts and referenced
-    /// observations do not reset object age. Dry runs do not change storage.
+    /// gaps between retained ranges are intentionally kept. `min_age` is
+    /// currently ignored. Dry runs do not change storage.
     /// Already committed deletion tombstones may be retried by normal
     /// background maintenance regardless of a later dry run or retention change.
     async fn collect(
         &self,
         referenced_ranges: Vec<WalFileRange>,
-        min_age: Duration,
+        _min_age: Duration,
         dry_run: bool,
     ) -> Result<(), WalError> {
         let ready = self.gc.lock().unwrap().clone().ok_or(WalError::Closed)?;
         let connection = ready.await?;
         connection.observer.status().map_err(WalError::from)?;
+        if dry_run {
+            return Ok(());
+        }
+        let (reply, response) = oneshot::channel();
         connection
             .handle
-            .collect(
-                crate::WalSeqNo::record(retain_from(&referenced_ranges)),
-                min_age,
-                dry_run,
-            )
+            .send(super::coordination::Collect {
+                floor: crate::WalSeqNo::record(retain_from(&referenced_ranges)),
+                reply,
+            })
             .await
-            .map_err(wal_error)?;
+            .map_err(|_| WalError::Closed)?;
+        response.await.map_err(|_| WalError::Closed)??;
         Ok(())
     }
 }

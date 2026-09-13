@@ -119,8 +119,7 @@ impl Default for WalEngineConfig {
 }
 
 impl WalEngineConfig {
-    /// Check admission, segment-size, and shutdown settings without opening a WAL.
-    pub fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.queue_capacity_bytes == 0 {
             return Err(Error::InvalidConfig("queue_capacity_bytes must be nonzero"));
         }
@@ -252,7 +251,6 @@ impl Future for AppendCompletion {
 
 enum Completion {
     Receipt(oneshot::Sender<Result<AppendReceipt, Error>>),
-    Notify(CommitNotification),
 }
 
 impl Completion {
@@ -261,23 +259,6 @@ impl Completion {
             Self::Receipt(sender) => {
                 let _ = sender.send(result);
             }
-            Self::Notify(mut notification) => (notification.0.take().unwrap())(result),
-        }
-    }
-}
-
-// Only nonblocking completion publishers run here. This replaces a per-record
-// oneshot for watermark-based consumers.
-type CommitCallback = Box<dyn FnOnce(Result<AppendReceipt, Error>) + Send>;
-
-struct CommitNotification(Option<CommitCallback>);
-
-impl Drop for CommitNotification {
-    fn drop(&mut self) {
-        if let Some(notify) = self.0.take() {
-            // Aborting/panicking must also release durability waiters. Like a
-            // dropped oneshot sender, this does not claim the write rolled back.
-            notify(Err(Error::Closed));
         }
     }
 }
@@ -577,14 +558,6 @@ impl WalEngine {
 }
 
 impl WalHandle {
-    /// Obtain a cloneable collection-only capability tied to this live engine.
-    /// It cannot append, recover, or claim writer ownership.
-    pub fn gc_handle(&self) -> WalGcHandle {
-        WalGcHandle {
-            maintenance: self.maintenance.clone(),
-            rotation_recheck: self.rotation_recheck.clone(),
-        }
-    }
     /// Admit one caller-numbered opaque record without waiting for durability.
     ///
     /// Before waiting, this method verifies that `seqno` is exactly the next
@@ -612,35 +585,6 @@ impl WalHandle {
         self.enqueue_inner(seqno, record, || {
             let (sender, receiver) = oneshot::channel();
             (Completion::Receipt(sender), AppendCompletion { receiver })
-        })
-        .await
-    }
-
-    /// Admit a record and deliver its ordered completion to a nonblocking callback.
-    ///
-    /// Admission and cancellation semantics match [`Self::enqueue_append`]. The
-    /// callback is installed after validation and admission-budget waits. Those
-    /// failures or cancellation during those waits do not invoke it. After
-    /// successful admission it is called once with the eventual result. If the
-    /// engine closes during the final handoff, both this method and the callback
-    /// may report [`Error::Closed`].
-    /// Engine shutdown or cancellation reports [`Error::Closed`], which does not
-    /// establish that an admitted append failed to commit.
-    ///
-    /// The callback runs inline with engine progress (or teardown). It must not
-    /// block, panic, await other WAL work, or call application listeners. Publish
-    /// into nonblocking shared state or a channel, then dispatch listeners elsewhere.
-    pub async fn enqueue_append_notifying(
-        &mut self,
-        seqno: WalSeqNo,
-        record: Bytes,
-        notify: impl FnOnce(Result<AppendReceipt, Error>) + Send + 'static,
-    ) -> Result<(), Error> {
-        self.enqueue_inner(seqno, record, || {
-            (
-                Completion::Notify(CommitNotification(Some(Box::new(notify)))),
-                (),
-            )
         })
         .await
     }
@@ -900,45 +844,6 @@ impl WalHandle {
                 })
             }
         }
-    }
-}
-
-/// Retention collection capability obtained from [`WalHandle::gc_handle`].
-///
-/// Cloning it never grants append or recovery authority and does not keep a
-/// closed engine alive. Collection runs on the engine's maintenance worker.
-#[derive(Clone)]
-pub struct WalGcHandle {
-    maintenance: crate::maintenance::MaintenanceHandle,
-    rotation_recheck: mpsc::Sender<()>,
-}
-
-impl WalGcHandle {
-    /// Reclaim whole sealed segments strictly preceding `retain_from`.
-    ///
-    /// The caller must choose the earliest record required by any checkpoint or
-    /// reader. This may advance the destructive truncation floor; it cannot be
-    /// undone by a later call with a lower boundary. Active records are retained.
-    ///
-    /// A nonzero `min_age` requires each existing copy's storage modification
-    /// time to be older than the cutoff. Unknown ages defer new truncation.
-    /// Zero disables that age gate. `dry_run` does not mutate storage and returns
-    /// zero deletion counts; previously authorized background cleanup may continue.
-    /// Calling after engine shutdown returns [`Error::Closed`].
-    pub async fn collect(
-        &self,
-        retain_from: WalSeqNo,
-        min_age: Duration,
-        dry_run: bool,
-    ) -> Result<TruncationReport, Error> {
-        let report = self
-            .maintenance
-            .collect(retain_from.record_index, min_age, dry_run)
-            .await?;
-        if !dry_run {
-            let _ = self.rotation_recheck.try_send(());
-        }
-        Ok(report)
     }
 }
 
