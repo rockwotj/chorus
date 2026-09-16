@@ -115,6 +115,12 @@ async fn gc_retention_can_precede_the_writer_replay_checkpoint() {
     let new_manifest = manifest(&servers).await;
     assert_eq!(old_manifest["chorus.epoch"], new_manifest["chorus.epoch"]);
     assert_eq!(old_manifest["chorus.owner"], new_manifest["chorus.owner"]);
+    // Decoupling replay must not let a later request resurrect deleted history.
+    assert!(wal
+        .collect(retained(0), Duration::ZERO, false)
+        .await
+        .is_err());
+    assert_eq!(floor(&servers).await, collected);
     writer.wal_writer.append(&[row(17)]).await.unwrap();
     writer.wal_writer.flush().await.unwrap().await.unwrap();
     writer.wal_writer.close().await.unwrap();
@@ -146,7 +152,30 @@ async fn gc_after_restart_preserves_dry_run() {
     fresh.collect(retained(13), age, true).await.unwrap();
     assert_eq!(manifest(&servers).await, snapshot);
     assert!(before.is_subset(&names(&servers, 0).await));
-    fresh.collect(retained(13), age, false).await.unwrap();
+    // Slow physical deletion must not hold up unrelated write admission.
+    use chorus_fake_gcs::Operation;
+    servers[0].service.reset_operation_counts().await;
+    servers[0]
+        .service
+        .inject_delay(Operation::Delete, Duration::from_secs(1))
+        .await;
+    let collecting = fresh.clone();
+    let task = tokio::spawn(async move { collecting.collect(retained(13), age, false).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while servers[0].service.operation_count(Operation::Delete).await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(500), async {
+        writer.wal_writer.append(&[row(17)]).await.unwrap();
+        writer.wal_writer.flush().await.unwrap().await.unwrap();
+    })
+    .await
+    .expect("physical GC blocked write admission or durability");
+    assert!(!task.is_finished());
+    task.await.unwrap().unwrap();
     assert!(floor(&servers).await > 0);
     assert!(!before.is_subset(&names(&servers, 0).await));
     writer.wal_writer.close().await.unwrap();
@@ -473,37 +502,43 @@ async fn put_range(db: &Db, first: u64, end: u64) {
 
 #[tokio::test]
 async fn slatedb_scheduled_gc_reclaims_storage_while_the_database_keeps_writing() {
-    let (servers, volume) = volume().await;
-    let wal = ChorusWal::with_config(volume.clone(), config());
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = open_with_gc(&wal, store.clone(), Some(Duration::from_millis(10))).await;
-    put_range(&db, 0, 16).await;
-    db.flush_with_options(FlushOptions {
-        flush_type: FlushType::MemTable,
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while floor(&servers).await == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    put_range(&db, 16, 20).await;
-    assert_eq!(
-        db.get(b"key-0").await.unwrap(),
-        Some(Bytes::from(vec![42; 100]))
-    );
-    close(&db).await;
-    let reopened = open(&volume, store).await;
-    for index in 0..20 {
+    // Bound the entire workflow, not just the GC poll: an admission/maintenance
+    // deadlock must fail the test rather than consume the CI job's six hours.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (servers, volume) = volume().await;
+        let wal = ChorusWal::with_config(volume.clone(), config());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = open_with_gc(&wal, store.clone(), Some(Duration::from_millis(10))).await;
+        put_range(&db, 0, 16).await;
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while floor(&servers).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        put_range(&db, 16, 20).await;
         assert_eq!(
-            reopened.get(format!("key-{index}")).await.unwrap(),
+            db.get(b"key-0").await.unwrap(),
             Some(Bytes::from(vec![42; 100]))
         );
-    }
-    close(&reopened).await;
+        close(&db).await;
+        let reopened = open(&volume, store).await;
+        for index in 0..20 {
+            assert_eq!(
+                reopened.get(format!("key-{index}")).await.unwrap(),
+                Some(Bytes::from(vec![42; 100]))
+            );
+        }
+        close(&reopened).await;
+    })
+    .await
+    .expect("scheduled GC blocked the database lifecycle");
 }
 
 #[tokio::test]

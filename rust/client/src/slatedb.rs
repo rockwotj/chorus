@@ -103,9 +103,9 @@ impl ChorusWal {
 
     /// Use explicit Chorus capacity, rotation, repair, and shutdown settings.
     ///
-    /// `max_record_bytes` bounds an entire encoded SlateDB write batch, including
-    /// this adapter's framing. Exceeding it fails the write (and SlateDB may close
-    /// the database); batches are never split into non-atomic records.
+    /// Applications enforce their own transaction-size policy. A batch is never
+    /// split into non-atomic records; oversized records exclusively reserve the
+    /// engine's byte budgets. Wire-format and active-segment limits still apply.
     pub fn with_config(volume: SegmentedVolume, config: WalEngineConfig) -> Self {
         Self {
             volume,
@@ -167,7 +167,7 @@ fn writer_and_replay_with_gc(
             observer: observer.clone(),
             last_seq: None,
             failure: None,
-            config: config.clone(),
+            config,
             startup: Some(startup),
         }),
         wal_writer: Box::new(Writer {
@@ -180,7 +180,6 @@ fn writer_and_replay_with_gc(
             next_index,
             last_admitted_seq: None,
             total_rows: 0,
-            config,
         }),
     })
 }
@@ -459,7 +458,6 @@ struct Writer {
     next_index: u64,
     last_admitted_seq: Option<u64>,
     total_rows: u128,
-    config: WalEngineConfig,
 }
 
 impl Writer {
@@ -501,7 +499,7 @@ impl Writer {
 
     async fn append_inner(&mut self, rows: &[RowEntry]) -> Result<(), WalError> {
         self.observer.status().map_err(WalError::from)?;
-        let payload = codec::encode(rows, self.config.max_record_bytes)?;
+        let payload = codec::encode(rows, crate::record::RecordFrame::MAX_PAYLOAD_BYTES)?;
         let seq = rows[0].seq;
         let last_seq = self.last_admitted_seq.or(self
             .observer
@@ -545,6 +543,20 @@ impl Writer {
 
 #[async_trait]
 impl WalWriter for Writer {
+    fn should_flush_memtable(&self, replay_after_wal_id: u64) -> bool {
+        // Each batch is a WAL record, including overwrites that do not grow the
+        // memtable. Bound their replay work even for a tiny, hot keyspace.
+        const MAX_UNFLUSHED_RECORDS: u64 = 4096;
+        self.observer
+            .state
+            .lock()
+            .unwrap()
+            .status
+            .last_flushed_wal_id
+            .saturating_sub(replay_after_wal_id)
+            >= MAX_UNFLUSHED_RECORDS
+    }
+
     async fn append(&mut self, write_batch: &[RowEntry]) -> Result<(), WalError> {
         let result = self.append_inner(write_batch).await;
         if let Err(error) = &result {

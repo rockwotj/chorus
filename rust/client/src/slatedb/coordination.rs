@@ -2,6 +2,7 @@
 use super::{progress, wal_error};
 use crate::{AppendCompletion, WalHandle, WalSeqNo};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use slatedb::wal::WalError;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -64,6 +65,9 @@ impl Handle {
                 }
             });
             let mut pending: Option<Append> = None;
+            // At most one collection is active; the bounded channel holds the
+            // rest. The owned maintenance future does not borrow admission.
+            let mut collection: Option<BoxFuture<'static, ()>> = None;
             loop {
                 let index = pending.as_ref().map(|request| request.index);
                 let bytes = pending.as_ref().map(|request| request.bytes.clone());
@@ -71,19 +75,20 @@ impl Handle {
                     Stop(bool),
                     Append(Option<Append>),
                     Collect(Collect),
+                    Collected,
                     Cancel,
                     Admitted(Result<AppendCompletion, crate::Error>),
                 }
                 let event = tokio::select! {
                     biased;
                     stop = &mut stopping => Event::Stop(stop.unwrap_or(true)),
-                    Some(request) = collections.recv() => Event::Collect(request),
+                    () = async { collection.as_mut().unwrap().await }, if collection.is_some() => Event::Collected,
+                    Some(request) = collections.recv(), if collection.is_none() => Event::Collect(request),
                     () = async { pending.as_mut().unwrap().reply.closed().await }, if index.is_some() => Event::Cancel,
                     result = async { engine.0.as_mut().unwrap().enqueue_append(index.unwrap(), bytes.unwrap()).await }, if index.is_some() => Event::Admitted(result),
                     request = appends.recv(), if index.is_none() => Event::Append(request),
                 };
-                // The admission future has been dropped before truncation borrows
-                // the handle. Cancellation during admission consumes no record ID.
+                // Cancellation during admission consumes no record ID.
                 match event {
                     Event::Stop(abort) => {
                         let handle = engine.0.take().unwrap();
@@ -117,16 +122,13 @@ impl Handle {
                             .committed
                             .map_or(recovered_end, |position| position.wal_id.max(recovered_end));
                         let floor = WalSeqNo::record(request.floor.record_index.min(committed_end));
-                        let result = engine
-                            .0
-                            .as_ref()
-                            .unwrap()
-                            .truncate_before(floor)
-                            .await
-                            .map(|_| ())
-                            .map_err(wal_error);
-                        let _ = request.reply.send(result);
+                        let truncation = engine.0.as_ref().unwrap().truncate_before(floor);
+                        collection = Some(Box::pin(async move {
+                            let result = truncation.await.map(|_| ()).map_err(wal_error);
+                            let _ = request.reply.send(result);
+                        }));
                     }
+                    Event::Collected => collection = None,
                     Event::Cancel => pending = None,
                     Event::Admitted(result) => {
                         let request = pending.take().unwrap();

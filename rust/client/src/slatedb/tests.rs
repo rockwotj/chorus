@@ -360,8 +360,8 @@ async fn quorum_failure_closes_observer_and_does_not_advance_durability() {
 }
 
 #[tokio::test]
-async fn incomplete_replay_and_oversized_batches_fail_closed() {
-    let (_servers, volume) = volume().await;
+async fn incomplete_replay_fails_closed_but_oversized_batches_remain_atomic() {
+    let (servers, volume) = volume().await;
     let mut result = direct_writer(&volume, 0).await;
     assert!(result.wal_writer.append(&[row(1)]).await.is_err());
     assert!(result.wal_writer.status().is_err());
@@ -371,18 +371,38 @@ async fn incomplete_replay_and_oversized_batches_fail_closed() {
     let mut result = writer_and_replay(
         recovery,
         WalEngineConfig {
-            max_record_bytes: 32,
+            queue_capacity_bytes: 32,
+            max_inflight_bytes: 32,
+            pipeline_window_bytes: 32,
+            max_replica_lag_bytes: 32,
+            max_segment_bytes: 8 * 1024 * 1024,
             ..config()
         },
     )
     .unwrap();
     replay(&mut result).await;
-    assert!(result.wal_writer.append(&[row(1)]).await.is_err());
-    assert_eq!(
-        result.wal_writer.status().unwrap_err().last_flushed_wal_id,
-        0
-    );
-    let _ = result.wal_writer.close().await;
+    let mut large = row(1);
+    large.value = ValueDeletable::Value(Bytes::from(vec![7; 2 * 1024 * 1024]));
+    // An oversized record must not shed healthy lanes, but a stalled lane
+    // cannot retain successive oversized records beyond its budget.
+    servers[2].service.inject_flush_hold().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        result.wal_writer.append(&[large.clone()]).await.unwrap();
+        result.wal_writer.flush().await.unwrap().await.unwrap();
+        result.wal_writer.append(&[row(2)]).await.unwrap();
+        result.wal_writer.flush().await.unwrap().await.unwrap();
+    })
+    .await
+    .expect("oversized record must not deadlock behind byte budgets");
+    assert_eq!(result.wal_writer.status().unwrap().last_flushed_wal_id, 2);
+    result.wal_writer.close().await.unwrap();
+    servers[2].service.release_flush_holds().await;
+    let mut recovered = direct_writer(&volume, 0).await;
+    let batches = replay(&mut recovered).await;
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].rows, vec![large]);
+    assert_eq!(batches[1].rows, vec![row(2)]);
+    recovered.wal_writer.close().await.unwrap();
 }
 
 #[tokio::test]

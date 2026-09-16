@@ -1239,9 +1239,11 @@ mod recovery {
                     )));
                 }
             }
-            // future truncation calls must not regress below what the caller
-            // has already durably applied
-            let checkpoint_floor = adopted.trunc.max(checkpoint.record_index);
+            // Replay starts at the caller's current database checkpoint, but
+            // older snapshots may still own earlier WAL records. Only an
+            // explicit truncation authorizes deletion: opening a newer database
+            // checkpoint must not advance the retention floor.
+            let checkpoint_floor = adopted.trunc;
             let mut sealed_segments = Vec::with_capacity(chain.len() + 1);
             for (id, base, end, crc32c) in &chain {
                 // Startup cost is bounded by the write frontier, never by

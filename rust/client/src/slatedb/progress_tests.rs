@@ -104,7 +104,7 @@ async fn writer_without_consumer(
 ) -> (Writer, watch::Receiver<progress::Progress>) {
     let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
     assert!(recovery.try_next().await.unwrap().is_none());
-    let handle = recovery.start(config.clone()).await.unwrap();
+    let handle = recovery.start(config).await.unwrap();
     let handle = coordination::Handle::start(handle, 0);
     let updates = handle.progress.clone();
     let receiver = updates.subscribe();
@@ -119,7 +119,6 @@ async fn writer_without_consumer(
             next_index: 0,
             last_admitted_seq: None,
             total_rows: 0,
-            config,
         },
         receiver,
     )
@@ -141,7 +140,7 @@ async fn stalled_progress_consumer_does_not_limit_small_write_admission() {
     // The old 64-ticket cap would block this loop before it finished, although
     // these batches use only a small fraction of the engine's byte budgets.
     tokio::time::timeout(Duration::from_secs(5), async {
-        for index in 2..=257 {
+        for index in 2..=4097 {
             let seq = index * 100;
             let rows = vec![row(seq); if index % 2 == 0 { 2 } else { 1 }];
             writer.append(&rows).await.unwrap();
@@ -152,21 +151,25 @@ async fn stalled_progress_consumer_does_not_limit_small_write_admission() {
     assert_eq!(progress.borrow().committed.unwrap().wal_id, 1);
     assert_eq!(writer.status().unwrap().last_flushed_wal_id, 0);
     assert_eq!(writer.status().unwrap().estimated_bytes, 0);
+    assert!(
+        !writer.should_flush_memtable(0),
+        "uncommitted writes must not request a freeze"
+    );
     let barrier = writer.flush().await.unwrap();
     for server in &servers[..3] {
         server.service.release_flush_holds().await;
     }
     tokio::time::timeout(
         Duration::from_secs(5),
-        progress.wait_for(|p| p.committed.is_some_and(|position| position.wal_id == 257)),
+        progress.wait_for(|p| p.committed.is_some_and(|position| position.wal_id == 4097)),
     )
     .await
     .unwrap()
     .unwrap();
     // Durability continued while the adapter consumed zero notifications.
     let final_position = progress.borrow().committed.unwrap();
-    assert_eq!(final_position.seq, 25700);
-    assert_eq!(final_position.total_rows, 385);
+    assert_eq!(final_position.seq, 409700);
+    assert_eq!(final_position.total_rows, 6145);
     writer.notifications = Some(tokio::spawn(progress::forward(
         progress,
         writer.observer.clone(),
@@ -176,8 +179,13 @@ async fn stalled_progress_consumer_does_not_limit_small_write_admission() {
         .unwrap()
         .unwrap();
     assert_eq!(writer.status().unwrap().buffered_wal_entries_count, 0);
+    assert!(writer.should_flush_memtable(0));
+    assert!(writer.should_flush_memtable(1));
+    assert!(!writer.should_flush_memtable(2));
+    assert!(!writer.should_flush_memtable(4097));
+    assert!(!writer.should_flush_memtable(4098));
     writer.close().await.unwrap();
-    assert_eq!(writer.status().unwrap_err().last_flushed_seq, Some(25700));
+    assert_eq!(writer.status().unwrap_err().last_flushed_seq, Some(409700));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -187,10 +195,11 @@ async fn engine_bytes_block_admission_and_cancelled_wait_does_not_consume_an_id(
     let payload_bytes = codec::encode(&rows, 1024).unwrap().len();
     let encoded_bytes = payload_bytes + RecordFrame::HEADER_LEN;
     let cfg = WalEngineConfig {
-        max_record_bytes: payload_bytes,
-        queue_capacity_bytes: encoded_bytes,
-        max_inflight_bytes: encoded_bytes,
-        pipeline_window_bytes: encoded_bytes,
+        // Every record exceeds the budgets: the exception must remain exclusive
+        // and cancellation must release its partial reservations without ID reuse.
+        queue_capacity_bytes: encoded_bytes / 2,
+        max_inflight_bytes: encoded_bytes / 2,
+        pipeline_window_bytes: encoded_bytes / 2,
         max_segment_bytes: 1024 * 1024,
         ..config()
     };

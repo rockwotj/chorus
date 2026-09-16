@@ -7,7 +7,6 @@ async fn caller_numbered_appends_admit_in_order_and_refill_the_pipeline() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            max_record_bytes: 64 * 1024,
             pipeline_window_bytes: 8 * (64 * 1024 + 4),
             ..Default::default()
         },
@@ -34,16 +33,6 @@ async fn caller_numbered_appends_admit_in_order_and_refill_the_pipeline() {
             actual: WalSeqNo { record_index: 1 },
         })
     ));
-    assert!(matches!(
-        handle
-            .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from(vec![0; 64 * 1024 + 1]),)
-            .await,
-        Err(Error::RecordTooLarge {
-            max: 65536,
-            actual: 65537,
-        })
-    ));
-
     let first = tokio::time::timeout(
         Duration::from_millis(10),
         handle.enqueue_append(
@@ -90,7 +79,6 @@ async fn latency_injected_pipeline_keeps_many_commits_in_flight_across_rotation(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
             queue_capacity_bytes: 256 * 4100,
-            max_record_bytes: 4096,
             pipeline_window_bytes: 64 * 4100,
             max_inflight_bytes: 64 * 1024 * 1024,
             max_replica_lag_bytes: 64 * 1024 * 1024,
@@ -204,7 +192,6 @@ async fn queue_depth_one_makes_progress_across_latency_injected_rotation() {
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
             queue_capacity_bytes: 4100,
-            max_record_bytes: 4096,
             pipeline_window_bytes: 4100,
             max_inflight_bytes: 4100,
             max_replica_lag_bytes: 64 * 1024 * 1024,
@@ -300,7 +287,6 @@ async fn engine_configuration_is_validated_without_panicking() {
         WalEngine::start(
             writer,
             WalEngineConfig {
-                max_record_bytes: 1,
                 max_inflight_bytes: 5,
                 max_replica_lag_bytes: 5,
                 max_segment_bytes: 6,
@@ -354,14 +340,11 @@ async fn engine_configuration_is_validated_without_panicking() {
         WalEngine::start(
             writer,
             WalEngineConfig {
-                max_record_bytes: 1024,
-                max_inflight_bytes: 1027,
+                max_inflight_bytes: 0,
                 ..Default::default()
             },
         ),
-        Err(Error::InvalidConfig(
-            "max_inflight_bytes must fit one maximum-size encoded record"
-        ))
+        Err(Error::InvalidConfig("max_inflight_bytes must be nonzero"))
     ));
 
     let writer = volume.recover_writer().await.unwrap();
@@ -369,7 +352,6 @@ async fn engine_configuration_is_validated_without_panicking() {
         WalEngine::start(
             writer,
             WalEngineConfig {
-                max_record_bytes: 1024,
                 max_inflight_bytes: 2048,
                 max_replica_lag_bytes: 1024,
                 ..Default::default()
@@ -407,7 +389,6 @@ async fn active_segment_ceiling_backpressures_cleanly_until_truncation_frees_rot
     let mut handle = WalEngine::start(
         writer,
         WalEngineConfig {
-            max_record_bytes: 1,
             max_inflight_bytes: 5,
             max_replica_lag_bytes: 5,
             max_segment_bytes: 1,
@@ -525,7 +506,6 @@ async fn admission_waits_for_the_encoded_inflight_byte_budget() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            max_record_bytes: 5,
             max_inflight_bytes: 9,
             max_replica_lag_bytes: 9,
             ..Default::default()
@@ -571,7 +551,6 @@ async fn queue_capacity_bytes_bounds_channel_and_engine_queue_together() {
         WalEngineConfig {
             // Payloads encode to 9 or 10 bytes: the window carries one
             // record, and the queue budget holds two more.
-            max_record_bytes: 6,
             queue_capacity_bytes: 20,
             pipeline_window_bytes: 10,
             repair_interval: None,
@@ -643,7 +622,6 @@ async fn lagging_replica_is_dropped_at_its_retained_byte_budget() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            max_record_bytes: 5,
             max_inflight_bytes: 9,
             max_replica_lag_bytes: 9,
             ..Default::default()
@@ -1397,7 +1375,6 @@ async fn indeterminate_record_poisons_and_closes_the_engine() {
     let mut handle = WalEngine::start(
         volume.recover_writer().await.unwrap(),
         WalEngineConfig {
-            max_record_bytes: 16,
             // `record-N` payloads encode to 13 bytes, so this window carries
             // three records.
             pipeline_window_bytes: 3 * 13,

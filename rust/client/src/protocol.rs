@@ -99,11 +99,18 @@ impl LaneBudget {
         self.limit.store(limit, Ordering::Relaxed);
     }
 
-    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<LaneReservation>> {
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        oversized_record: bool,
+    ) -> Option<Arc<LaneReservation>> {
         let mut current = self.outstanding.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(bytes)?;
-            if next > self.limit.load(Ordering::Relaxed) {
+            let limit = self.limit.load(Ordering::Relaxed);
+            // Keep normal lag bounded, but let one indivisible record through.
+            // A lane already over budget cannot accumulate another exception.
+            if next > limit && !(oversized_record && bytes > limit && current <= limit) {
                 return None;
             }
             match self.outstanding.compare_exchange_weak(
@@ -1454,7 +1461,7 @@ impl Writer {
         for zone in 0..self.lanes.len() {
             let reservation = self.lanes[zone]
                 .as_ref()
-                .and_then(|lane| lane.budget.try_reserve(batch_bytes));
+                .and_then(|lane| lane.budget.try_reserve(batch_bytes, chunks.len() == 1));
             if reservation.is_none() && self.lanes[zone].is_some() {
                 let lane = self.lanes[zone].take().expect("lane checked present");
                 lane.done.abort();
@@ -3238,21 +3245,21 @@ mod tests {
         let group_one = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                first_budget.try_reserve(first_bytes).unwrap(),
+                first_budget.try_reserve(first_bytes, false).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                first_budget.try_reserve(second_bytes).unwrap(),
+                first_budget.try_reserve(second_bytes, false).unwrap(),
             ),
         ];
         let group_two = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                second_budget.try_reserve(first_bytes).unwrap(),
+                second_budget.try_reserve(first_bytes, false).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                second_budget.try_reserve(second_bytes).unwrap(),
+                second_budget.try_reserve(second_bytes, false).unwrap(),
             ),
         ];
 
@@ -3876,7 +3883,6 @@ mod tests {
             writer,
             crate::WalEngineConfig {
                 queue_capacity_bytes: 2 * encoded_bytes,
-                max_record_bytes: payload.len(),
                 pipeline_window_bytes: encoded_bytes,
                 max_inflight_bytes: encoded_bytes,
                 max_replica_lag_bytes: encoded_bytes,

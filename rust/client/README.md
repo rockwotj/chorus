@@ -199,10 +199,21 @@ db.close().await?;
 ```
 
 Use `ChorusWal::with_config(volume, config)` to customize `WalEngineConfig`.
-The complete **encoded batch** must fit `max_record_bytes` (default 1 MiB).
-Oversized batches fail, rather than being split and losing atomicity. Admission
+Transaction-size policy belongs to the application. A complete encoded batch
+may exceed scheduling byte budgets: it exclusively reserves each admission
+budget and dispatches alone after the pipeline drains. It is never split into
+non-atomic records. The u32 record envelope and hard active-segment ceiling still
+apply. A replica lane may retain its ordinary budget plus one oversized record,
+but cannot accumulate more oversized records while over budget. Admission
 and completion failures close the adapter; ambiguous outcomes require reopening
 the database to resolve the recovered prefix, not retrying within that writer.
+
+The adapter requests a memtable flush after 4096 durable WAL records beyond the
+last frozen/persisted memtable boundary, bounding replay work for repeated
+overwrites even when the memtable remains small. GC runs concurrently with
+admission, with one active collection and a bounded collection request queue.
+Recovery's replay checkpoint does not authorize deleting older history: the
+retention floor advances only through explicit GC/truncation requests.
 
 Each SlateDB write batch is one Chorus record, preserving values, tombstones,
 merge operands, sequence numbers, and optional creation/expiry timestamps. A
