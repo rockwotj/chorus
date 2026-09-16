@@ -616,36 +616,77 @@ async fn queue_capacity_bytes_bounds_channel_and_engine_queue_together() {
 
 #[tokio::test]
 async fn lagging_replica_is_dropped_at_its_retained_byte_budget() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let (volume, metrics) =
-        volume_with_metrics(factories, manifest_factory, "lane-byte-budget-wal");
-    let mut handle = WalEngine::start(
-        volume.recover_writer().await.unwrap(),
-        WalEngineConfig {
-            max_inflight_bytes: 9,
-            max_replica_lag_bytes: 9,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    servers[2].service.inject_flush_hold().await;
-
-    handle
-        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"first"))
-        .await
-        .unwrap()
-        .await
+    for oversized in [false, true] {
+        let (servers, factories, manifest_factory) = factory_cluster().await;
+        let (volume, metrics) =
+            volume_with_metrics(factories, manifest_factory, "lane-byte-budget-wal");
+        let mut handle = WalEngine::start(
+            volume.recover_writer().await.unwrap(),
+            WalEngineConfig {
+                max_inflight_bytes: 9,
+                max_replica_lag_bytes: 9,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    handle
-        .enqueue_append(WalSeqNo::record(1), bytes::Bytes::from_static(b"other"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
-    assert_eq!(metrics.counter("chorus.wal.lane.capacity_drops"), 1);
+        servers[2].service.inject_flush_hold().await;
 
-    servers[2].service.release_flush_holds().await;
-    shutdown_engine(handle).await;
+        handle
+            .enqueue_append(
+                WalSeqNo::ZERO,
+                bytes::Bytes::from_static(if oversized {
+                    b"oversized-record"
+                } else {
+                    b"first"
+                }),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        handle
+            .enqueue_append(WalSeqNo::record(1), bytes::Bytes::from_static(b"other"))
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        if oversized {
+            // The slow lane can retain one large record AND the full normal budget.
+            assert_eq!(metrics.counter("chorus.wal.lane.capacity_drops"), 0);
+            servers[2].service.release_flush_holds().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while metrics
+                    .labeled_gauge("chorus.wal.replica.durable_lag_bytes", &[("zone", "2")])
+                    != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("healthy slow lane must catch up without being evicted");
+
+            // Acknowledgement releases the exception, but a stalled lane cannot
+            // accumulate two oversized records at once.
+            servers[2].service.inject_flush_hold().await;
+            for seq in 2..=3 {
+                handle
+                    .enqueue_append(
+                        WalSeqNo::record(seq),
+                        bytes::Bytes::from_static(b"oversized-record"),
+                    )
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+                assert_eq!(metrics.counter("chorus.wal.lane.capacity_drops"), seq - 2);
+            }
+        } else {
+            assert_eq!(metrics.counter("chorus.wal.lane.capacity_drops"), 1);
+        }
+
+        servers[2].service.release_flush_holds().await;
+        shutdown_engine(handle).await;
+    }
 }
 
 #[tokio::test]
