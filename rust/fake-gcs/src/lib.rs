@@ -1305,10 +1305,14 @@ impl FakeGcs {
         check_metadata_size(&resource.metadata)?;
         let mut state = self.inner.lock().await;
         let key = object_key(&resource.bucket, &resource.name);
-        if state.objects.contains_key(&key) {
+        if let Some(existing) = state.objects.get(&key) {
             if if_generation_match == Some(0) {
                 return Err(Status::already_exists("object exists"));
             }
+            if if_generation_match != Some(existing.generation) {
+                return Err(Status::failed_precondition("generation mismatch"));
+            }
+        } else if if_generation_match.is_some_and(|generation| generation != 0) {
             return Err(Status::failed_precondition("generation mismatch"));
         }
         state.next_generation += 1;

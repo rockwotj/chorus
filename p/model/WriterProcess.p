@@ -269,7 +269,7 @@ machine WriterProcess {
                 pending=view.pending,
                 sealBase=view.sealBase, sealId=view.sealId,
                 sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-                directory=view.directory);
+                archive=view.archive, directory=view.directory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=viewMetagen, rec=candidate);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -394,7 +394,7 @@ machine WriterProcess {
                 tailGen=view.tailGen, pending=view.pending,
                 sealBase=segBase, sealId=sealId,
                 sealEnd=segBase + count, sealSum=sum, trunc=view.trunc,
-                directory=nextDirectory);
+                archive=view.archive, directory=nextDirectory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=viewMetagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -447,7 +447,7 @@ machine WriterProcess {
                 tailGen=target, pending=view.pending,
                 sealBase=view.sealBase, sealId=view.sealId,
                 sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-                directory=view.directory);
+                archive=view.archive, directory=view.directory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=viewMetagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -847,7 +847,7 @@ machine PendingChainRecovery {
             pending=view.pending,
             sealBase=view.sealBase, sealId=view.sealId,
             sealEnd=view.sealEnd, sealSum=view.sealSum, trunc=view.trunc,
-            directory=view.directory);
+            archive=view.archive, directory=view.directory);
         send manifest, eManifestCas, (
             caller=this, expMetagen=readResponse.metagen, rec=next);
         receive { case eManifestCasResponse: (r: tManifestCasResponse) {

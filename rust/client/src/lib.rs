@@ -72,6 +72,7 @@
 #![doc = include_str!("../examples/database_wal.rs")]
 #![doc = "```"]
 
+mod archive;
 mod auth;
 mod engine;
 mod error;
@@ -90,10 +91,11 @@ mod transport;
 #[cfg(test)]
 mod grpc_internal_tests;
 
+pub use archive::{ArchiveByteStream, ArchiveError, ArchiveObjectRef, ArchivePolicy, ArchiveStore};
 pub use auth::{AccessTokenSource, BearerAuth, RefreshingAuthConfig};
 pub use engine::{AppendCompletion, AppendReceipt, WalEngineConfig, WalHandle};
 pub use error::Error;
-pub use grpc::GrpcReplicaFactory;
+pub use grpc::{GcsArchiveStore, GcsBodyManifestStore, GrpcReplicaFactory};
 pub use manifest_store::{ManifestStore, ManifestStoreError, ManifestVersion, VersionedManifest};
 pub use metrics::{
     CounterFn, GaugeFn, HistogramFn, MetricsRecorder, NoopMetricsRecorder, UpDownCounterFn,

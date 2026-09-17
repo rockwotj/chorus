@@ -278,16 +278,30 @@ def _pobserve_regressions(jar: Path) -> None:
 
 def _verification_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    if shutil.which("uclid", path=environment.get("PATH")):
-        return environment
-
+    executable = shutil.which("uclid", path=environment.get("PATH"))
     fallback = Path("/tmp/chorus-uclid/uclid-0.9.5/bin/uclid")
-    if fallback.is_file() and os.access(fallback, os.X_OK):
-        environment["PATH"] = (
-            f"{fallback.parent}{os.pathsep}{environment.get('PATH', '')}"
-        )
-        return environment
-    raise OrchestrationError("uclid 0.9.5 is required for PVerifier")
+    if executable is None and fallback.is_file() and os.access(fallback, os.X_OK):
+        executable = str(fallback)
+    if executable is None:
+        raise OrchestrationError("a PVerifier-compatible UCLID build is required")
+    wrapper_directory = Path(tempfile.mkdtemp(prefix="chorus-checked-uclid."))
+    (wrapper_directory / "uclid").symlink_to(ROOT / "docker/scripts/uclid_checked.py")
+    environment["CHORUS_UCLID_REAL"] = executable
+    environment["PATH"] = f"{wrapper_directory}{os.pathsep}{environment.get('PATH', '')}"
+    return environment
+
+
+def _prove(project: str, environment: dict[str, str], expected: int) -> None:
+    result = subprocess.run(
+        ("p", "compile", "-pp", project, "-md", "verification"),
+        cwd=P_ROOT, env=environment, text=True, capture_output=True,
+    )
+    output = result.stdout + result.stderr
+    print(output, end="", flush=True)
+    # P 3.1 exits zero even when individual invariants fail.
+    if (result.returncode or "Failed to verify" in output or
+            f"Verified {expected} invariants!" not in output):
+        raise OrchestrationError(f"{project}: proof obligations were not all verified")
 
 
 def _parse_model_test_cases(output: str) -> tuple[str, ...]:
@@ -426,8 +440,10 @@ def verify(*, quick: bool) -> int:
         os.close(descriptor)
         Path(temporary_name).unlink()
         shutil.move(verifier_cache, temporary_name)
+    _prove("QuorumProof.pproj", environment, 41)
+    _prove("ArchiveProof.pproj", environment, 14)
     _run(
-        ("p", "compile", "-pp", "QuorumProof.pproj", "-md", "verification"),
+        (sys.executable, ROOT / "docker/scripts/check_archive_proof.py", "--mutations-only"),
         cwd=P_ROOT,
         env=environment,
     )
