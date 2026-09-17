@@ -504,7 +504,9 @@ async fn put_range(db: &Db, first: u64, end: u64) {
 async fn slatedb_scheduled_gc_reclaims_storage_while_the_database_keeps_writing() {
     // Bound the entire workflow, not just the GC poll: an admission/maintenance
     // deadlock must fail the test rather than consume the CI job's six hours.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // This is a liveness guard, not a latency assertion; leave enough headroom
+    // for a loaded runner executing the fake-GCS-heavy suite in parallel.
+    tokio::time::timeout(Duration::from_secs(120), async {
         let (servers, volume) = volume().await;
         let wal = ChorusWal::with_config(volume.clone(), config());
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
