@@ -894,54 +894,6 @@ mod recovery {
             })
         }
 
-        /// Resolve a finite, quorum-visible end without fencing or following
-        /// future writes. SlateDB uses this to bound a reader's startup replay.
-        /// Object metadata cannot supply the length of an appendable tail.
-        #[cfg(feature = "slatedb")]
-        pub(crate) async fn readonly_end(
-            &self,
-            checkpoint: WalSeqNo,
-            through: Option<u64>,
-        ) -> Result<WalSeqNo, Error> {
-            let mut manifest = self
-                .open_existing_manifest()
-                .await?
-                .ok_or(Error::Uninitialized)?;
-            let record = manifest.record();
-            let tail_id = record.tail_id.clone().ok_or(Error::Uninitialized)?;
-            check_readonly_floor(record, checkpoint)?;
-            let base = record.tail_base;
-            // A bounded read entirely in published sealed history does not
-            // depend on the active tail's availability.
-            if through.is_some_and(|end| end <= base) {
-                return Ok(WalSeqNo::record(base.max(checkpoint.record_index)));
-            }
-            let object = format!("{}/segments/{tail_id}", self.prefix);
-            let replicas = timed_replicas_for(&self.factories, &object, &self.metrics);
-            let count = replicas.len();
-            let mut state = ActiveReadState {
-                id: tail_id,
-                epoch: record.epoch,
-                base_record_index: base,
-                byte_offset: 0,
-                skip_records: 0,
-                replicas,
-                inflight: FuturesUnordered::new(),
-                inflight_offsets: vec![None; count],
-                abort_handles: vec![None; count],
-                generations: vec![None; count],
-            };
-            // One finite range read per replica; do not chase a moving tail.
-            let frames = read_active_quorum(&mut state, true).await;
-            // GC may have removed the sampled tail while these reads ran.
-            let refreshed = manifest.refreshed_record().await.map_err(Error::from)?;
-            check_readonly_floor(&refreshed, checkpoint)?;
-            let end = base
-                .checked_add(frames?.len() as u64)
-                .ok_or(Error::SequenceExhausted)?;
-            Ok(WalSeqNo::record(end.max(checkpoint.record_index)))
-        }
-
         fn follow_readonly(
             &self,
             manifest: Manifest,
@@ -1287,9 +1239,11 @@ mod recovery {
                     )));
                 }
             }
-            // future truncation calls must not regress below what the caller
-            // has already durably applied
-            let checkpoint_floor = adopted.trunc.max(checkpoint.record_index);
+            // Replay starts at the caller's current database checkpoint, but
+            // older snapshots may still own earlier WAL records. Only an
+            // explicit truncation authorizes deletion: opening a newer database
+            // checkpoint must not advance the retention floor.
+            let checkpoint_floor = adopted.trunc;
             let mut sealed_segments = Vec::with_capacity(chain.len() + 1);
             for (id, base, end, crc32c) in &chain {
                 // Startup cost is bounded by the write frontier, never by

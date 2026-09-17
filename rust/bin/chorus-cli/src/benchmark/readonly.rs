@@ -227,7 +227,6 @@ pub(crate) async fn run(
             // library default would force `max_active_segment_bytes` to cover a
             // maximum-size record the benchmark never writes, which rejects
             // every small configuration.
-            max_record_bytes: args.payload_bytes,
             pipeline_window_bytes,
             max_inflight_bytes: WalEngineConfig::default().max_inflight_bytes,
             max_replica_lag_bytes: WalEngineConfig::default().max_replica_lag_bytes,

@@ -198,11 +198,28 @@ write.await_durable().await?; // Waits for a Chorus quorum, not an SST flush.
 db.close().await?;
 ```
 
+SlateDB's `Settings::flush_interval` configures its native WAL writer and does
+not control `ChorusWal`. The adapter submits each batch to Chorus during append,
+without waiting for a timer. Await the returned write handle as above to wait
+for the lowest-latency quorum durability signal. `Db::flush()` is a barrier for
+the already-submitted prefix; it does not dispatch those writes any sooner.
+
 Use `ChorusWal::with_config(volume, config)` to customize `WalEngineConfig`.
-The complete **encoded batch** must fit `max_record_bytes` (default 1 MiB).
-Oversized batches fail, rather than being split and losing atomicity. Admission
+Transaction-size policy belongs to the application. A complete encoded batch
+may exceed scheduling byte budgets: it exclusively reserves each admission
+budget and dispatches alone after the pipeline drains. It is never split into
+non-atomic records. The u32 record envelope and hard active-segment ceiling still
+apply. A replica lane may retain its ordinary budget plus one oversized record,
+but cannot accumulate more oversized records while over budget. Admission
 and completion failures close the adapter; ambiguous outcomes require reopening
 the database to resolve the recovered prefix, not retrying within that writer.
+
+The adapter requests a memtable flush after 4096 durable WAL records beyond the
+last frozen/persisted memtable boundary, bounding replay work for repeated
+overwrites even when the memtable remains small. GC runs concurrently with
+admission, with one active collection and a bounded collection request queue.
+Recovery's replay checkpoint does not authorize deleting older history: the
+retention floor advances only through explicit GC/truncation requests.
 
 Each SlateDB write batch is one Chorus record, preserving values, tombstones,
 merge operands, sequence numbers, and optional creation/expiry timestamps. A
@@ -230,55 +247,26 @@ It preserves the current WAL boundary, the active tail, and pending seals.
 Replay position and retention authority are separate: an older checkpoint can
 keep history below the current writer's startup replay position.
 
-Collection uses the attached writer's existing maintenance queue, serializing
-deletion with repair without fencing or pausing the append engine. Committed
-truncation floors and generation-guarded deletion tombstones provide the usual
-Chorus retry/recovery safety, including when a zone is unavailable. Successful
-collection wakes the rotation capacity check. This collector requires an open Db
-using the same initializer or a clone; separate-process/offline collection is
-not supported and returns an error rather than recovering/fencing the volume.
+The adapter owns the writer handle in a coordinator and submits GC through
+the existing public `truncate_before` API. A blocked append admission can be
+cancelled and retried while the coordinator services GC; application listeners
+run separately from completion processing. Separate-process/offline collection
+is not supported.
 
-Configure the GC builder's `GarbageCollectorOptions::wal_options` for interval,
-`min_age`, and `dry_run`. Nonzero `min_age` uses GCS object modification time
-(`update_time`): every existing replica must be strictly older than the cutoff
-before GC authorizes a segment's deletion. A repaired/replaced copy gets its own
-age; unavailable listings, missing/invalid timestamps, or future timestamps defer
-new truncation. This requires all zones to answer age checks; `min_age = 0`
-disables the age gate and allows degraded-zone truncation. Object age survives
-restarts and is independent of when a segment becomes unreferenced. No on-disk
-schema change is needed. Dry runs do not advance the floor or delete objects;
-they log the proposed floor using the same age checks. Background maintenance
-may still retry deletions authorized by an earlier real collection. Long-lived
-checkpoints, a long minimum age, or unavailable zones can still exhaust the
-bounded manifest directory; size rotation/GC settings for the retention window.
+Configure the GC builder's `GarbageCollectorOptions::wal_options` for interval
+and `dry_run`. **`min_age` is currently ignored.** Dry runs do not advance the
+floor or delete objects. Background maintenance may still retry deletions
+authorized by an earlier real collection.
 
 ### SlateDB readers
 
-`ChorusWal` also implements `slatedb::wal::WalReader`. A separate process can
-construct its own volume/transports and initializer for the same WAL namespace:
-
-```rust,ignore
-use std::sync::Arc;
-use chorus_client::slatedb::ChorusWal;
-use slatedb::{DbReader, DbReaderMode};
-
-let reader = DbReader::builder("orders", sst_store)
-    .with_reader_mode(DbReaderMode::ManagedCheckpoint)
-    .with_wal_reader(Arc::new(ChorusWal::new(volume)))
-    .build()
-    .await?;
-let value = reader.get(b"customer/7").await?;
-reader.close().await?;
-```
-
-Readers do not fence the writer. Managed readers retain history through SlateDB
-checkpoints, which the GC adapter honors. Direct iterators and `FollowLatest`
-readers do not pin history: if GC overtakes them, they return
-`WalError::WalTruncated` rather than skipping records. See the `ChorusWal` API
-docs for range semantics and polling configuration.
+SlateDB `WalReader` operations currently return an explicit unsupported error,
+without opening or fencing the volume. `with_reader_config` remains available
+for source compatibility but has no effect. Native Chorus readonly streams are
+unchanged.
 
 `WalAdmin` and WAL-based clones remain unsupported. Do not use SlateDB's default
-native-WAL reader/clone/delete tools for this backend; configure `with_wal_reader`.
+native-WAL reader/clone/delete tools for this backend.
 Chorus CLI recovery/repair commands fence the active writer and must run offline.
 
 From the repository's `rust` directory:
@@ -293,14 +281,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 The adapter tests run actual SlateDB databases over the loopback fake-GCS
 transport, including atomic batch replay, L0 checkpoint resume, takeover,
 quorum-only durability, failure propagation, corrupt-record rejection, retained
-checkpoints, scheduled GC with live writes, age/dry-run gates, and deletion retries.
+checkpoints, scheduled GC with live writes, dry-run behavior, and deletion retries.
 External integration tests use only the exported API to check mixed writes,
 deletes, reads, and scans against a reference model across GC and fresh-client
-reopens, plus writer takeover while a zone is unavailable. Reader tests cover
-active-tail quorum visibility, bounded ranges, canceled polls, rotation and
-takeover, corruption, GC lag, and real `DbReader` instances in managed, latest,
-and pinned-checkpoint modes with fresh transports. These tests use fake
-GCS servers, not live-cloud resources.
+reopens, plus writer takeover while a zone is unavailable. Readonly adapter
+tests verify explicit unsupported errors. These tests use fake GCS servers,
+not live-cloud resources.
 
 ## Storage setup
 

@@ -8,17 +8,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chorus_client::{
-    slatedb::ChorusWal, ClientConfig, GrpcReplicaFactory, ReadOnlyConfig, SegmentedVolume,
-    WalEngineConfig,
+    slatedb::ChorusWal, ClientConfig, GrpcReplicaFactory, SegmentedVolume, WalEngineConfig,
 };
 use chorus_fake_gcs::{FakeGcs, LatencyProfile, Operation, RunningFake, SimulatedLatency};
-use slatedb::admin::AdminBuilder;
 use slatedb::config::{
-    CheckpointOptions, CheckpointScope, CloseOptions, DbReaderOptions, FlushOptions, FlushType,
-    GarbageCollectorDirectoryOptions, GarbageCollectorOptions, Settings,
+    CloseOptions, FlushOptions, FlushType, GarbageCollectorDirectoryOptions,
+    GarbageCollectorOptions, Settings,
 };
 use slatedb::object_store::{memory::InMemory, ObjectStore};
-use slatedb::{Db, DbReader, DbReaderMode, GarbageCollectorBuilder, WriteBatch};
+use slatedb::{Db, DbReader, GarbageCollectorBuilder, WriteBatch};
 
 #[path = "slatedb_integration/startup_gc.rs"]
 mod startup_gc;
@@ -99,23 +97,6 @@ impl Fixture {
                 ..WalEngineConfig::default()
             },
         )
-        .with_reader_config(ReadOnlyConfig {
-            poll_interval: Duration::from_millis(5),
-            manifest_poll_interval: Duration::from_millis(5),
-        })
-    }
-
-    async fn open_reader(&self, mode: DbReaderMode) -> DbReader {
-        DbReader::builder("db", self.store.clone())
-            .with_reader_mode(mode)
-            .with_wal_reader(Arc::new(self.wal().await))
-            .with_options(DbReaderOptions {
-                manifest_poll_interval: Duration::from_millis(10),
-                ..DbReaderOptions::default()
-            })
-            .build()
-            .await
-            .unwrap()
     }
 
     async fn open(&self) -> (Db, GarbageCollectorBuilder<&'static str>) {
@@ -178,180 +159,17 @@ impl Fixture {
     }
 }
 
-async fn verify_reader(reader: &DbReader, model: &Model) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let mut scan = reader.scan(..).await.unwrap();
-            let mut actual = Model::new();
-            while let Some(row) = scan.next().await.unwrap() {
-                actual.insert(row.key, row.value);
-            }
-            if &actual == model {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("DbReader did not catch up with the reference model");
-    for index in 0..KEY_COUNT {
-        let key = key(index);
-        assert_eq!(reader.get(&key).await.unwrap(), model.get(&key).cloned());
-    }
-    let mut scan = reader.scan(key(20)..key(50)).await.unwrap();
-    let mut actual = Vec::new();
-    while let Some(row) = scan.next().await.unwrap() {
-        actual.push((row.key, row.value));
-    }
-    assert_eq!(
-        actual,
-        model
-            .range(key(20)..key(50))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<Vec<_>>()
-    );
-}
-
 #[tokio::test]
-async fn public_db_readers_follow_active_writes_gc_and_writer_takeover() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let fixture = Fixture::new().await;
-        let (old, _) = fixture.open().await;
-        let epoch = fixture.manifest().await["chorus.epoch"].clone();
-        let latest = fixture.open_reader(DbReaderMode::FollowLatest).await;
-        let managed = fixture.open_reader(DbReaderMode::ManagedCheckpoint).await;
-        assert_eq!(fixture.manifest().await["chorus.epoch"], epoch);
-        let mut model = Model::new();
-        let mut state = 0x9a37_u64;
-        // First batch stays in the active tail and is never flushed to L0.
-        write_batches(&old, &mut model, &mut state, 1).await;
-        verify_reader(&latest, &model).await;
-        verify_reader(&managed, &model).await;
-        write_batches(&old, &mut model, &mut state, 16).await;
-        verify_reader(&latest, &model).await;
-        verify_reader(&managed, &model).await;
-
-        fixture.servers[2].service.set_crashed(true).await;
-        let (new, collector) = fixture.open().await;
-        let collector = collector.build();
-        write_batches(&new, &mut model, &mut state, 8).await;
-        verify_reader(&latest, &model).await;
-        verify_reader(&managed, &model).await;
-        fixture.servers[2].service.set_crashed(false).await;
-        flush_l0(&new).await;
-        collector.run_gc_once().await;
-        write_batches(&new, &mut model, &mut state, 8).await;
-        verify_reader(&latest, &model).await;
-        verify_reader(&managed, &model).await;
-        let fresh = fixture.open_reader(DbReaderMode::FollowLatest).await;
-        verify_reader(&fresh, &model).await;
-        fresh.close().await.unwrap();
-        latest.close().await.unwrap();
-        managed.close().await.unwrap();
-        collector.run_gc_once().await;
-        assert!(
-            fixture.manifest().await["chorus.trunc"]
-                .parse::<u64>()
-                .unwrap()
-                > 0
-        );
-        let _ = old
-            .close_with_options(CloseOptions::default().with_flush_type(None))
-            .await;
-        close(&new).await;
-    })
-    .await
-    .expect("public DbReader lifecycle test timed out");
-}
-
-#[tokio::test]
-async fn public_checkpoint_reader_excludes_later_writes_and_survives_gc() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let fixture = Fixture::new().await;
-        let (db, collector) = fixture.open().await;
-        let collector = collector.build();
-        let mut model = Model::new();
-        let mut state = 0xc105_u64;
-        write_batches(&db, &mut model, &mut state, 12).await;
-        let checkpoint = db
-            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
-            .await
-            .unwrap();
-        let pinned_model = model.clone();
-        let pinned = fixture
-            .open_reader(DbReaderMode::Checkpoint(checkpoint.id))
-            .await;
-        verify_reader(&pinned, &pinned_model).await;
-        write_batches(&db, &mut model, &mut state, 12).await;
-        flush_l0(&db).await;
-        collector.run_gc_once().await;
-        assert_ne!(model, pinned_model);
-        verify_reader(&pinned, &pinned_model).await;
-        // Opening a fresh process at the old checkpoint must also work after GC.
-        let reopened = fixture
-            .open_reader(DbReaderMode::Checkpoint(checkpoint.id))
-            .await;
-        verify_reader(&reopened, &pinned_model).await;
-        let latest = fixture.open_reader(DbReaderMode::FollowLatest).await;
-        verify_reader(&latest, &model).await;
-        latest.close().await.unwrap();
-        reopened.close().await.unwrap();
-        pinned.close().await.unwrap();
-        close(&db).await;
-    })
-    .await
-    .expect("public checkpoint reader test timed out");
-}
-
-#[tokio::test]
-async fn public_wal_only_checkpoint_survives_gc_and_fresh_reader_reopen() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let fixture = Fixture::new().await;
-        let (first, _) = fixture.open().await;
-        let mut model = Model::new();
-        let mut state = 0xc105_u64;
-        write_batches(&first, &mut model, &mut state, 12).await;
-        first
-            .close_with_options(CloseOptions::default().with_flush_type(Some(FlushType::Wal)))
-            .await
-            .unwrap();
-        let admin = AdminBuilder::new("db", fixture.store.clone()).build();
-        let checkpoint = admin
-            .create_detached_checkpoint(&CheckpointOptions::default())
-            .await
-            .unwrap();
-        let manifest = admin
-            .read_manifest(Some(checkpoint.manifest_id))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(manifest.replay_after_wal_id(), 0);
-        assert_eq!(manifest.next_wal_sst_id(), 13);
-        assert!(manifest.l0().is_empty());
-        let pinned_model = model.clone();
-        let (db, collector) = fixture.open().await;
-        write_batches(&db, &mut model, &mut state, 12).await;
-        flush_l0(&db).await;
-        let collector = collector.build();
-        collector.run_gc_once().await;
-        assert_eq!(fixture.manifest().await["chorus.trunc"], "0");
-        let reopened = fixture
-            .open_reader(DbReaderMode::Checkpoint(checkpoint.id))
-            .await;
-        verify_reader(&reopened, &pinned_model).await;
-        reopened.close().await.unwrap();
-        admin.delete_checkpoint(checkpoint.id).await.unwrap();
-        collector.run_gc_once().await;
-        assert!(
-            fixture.manifest().await["chorus.trunc"]
-                .parse::<u64>()
-                .unwrap()
-                > 0
-        );
-        close(&db).await;
-    })
-    .await
-    .expect("WAL-only checkpoint retention test timed out");
+async fn public_db_reader_reports_unsupported() {
+    let fixture = Fixture::new().await;
+    let (db, _) = fixture.open().await;
+    db.put(b"key", b"value").await.unwrap();
+    let result = DbReader::builder("db", fixture.store.clone())
+        .with_wal_reader(Arc::new(fixture.wal().await))
+        .build()
+        .await;
+    assert!(result.is_err());
+    close(&db).await;
 }
 
 fn key(index: u64) -> Bytes {

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -83,7 +83,10 @@ struct LaneHandle {
 
 #[derive(Debug)]
 struct LaneBudget {
+    // Ordinary bytes and the single oversized record have independent budgets.
+    // Releasing one must never consume or reopen the other's allowance.
     outstanding: AtomicUsize,
+    oversized: AtomicBool,
     limit: AtomicUsize,
 }
 
@@ -91,6 +94,7 @@ impl LaneBudget {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             outstanding: AtomicUsize::new(0),
+            oversized: AtomicBool::new(false),
             limit: AtomicUsize::new(usize::MAX),
         })
     }
@@ -99,11 +103,30 @@ impl LaneBudget {
         self.limit.store(limit, Ordering::Relaxed);
     }
 
-    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<Arc<LaneReservation>> {
+    fn try_reserve(
+        self: &Arc<Self>,
+        bytes: usize,
+        oversized_record: bool,
+    ) -> Option<Arc<LaneReservation>> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        if bytes > limit {
+            if !oversized_record
+                || self
+                    .oversized
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+            {
+                return None;
+            }
+            return Some(Arc::new(LaneReservation {
+                budget: Arc::clone(self),
+                charge: LaneCharge::Oversized,
+            }));
+        }
         let mut current = self.outstanding.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(bytes)?;
-            if next > self.limit.load(Ordering::Relaxed) {
+            if next > limit {
                 return None;
             }
             match self.outstanding.compare_exchange_weak(
@@ -115,7 +138,7 @@ impl LaneBudget {
                 Ok(_) => {
                     return Some(Arc::new(LaneReservation {
                         budget: Arc::clone(self),
-                        bytes,
+                        charge: LaneCharge::Ordinary(bytes),
                     }));
                 }
                 Err(observed) => current = observed,
@@ -150,16 +173,25 @@ impl LaneStallTimeout {
 }
 
 #[derive(Debug)]
+enum LaneCharge {
+    Ordinary(usize),
+    Oversized,
+}
+
+#[derive(Debug)]
 struct LaneReservation {
     budget: Arc<LaneBudget>,
-    bytes: usize,
+    charge: LaneCharge,
 }
 
 impl Drop for LaneReservation {
     fn drop(&mut self) {
-        self.budget
-            .outstanding
-            .fetch_sub(self.bytes, Ordering::Relaxed);
+        match self.charge {
+            LaneCharge::Ordinary(bytes) => {
+                self.budget.outstanding.fetch_sub(bytes, Ordering::Relaxed);
+            }
+            LaneCharge::Oversized => self.budget.oversized.store(false, Ordering::Relaxed),
+        }
     }
 }
 
@@ -1454,7 +1486,7 @@ impl Writer {
         for zone in 0..self.lanes.len() {
             let reservation = self.lanes[zone]
                 .as_ref()
-                .and_then(|lane| lane.budget.try_reserve(batch_bytes));
+                .and_then(|lane| lane.budget.try_reserve(batch_bytes, chunks.len() == 1));
             if reservation.is_none() && self.lanes[zone].is_some() {
                 let lane = self.lanes[zone].take().expect("lane checked present");
                 lane.done.abort();
@@ -3229,30 +3261,32 @@ mod tests {
 
     #[test]
     fn matching_lane_groups_share_one_packed_wire_payload() {
-        let first = batch_descriptor(0, vec![Bytes::from_static(b"first")], 2);
+        let first = batch_descriptor(0, vec![Bytes::from_static(b"oversized")], 2);
         let second = batch_descriptor(first.end(), vec![Bytes::from_static(b"second")], 2);
         let first_bytes = first.chunks.iter().map(Bytes::len).sum();
         let second_bytes = second.chunks.iter().map(Bytes::len).sum();
         let first_budget = LaneBudget::new();
         let second_budget = LaneBudget::new();
+        first_budget.set_limit(second_bytes);
+        second_budget.set_limit(second_bytes);
         let group_one = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                first_budget.try_reserve(first_bytes).unwrap(),
+                first_budget.try_reserve(first_bytes, true).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                first_budget.try_reserve(second_bytes).unwrap(),
+                first_budget.try_reserve(second_bytes, false).unwrap(),
             ),
         ];
         let group_two = vec![
             LaneBatch::new(
                 Arc::clone(&first),
-                second_budget.try_reserve(first_bytes).unwrap(),
+                second_budget.try_reserve(first_bytes, true).unwrap(),
             ),
             LaneBatch::new(
                 Arc::clone(&second),
-                second_budget.try_reserve(second_bytes).unwrap(),
+                second_budget.try_reserve(second_bytes, false).unwrap(),
             ),
         ];
 
@@ -3262,10 +3296,29 @@ mod tests {
         assert!(Arc::ptr_eq(&packed_one, &packed_two));
         assert_eq!(
             packed_one.chunks(),
-            &[Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+            &[
+                Bytes::from_static(b"oversized"),
+                Bytes::from_static(b"second")
+            ]
         );
+        assert!(first_budget.try_reserve(1, false).is_none());
+        assert!(first_budget.try_reserve(first_bytes, true).is_none());
+        // Ownership can outlive a cancelled/retired lane group. Only the last
+        // reference releases the oversized allowance.
+        let held = Arc::clone(group_one[0].reservation.as_ref().unwrap());
         drop(group_one);
         drop(group_two);
+        assert!(first_budget.try_reserve(first_bytes, true).is_none());
+        let ordinary = first_budget.try_reserve(second_bytes, false).unwrap();
+        drop(held);
+        let oversized = first_budget.try_reserve(first_bytes, true).unwrap();
+        assert!(first_budget.try_reserve(first_bytes, true).is_none());
+        // Releasing ordinary bytes must not reopen the oversized slot.
+        drop(ordinary);
+        assert!(first_budget.try_reserve(first_bytes, true).is_none());
+        drop(oversized);
+        assert!(first_budget.try_reserve(first_bytes, false).is_none());
+        assert!(first_budget.try_reserve(first_bytes, true).is_some());
         assert!(first
             .packed_groups
             .lock()
@@ -3876,7 +3929,6 @@ mod tests {
             writer,
             crate::WalEngineConfig {
                 queue_capacity_bytes: 2 * encoded_bytes,
-                max_record_bytes: payload.len(),
                 pipeline_window_bytes: encoded_bytes,
                 max_inflight_bytes: encoded_bytes,
                 max_replica_lag_bytes: encoded_bytes,

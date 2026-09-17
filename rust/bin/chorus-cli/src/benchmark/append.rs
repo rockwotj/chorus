@@ -71,6 +71,9 @@ impl AppendArgs {
         {
             bail!("duration and all size/concurrency counts must be positive");
         }
+        if self.payload_bytes > self.max_record_bytes {
+            bail!("--payload-bytes exceeds the application's --max-record-bytes policy");
+        }
         Ok(())
     }
 }
@@ -214,7 +217,6 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
     let mut handle = recovery
         .start(WalEngineConfig {
             queue_capacity_bytes: args.queue_capacity_bytes,
-            max_record_bytes: args.max_record_bytes,
             pipeline_window_bytes: args.pipeline_window_bytes,
             max_inflight_bytes: args.max_inflight_bytes,
             max_replica_lag_bytes: args.max_replica_lag_bytes,

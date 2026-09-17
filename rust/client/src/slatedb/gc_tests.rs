@@ -1,5 +1,5 @@
 use super::*;
-use chorus_fake_gcs::proto::{storage_server::Storage, GetObjectRequest, Timestamp};
+use chorus_fake_gcs::proto::Timestamp;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
     CheckpointOptions, CheckpointScope, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
@@ -16,12 +16,6 @@ fn timestamp(time: SystemTime) -> Timestamp {
         seconds: time.as_secs() as i64,
         nanos: time.subsec_nanos() as i32,
     }
-}
-
-async fn first_segment(servers: &[RunningFake]) -> String {
-    let metadata = manifest(servers).await;
-    let id = metadata["chorus.segments"].split(':').next().unwrap();
-    format!("slatedb-test/segments/{id}")
 }
 
 async fn manifest(servers: &[RunningFake]) -> HashMap<String, String> {
@@ -121,6 +115,12 @@ async fn gc_retention_can_precede_the_writer_replay_checkpoint() {
     let new_manifest = manifest(&servers).await;
     assert_eq!(old_manifest["chorus.epoch"], new_manifest["chorus.epoch"]);
     assert_eq!(old_manifest["chorus.owner"], new_manifest["chorus.owner"]);
+    // Decoupling replay must not let a later request resurrect deleted history.
+    assert!(wal
+        .collect(retained(0), Duration::ZERO, false)
+        .await
+        .is_err());
+    assert_eq!(floor(&servers).await, collected);
     writer.wal_writer.append(&[row(17)]).await.unwrap();
     writer.wal_writer.flush().await.unwrap().await.unwrap();
     writer.wal_writer.close().await.unwrap();
@@ -135,14 +135,13 @@ async fn gc_retention_can_precede_the_writer_replay_checkpoint() {
 }
 
 #[tokio::test]
-async fn gc_uses_object_age_on_first_eligible_pass_after_restart_and_dry_run() {
+async fn gc_after_restart_preserves_dry_run() {
     let (servers, wal, mut writer) = seeded(0).await;
     let age = Duration::from_secs(3600);
     let before = names(&servers, 0).await;
     wal.collect(retained(0), age, false).await.unwrap();
     writer.wal_writer.close().await.unwrap();
-    // A new initializer discards all process-local GC state. Old storage
-    // timestamps still authorize deletion on its first eligible pass.
+    // A new initializer discards all process-local GC state.
     let fresh = ChorusWal::with_config(wal.volume.clone(), wal.config.clone());
     let mut writer = initialize(&fresh, 0).await;
     fresh
@@ -153,130 +152,46 @@ async fn gc_uses_object_age_on_first_eligible_pass_after_restart_and_dry_run() {
     fresh.collect(retained(13), age, true).await.unwrap();
     assert_eq!(manifest(&servers).await, snapshot);
     assert!(before.is_subset(&names(&servers, 0).await));
-    fresh.collect(retained(13), age, false).await.unwrap();
+    // Slow physical deletion must not hold up unrelated write admission.
+    use chorus_fake_gcs::Operation;
+    servers[0].service.reset_operation_counts().await;
+    servers[0]
+        .service
+        .inject_delay(Operation::Delete, Duration::from_secs(1))
+        .await;
+    let collecting = fresh.clone();
+    let task = tokio::spawn(async move { collecting.collect(retained(13), age, false).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while servers[0].service.operation_count(Operation::Delete).await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(500), async {
+        writer.wal_writer.append(&[row(17)]).await.unwrap();
+        writer.wal_writer.flush().await.unwrap().await.unwrap();
+    })
+    .await
+    .expect("physical GC blocked write admission or durability");
+    assert!(!task.is_finished());
+    task.await.unwrap().unwrap();
     assert!(floor(&servers).await > 0);
     assert!(!before.is_subset(&names(&servers, 0).await));
     writer.wal_writer.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn gc_defers_young_objects_even_when_they_are_unreferenced() {
+async fn gc_ignores_min_age_but_preserves_dry_run() {
     let (servers, wal, mut writer) = seeded_at(0, timestamp(SystemTime::now())).await;
     let age = Duration::from_secs(3600);
     let before = names(&servers, 0).await;
     wal.collect(retained(13), age, true).await.unwrap();
-    wal.collect(retained(13), age, false).await.unwrap();
     assert_eq!(floor(&servers).await, 0);
     assert_eq!(names(&servers, 0).await, before);
-    writer.wal_writer.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn gc_requires_old_valid_timestamps_on_every_existing_copy() {
-    let (servers, wal, mut writer) = seeded(0).await;
-    let age = Duration::from_secs(3600);
-    let object = first_segment(&servers).await;
-    let bucket = "projects/_/buckets/zone-2";
-    let before = names(&servers, 2).await;
-    for time in [
-        None,
-        Some(Timestamp {
-            seconds: 0,
-            nanos: -1,
-        }),
-        Some(Timestamp {
-            seconds: 0,
-            nanos: 1_000_000_000,
-        }),
-        Some(Timestamp {
-            seconds: i64::MAX,
-            nanos: 0,
-        }),
-        Some(timestamp(SystemTime::now())),
-        Some(timestamp(SystemTime::now() + age)),
-    ] {
-        servers[2]
-            .service
-            .set_object_update_time(bucket, &object, time)
-            .await;
-        wal.collect(retained(13), age, true).await.unwrap();
-        wal.collect(retained(13), age, false).await.unwrap();
-        assert_eq!(floor(&servers).await, 0, "timestamp {time:?}");
-        assert_eq!(names(&servers, 2).await, before);
-    }
-    servers[2]
-        .service
-        .set_object_update_time(bucket, &object, Some(Timestamp::default()))
-        .await;
     wal.collect(retained(13), age, false).await.unwrap();
     assert!(floor(&servers).await > 0);
-    writer.wal_writer.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn gc_defers_age_authorization_until_an_unavailable_zone_returns() {
-    let (servers, wal, mut writer) = seeded(0).await;
-    let age = Duration::from_secs(3600);
-    let before = names(&servers, 0).await;
-    servers[2].service.set_crashed(true).await;
-    wal.collect(retained(13), age, false).await.unwrap();
-    assert_eq!(floor(&servers).await, 0);
-    assert_eq!(names(&servers, 0).await, before);
-    servers[2].service.set_crashed(false).await;
-    wal.collect(retained(13), age, false).await.unwrap();
-    assert!(floor(&servers).await > 0);
-    writer.wal_writer.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn gc_rechecks_the_storage_age_of_a_repaired_replica() {
-    let (servers, wal, mut writer) = seeded(0).await;
-    let object = first_segment(&servers).await;
-    let bucket = "projects/_/buckets/zone-2";
-    let request = || {
-        tonic::Request::new(GetObjectRequest {
-            bucket: bucket.into(),
-            object: object.clone(),
-            ..Default::default()
-        })
-    };
-    let original = servers[2]
-        .service
-        .get_object(request())
-        .await
-        .unwrap()
-        .into_inner();
-    writer.wal_writer.close().await.unwrap();
-    let repaired_at = timestamp(SystemTime::now());
-    servers[2].service.set_clock(repaired_at).await;
-    assert!(
-        servers[2]
-            .service
-            .diverge_byte_for(bucket, &object, 0)
-            .await
-    );
-    let mut writer = initialize(&wal, 0).await;
-    // Queue behind startup repair without granting deletion authority.
-    wal.collect(retained(0), Duration::ZERO, false)
-        .await
-        .unwrap();
-    let repaired = servers[2]
-        .service
-        .get_object(request())
-        .await
-        .unwrap()
-        .into_inner();
-    assert_ne!(repaired.generation, original.generation);
-    assert_eq!(repaired.update_time, Some(repaired_at));
-    wal.collect(retained(13), Duration::from_secs(3600), false)
-        .await
-        .unwrap();
-    assert_eq!(
-        floor(&servers).await,
-        0,
-        "the youngest copy must protect the prefix"
-    );
-    assert!(names(&servers, 0).await.contains(&object));
+    assert!(names(&servers, 0).await.len() < before.len());
     writer.wal_writer.close().await.unwrap();
 }
 
@@ -587,37 +502,45 @@ async fn put_range(db: &Db, first: u64, end: u64) {
 
 #[tokio::test]
 async fn slatedb_scheduled_gc_reclaims_storage_while_the_database_keeps_writing() {
-    let (servers, volume) = volume().await;
-    let wal = ChorusWal::with_config(volume.clone(), config());
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = open_with_gc(&wal, store.clone(), Some(Duration::from_millis(10))).await;
-    put_range(&db, 0, 16).await;
-    db.flush_with_options(FlushOptions {
-        flush_type: FlushType::MemTable,
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while floor(&servers).await == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    put_range(&db, 16, 20).await;
-    assert_eq!(
-        db.get(b"key-0").await.unwrap(),
-        Some(Bytes::from(vec![42; 100]))
-    );
-    close(&db).await;
-    let reopened = open(&volume, store).await;
-    for index in 0..20 {
+    // Bound the entire workflow, not just the GC poll: an admission/maintenance
+    // deadlock must fail the test rather than consume the CI job's six hours.
+    // This is a liveness guard, not a latency assertion; leave enough headroom
+    // for a loaded runner executing the fake-GCS-heavy suite in parallel.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (servers, volume) = volume().await;
+        let wal = ChorusWal::with_config(volume.clone(), config());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = open_with_gc(&wal, store.clone(), Some(Duration::from_millis(10))).await;
+        put_range(&db, 0, 16).await;
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while floor(&servers).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        put_range(&db, 16, 20).await;
         assert_eq!(
-            reopened.get(format!("key-{index}")).await.unwrap(),
+            db.get(b"key-0").await.unwrap(),
             Some(Bytes::from(vec![42; 100]))
         );
-    }
-    close(&reopened).await;
+        close(&db).await;
+        let reopened = open(&volume, store).await;
+        for index in 0..20 {
+            assert_eq!(
+                reopened.get(format!("key-{index}")).await.unwrap(),
+                Some(Bytes::from(vec![42; 100]))
+            );
+        }
+        close(&reopened).await;
+    })
+    .await
+    .expect("scheduled GC blocked the database lifecycle");
 }
 
 #[tokio::test]

@@ -94,7 +94,6 @@ fn manifest_latency_profile(seed: u64) -> LatencyProfile {
 fn production_engine_config() -> WalEngineConfig {
     WalEngineConfig {
         queue_capacity_bytes: 64 * 1024,
-        max_record_bytes: 16 * 1024,
         pipeline_window_bytes: 32 * 1024,
         max_inflight_bytes: 64 * 1024,
         max_replica_lag_bytes: 64 * 1024,
@@ -643,7 +642,6 @@ async fn run_lane_stall_recheck_scenario(seed: u64, zone: FakeGcs, close_code: C
     let mut handle = recovery
         .start(WalEngineConfig {
             queue_capacity_bytes: 16 * 1024,
-            max_record_bytes: 1024,
             pipeline_window_bytes: 4 * 1028,
             max_inflight_bytes: 16 * 1024,
             max_replica_lag_bytes: 16 * 1024,

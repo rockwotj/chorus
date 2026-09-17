@@ -34,10 +34,9 @@ pub(super) fn encode(rows: &[RowEntry], max_bytes: usize) -> Result<Bytes, WalEr
             .ok_or_else(|| internal_error("batch size overflow"))?;
     }
     if size > max_bytes {
-        return Err(super::wal_error(crate::Error::RecordTooLarge {
-            max: max_bytes,
-            actual: size,
-        }));
+        return Err(internal_error(&format!(
+            "encoded SlateDB batch is {size} bytes, exceeding the {max_bytes}-byte record limit"
+        )));
     }
     let mut bytes = BytesMut::with_capacity(size);
     bytes.extend_from_slice(MAGIC);

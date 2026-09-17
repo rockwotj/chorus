@@ -27,7 +27,7 @@ impl Progress {
     }
 }
 
-/// Runs on the engine task. Only replace a fixed-size snapshot here; SlateDB
+/// Runs on the adapter completion task. Only replace a fixed-size snapshot here; SlateDB
 /// listeners run separately and cannot hold up engine admission/completion.
 pub(super) fn completion(
     updates: watch::Sender<Progress>,

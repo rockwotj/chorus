@@ -30,27 +30,27 @@ pub struct WalEngineConfig {
     ///
     /// This is one combined bound across the handle-to-engine channel and the
     /// engine's internal queue, not a separate allowance for each stage. The
-    /// default is 64 MiB, sixteen times the default pipeline window. Must fit
-    /// one maximum-size encoded record.
+    /// default is 64 MiB, sixteen times the default pipeline window. A record
+    /// larger than the budget reserves the entire budget and runs alone.
     pub queue_capacity_bytes: usize,
-    /// Maximum application payload bytes accepted in one record.
-    pub max_record_bytes: usize,
     /// Maximum encoded WAL bytes dispatched but not yet logically committed.
     /// Budget is returned per record as ordered quorum completions arrive.
     ///
     /// The provider bounds an append by the bytes it carries, not by the number
     /// of records packed into it, so this window is what decides how much data
-    /// one dispatched append may hold. The default is 4 MiB. Must fit one
-    /// maximum-size encoded record.
+    /// one dispatched append may hold. The default is 4 MiB. One oversized
+    /// record may exceed the window only after earlier records commit.
     pub pipeline_window_bytes: usize,
     /// Maximum encoded WAL bytes admitted but not yet resolved through the
     /// ordered quorum completion stream. Admission waits for this byte budget
-    /// before taking ownership of another record.
+    /// before taking ownership of another record. An oversized record reserves
+    /// the entire budget, excluding other admitted records until it completes.
     pub max_inflight_bytes: usize,
     /// Maximum unacknowledged encoded bytes retained for one replica lane.
     /// A lane that falls farther behind is dropped so a healthy quorum can
     /// continue without retaining an unbounded retry suffix. Must be at
-    /// least [`max_inflight_bytes`](Self::max_inflight_bytes).
+    /// least [`max_inflight_bytes`](Self::max_inflight_bytes). One oversized
+    /// record may exceed this budget; another cannot until the lane catches up.
     pub max_replica_lag_bytes: usize,
     /// Maximum interval in which a lane with retained writes may make no
     /// durable-tail progress before it is shed.
@@ -81,8 +81,9 @@ pub struct WalEngineConfig {
     /// rotation until truncation removes retained entries. Admission stops
     /// cleanly at this ceiling with [`Error::ActiveSegmentFull`] instead of
     /// letting the active object grow toward the provider limit or poisoning
-    /// the healthy writer. The ceiling must fit one maximum encoded record and
-    /// be at least the advisory rotation target.
+    /// the healthy writer. This physical-object ceiling is not a scheduling
+    /// budget and has no oversized-record exception. It must be at least the
+    /// advisory rotation target.
     pub max_active_segment_bytes: usize,
     /// Interval between background maintenance passes.
     ///
@@ -104,7 +105,6 @@ impl Default for WalEngineConfig {
     fn default() -> Self {
         Self {
             queue_capacity_bytes: DEFAULT_QUEUE_CAPACITY_BYTES,
-            max_record_bytes: 1024 * 1024,
             pipeline_window_bytes: DEFAULT_PIPELINE_WINDOW_BYTES,
             max_inflight_bytes: 64 * 1024 * 1024,
             max_replica_lag_bytes: 64 * 1024 * 1024,
@@ -123,14 +123,6 @@ impl WalEngineConfig {
         if self.queue_capacity_bytes == 0 {
             return Err(Error::InvalidConfig("queue_capacity_bytes must be nonzero"));
         }
-        if self.max_record_bytes == 0 {
-            return Err(Error::InvalidConfig("max_record_bytes must be nonzero"));
-        }
-        if self.max_record_bytes > RecordFrame::MAX_PAYLOAD_BYTES {
-            return Err(Error::InvalidConfig(
-                "max_record_bytes exceeds the record format limit",
-            ));
-        }
         if self.pipeline_window_bytes == 0 {
             return Err(Error::InvalidConfig(
                 "pipeline_window_bytes must be nonzero",
@@ -142,25 +134,6 @@ impl WalEngineConfig {
         if self.max_replica_lag_bytes == 0 {
             return Err(Error::InvalidConfig(
                 "max_replica_lag_bytes must be nonzero",
-            ));
-        }
-        let max_encoded_record = self
-            .max_record_bytes
-            .checked_add(RecordFrame::HEADER_LEN)
-            .ok_or(Error::InvalidConfig("max_record_bytes is too large"))?;
-        if max_encoded_record > self.max_inflight_bytes {
-            return Err(Error::InvalidConfig(
-                "max_inflight_bytes must fit one maximum-size encoded record",
-            ));
-        }
-        if max_encoded_record > self.queue_capacity_bytes {
-            return Err(Error::InvalidConfig(
-                "queue_capacity_bytes must fit one maximum-size encoded record",
-            ));
-        }
-        if max_encoded_record > self.pipeline_window_bytes {
-            return Err(Error::InvalidConfig(
-                "pipeline_window_bytes must fit one maximum-size encoded record",
             ));
         }
         if self.max_replica_lag_bytes < self.max_inflight_bytes {
@@ -187,11 +160,6 @@ impl WalEngineConfig {
         if self.max_active_segment_bytes == 0 {
             return Err(Error::InvalidConfig(
                 "max_active_segment_bytes must be nonzero",
-            ));
-        }
-        if self.max_active_segment_bytes < max_encoded_record {
-            return Err(Error::InvalidConfig(
-                "max_active_segment_bytes must fit one maximum-size encoded record",
             ));
         }
         if self.max_active_segment_bytes < self.max_segment_bytes {
@@ -251,8 +219,6 @@ impl Future for AppendCompletion {
 
 enum Completion {
     Receipt(oneshot::Sender<Result<AppendReceipt, Error>>),
-    #[cfg(feature = "slatedb")]
-    Notify(CommitNotification),
 }
 
 impl Completion {
@@ -261,27 +227,6 @@ impl Completion {
             Self::Receipt(sender) => {
                 let _ = sender.send(result);
             }
-            #[cfg(feature = "slatedb")]
-            Self::Notify(mut notification) => (notification.0.take().unwrap())(result),
-        }
-    }
-}
-
-// Only the adapter's nonblocking progress publisher runs here, never SlateDB
-// listeners. This replaces a per-record oneshot for watermark-based consumers.
-#[cfg(feature = "slatedb")]
-type CommitCallback = Box<dyn FnOnce(Result<AppendReceipt, Error>) + Send>;
-
-#[cfg(feature = "slatedb")]
-struct CommitNotification(Option<CommitCallback>);
-
-#[cfg(feature = "slatedb")]
-impl Drop for CommitNotification {
-    fn drop(&mut self) {
-        if let Some(notify) = self.0.take() {
-            // Aborting/panicking must also release durability waiters. Like a
-            // dropped oneshot sender, this does not claim the write rolled back.
-            notify(Err(Error::Closed));
         }
     }
 }
@@ -305,7 +250,8 @@ pub struct WalHandle {
     maintenance_task: tokio::task::JoinHandle<()>,
     rotation_recheck: mpsc::Sender<()>,
     next_seqno: u64,
-    max_record_bytes: usize,
+    max_inflight_bytes: usize,
+    queue_capacity_bytes: usize,
     max_active_segment_bytes: usize,
     total_admitted_bytes: u128,
     active_capacity: watch::Receiver<ActiveSegmentCapacity>,
@@ -477,10 +423,10 @@ struct EngineControl {
 impl WalEngine {
     /// Start the background engine around an already recovered writer.
     ///
-    /// Configuration limits must be nonzero and internally consistent: byte
-    /// budgets must fit a maximum encoded record, replica lag must cover the
-    /// in-flight budget, and the hard active-segment ceiling must cover the
-    /// advisory rotation target. Invalid limits return [`Error::InvalidConfig`].
+    /// Configuration limits must be nonzero and internally consistent: replica
+    /// lag must cover the in-flight budget, and the hard active-segment ceiling
+    /// must cover the advisory rotation target. Invalid limits return
+    /// [`Error::InvalidConfig`].
     /// This function requires a running Tokio runtime and returns immediately
     /// after spawning the task.
     pub fn start(mut writer: SegmentedWriter, config: WalEngineConfig) -> Result<WalHandle, Error> {
@@ -496,8 +442,8 @@ impl WalEngine {
         if active_segment_bytes != 0 && !active_segment_seal_room {
             return Err(Error::SegmentDirectoryFull);
         }
-        let max_record_bytes = config.max_record_bytes;
         let max_inflight_bytes = config.max_inflight_bytes;
+        let queue_capacity_bytes = config.queue_capacity_bytes;
         let max_active_segment_bytes = config.max_active_segment_bytes;
         let shutdown_timeout = config.shutdown_timeout;
         let inflight_bytes = Arc::new(Semaphore::new(max_inflight_bytes));
@@ -568,7 +514,8 @@ impl WalEngine {
             maintenance_task,
             rotation_recheck,
             next_seqno,
-            max_record_bytes,
+            max_inflight_bytes,
+            queue_capacity_bytes,
             max_active_segment_bytes,
             total_admitted_bytes: 0,
             active_capacity,
@@ -581,13 +528,6 @@ impl WalEngine {
 }
 
 impl WalHandle {
-    #[cfg(feature = "slatedb")]
-    pub(crate) fn gc_handle(&self) -> GcHandle {
-        GcHandle {
-            maintenance: self.maintenance.clone(),
-            rotation_recheck: self.rotation_recheck.clone(),
-        }
-    }
     /// Admit one caller-numbered opaque record without waiting for durability.
     ///
     /// Before waiting, this method verifies that `seqno` is exactly the next
@@ -598,7 +538,9 @@ impl WalHandle {
     /// [`Error::ActiveSegmentFull`]. Neither condition consumes `seqno`;
     /// truncation may free directory capacity, after which the same append can
     /// be retried. Otherwise this waits for the record's encoded size in both
-    /// the in-flight and queue byte budgets. On success the WAL owns the record
+    /// the in-flight and queue byte budgets, reserving an entire budget when
+    /// one record exceeds it. Applications enforce transaction-size policy;
+    /// the WAL checks only format and physical-segment limits. On success the WAL owns the record
     /// and the returned [`AppendCompletion`] may be moved to another task. Await
     /// that completion before applying the transaction to the database.
     ///
@@ -615,25 +557,6 @@ impl WalHandle {
         self.enqueue_inner(seqno, record, || {
             let (sender, receiver) = oneshot::channel();
             (Completion::Receipt(sender), AppendCompletion { receiver })
-        })
-        .await
-    }
-
-    /// Publish ordered completion directly into the adapter's latest-progress
-    /// state, without allocating or queuing an individual completion future.
-    /// The callback must not block or invoke external listeners.
-    #[cfg(feature = "slatedb")]
-    pub(crate) async fn enqueue_append_notifying(
-        &mut self,
-        seqno: WalSeqNo,
-        record: Bytes,
-        notify: impl FnOnce(Result<AppendReceipt, Error>) + Send + 'static,
-    ) -> Result<(), Error> {
-        self.enqueue_inner(seqno, record, || {
-            (
-                Completion::Notify(CommitNotification(Some(Box::new(notify)))),
-                (),
-            )
         })
         .await
     }
@@ -657,16 +580,9 @@ impl WalHandle {
             return Err(Error::SequenceExhausted);
         }
         let payload_bytes = record.len();
-        if payload_bytes > self.max_record_bytes {
-            return Err(Error::RecordTooLarge {
-                max: self.max_record_bytes,
-                actual: payload_bytes,
-            });
-        }
-
         let record = RecordFrame { payload: record };
         let encoded_bytes = record.encoded_len().map_err(|_| Error::RecordTooLarge {
-            max: self.max_record_bytes.min(RecordFrame::MAX_PAYLOAD_BYTES),
+            max: RecordFrame::MAX_PAYLOAD_BYTES,
             actual: payload_bytes,
         })?;
         let capacity = *self.active_capacity.borrow_and_update();
@@ -705,11 +621,13 @@ impl WalHandle {
         let permits = u32::try_from(encoded_bytes)
             .map_err(|_| Error::Internal("encoded record length exceeds u32".into()))?;
         let inflight_bytes = Arc::clone(&self.inflight_bytes)
-            .acquire_many_owned(permits)
+            .acquire_many_owned(permits.min(self.max_inflight_bytes.min(u32::MAX as usize) as u32))
             .await
             .map_err(|_| Error::Closed)?;
         let queue_permit = Arc::clone(&self.queue_slots)
-            .acquire_many_owned(permits)
+            .acquire_many_owned(
+                permits.min(self.queue_capacity_bytes.min(u32::MAX as usize) as u32),
+            )
             .await
             .map_err(|_| Error::Closed)?;
         let queue_slot =
@@ -738,8 +656,9 @@ impl WalHandle {
     /// Advance the application checkpoint floor and delete eligible sealed
     /// segments.
     ///
-    /// `floor` is the first record the database still needs. Call this only after
-    /// the database has durably checkpointed every record before that boundary.
+    /// `floor` is the first record any database checkpoint or retained snapshot
+    /// still needs. Call this only after the database has durably checkpointed
+    /// every record before that boundary and no retained reader needs it.
     /// The WAL deletes only whole sealed segments; it never truncates the active
     /// segment or deletes a segment containing `floor`.
     ///
@@ -750,14 +669,23 @@ impl WalHandle {
     /// truncation also makes the engine re-read directory capacity, so an active
     /// segment held at [`Error::ActiveSegmentFull`] can rotate and resume
     /// admission once enough entries are removed.
-    pub async fn truncate_before(&self, floor: WalSeqNo) -> Result<TruncationReport, Error> {
-        let report = self.maintenance.truncate(floor).await?;
-        // The maintenance manifest and writer manifest are independent
-        // handles. One pending wake is enough to make the engine refresh its
-        // copy after every completed truncation: if the slot is full, its
-        // queued wake has not been received yet; otherwise this call fills it.
-        let _ = self.rotation_recheck.try_send(());
-        Ok(report)
+    /// The returned future owns its maintenance connection, not a borrow of
+    /// this handle, so callers can continue admitting records while it runs.
+    pub fn truncate_before(
+        &self,
+        floor: WalSeqNo,
+    ) -> impl Future<Output = Result<TruncationReport, Error>> + Send + 'static {
+        let maintenance = self.maintenance.clone();
+        let rotation_recheck = self.rotation_recheck.clone();
+        async move {
+            let report = maintenance.truncate(floor).await?;
+            // The maintenance manifest and writer manifest are independent
+            // handles. One pending wake is enough to make the engine refresh its
+            // copy after every completed truncation: if the slot is full, its
+            // queued wake has not been received yet; otherwise this call fills it.
+            let _ = rotation_recheck.try_send(());
+            Ok(report)
+        }
     }
 
     /// Consume the admission handle, abort every owned task, and await their
@@ -893,33 +821,6 @@ impl WalHandle {
                 })
             }
         }
-    }
-}
-
-/// Collection-only capability. Cloning it never grants writer ownership.
-#[cfg(feature = "slatedb")]
-#[derive(Clone)]
-pub(crate) struct GcHandle {
-    maintenance: crate::maintenance::MaintenanceHandle,
-    rotation_recheck: mpsc::Sender<()>,
-}
-
-#[cfg(feature = "slatedb")]
-impl GcHandle {
-    pub(crate) async fn collect(
-        &self,
-        retain_from: u64,
-        min_age: Duration,
-        dry_run: bool,
-    ) -> Result<TruncationReport, Error> {
-        let report = self
-            .maintenance
-            .collect(retain_from, min_age, dry_run)
-            .await?;
-        if !dry_run {
-            let _ = self.rotation_recheck.try_send(());
-        }
-        Ok(report)
     }
 }
 
@@ -1179,18 +1080,19 @@ async fn run_engine(
             let mut dispatched_bytes = 0usize;
             while let Some(Command::Append(append)) = state.queue.front() {
                 let encoded_bytes = append.encoded_bytes();
-                if encoded_bytes > room {
+                // Never split an atomic record to fit the scheduling window.
+                // An oversized record runs alone after the pipeline drains.
+                if encoded_bytes > room && (state.pending_records != 0 || !appends.is_empty()) {
                     break;
                 }
                 let Some(Command::Append(append)) = state.queue.pop_front() else {
                     unreachable!();
                 };
-                room -= encoded_bytes;
+                room = room.saturating_sub(encoded_bytes);
                 dispatched_bytes += encoded_bytes;
                 appends.push(append);
             }
-            // The window fits one maximum-size encoded record, so an empty
-            // batch means the retained records need a completion first.
+            // An empty batch means earlier records must complete first.
             if appends.is_empty() {
                 break;
             }
