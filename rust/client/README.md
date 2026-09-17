@@ -181,20 +181,13 @@ it directly to SlateDB. Do **not** recover/start it separately:
 
 ```rust,ignore
 use chorus_client::slatedb::ChorusWal;
-use slatedb::{Db, GarbageCollectorBuilder, Settings};
+use slatedb::{Db, GarbageCollectorBuilder};
 use std::sync::Arc;
 
 let wal = ChorusWal::new(volume);
 let gc = GarbageCollectorBuilder::new("databases/orders", sst_object_store.clone())
     .with_wal_gc(Arc::new(wal.clone()));
-let settings = Settings {
-    // Chorus begins replicating every admitted batch immediately; do not add
-    // SlateDB's native timed-WAL flushing policy to this configuration.
-    flush_interval: None,
-    ..Settings::default()
-};
 let db = Db::builder("databases/orders", sst_object_store)
-    .with_settings(settings)
     .with_wal_writer(Box::new(wal))
     .with_gc_builder(gc)
     .build()
@@ -205,10 +198,11 @@ write.await_durable().await?; // Waits for a Chorus quorum, not an SST flush.
 db.close().await?;
 ```
 
-Use `flush_interval: None`, rather than a zero duration. Chorus controls WAL
-durability for this adapter and begins replicating each admitted batch without a
-timer. Disabling SlateDB's native interval makes that low-latency policy explicit;
-a zero interval would instead request continuously scheduled timer flushes.
+SlateDB's `Settings::flush_interval` configures its native WAL writer and does
+not control `ChorusWal`. The adapter submits each batch to Chorus during append,
+without waiting for a timer. Await the returned write handle as above to wait
+for the lowest-latency quorum durability signal. `Db::flush()` is a barrier for
+the already-submitted prefix; it does not dispatch those writes any sooner.
 
 Use `ChorusWal::with_config(volume, config)` to customize `WalEngineConfig`.
 Transaction-size policy belongs to the application. A complete encoded batch
