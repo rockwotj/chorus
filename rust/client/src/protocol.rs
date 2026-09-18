@@ -1995,9 +1995,12 @@ impl Drop for AbortLanesOnDrop {
     }
 }
 
-/// The per-lane writer receives batches in offset order, snapshots and drains
-/// everything currently queued, and sends the resulting group with a flush on
-/// its final data message without waiting for earlier flush acknowledgments.
+/// The per-lane writer receives batches in offset order. It keeps at most one
+/// flushed group outstanding: while that group becomes durable, later batches
+/// accumulate in the work channel. Once the durable tail covers the group, the
+/// lane snapshots and drains everything currently queued and sends that next
+/// group with one flush on its final data message. An individual engine batch
+/// is therefore never split, while adjacent batches may still be coalesced.
 /// Durable-tail movement publishes one monotonic byte watermark. On a session
 /// disturbance it resumes via the session handle and resends the retained
 /// unacknowledged suffix; a fence or exhausted retries publishes one terminal
@@ -2170,7 +2173,13 @@ async fn run_lane(
                     }
                 }
             }
-            batch = work.recv(), if !closed => match batch {
+            // Do not pipeline another flush behind one that has not become
+            // durable. Keeping the work arm closed makes concurrent arrivals
+            // accumulate naturally; after progress releases the retained
+            // group, the existing snapshot-and-drain below coalesces all work
+            // that is already ready. An idle lane still flushes its first
+            // batch immediately, without a timer or a target fill level.
+            batch = work.recv(), if !closed && lane.retained.is_empty() => match batch {
                 Some(batch) => {
                     // Snapshot and drain everything already queued, then flush
                     // on the final data message. Work arriving after the
@@ -2788,6 +2797,8 @@ mod tests {
     struct ScriptedLaneReplica {
         zone: usize,
         durable: watch::Sender<i64>,
+        auto_durable: AtomicBool,
+        pending_durable: std::sync::Mutex<VecDeque<i64>>,
         send_releases: Mutex<VecDeque<oneshot::Receiver<()>>>,
         sends: mpsc::UnboundedSender<i64>,
     }
@@ -2802,9 +2813,25 @@ mod tests {
             Self {
                 zone,
                 durable,
+                auto_durable: AtomicBool::new(true),
+                pending_durable: std::sync::Mutex::new(VecDeque::new()),
                 send_releases: Mutex::new(send_releases),
                 sends,
             }
+        }
+
+        fn hold_durability(&self) {
+            self.auto_durable.store(false, Ordering::SeqCst);
+        }
+
+        fn publish_next_durable(&self) {
+            let end = self
+                .pending_durable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .expect("a staged flush group was pending");
+            self.durable.send_replace(end);
         }
 
         fn error(&self, code: TransportCode, message: &str) -> TransportError {
@@ -2936,7 +2963,14 @@ mod tests {
             chunks: &[Bytes],
         ) -> Result<(), TransportError> {
             let end = write_offset + chunks.iter().map(|chunk| chunk.len() as i64).sum::<i64>();
-            self.durable.send_replace(end);
+            if self.auto_durable.load(Ordering::SeqCst) {
+                self.durable.send_replace(end);
+            } else {
+                self.pending_durable
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(end);
+            }
             let _ = self.sends.send(end);
             let release = self.send_releases.lock().await.pop_front();
             if let Some(release) = release {
@@ -3855,6 +3889,65 @@ mod tests {
         assert_eq!(writer.committed_len(), 3);
         assert_eq!(recorder.counter("chorus.wal.lane.capacity_drops"), 0);
         assert!(!writer.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn lane_accumulates_complete_batches_until_the_prior_flush_is_durable() {
+        let recorder = Arc::new(TestMetricsRecorder::default());
+        let metrics = Arc::new(Metrics::new(recorder.as_ref(), 1));
+        let (sends_tx, mut sends_rx) = mpsc::unbounded_channel();
+        let replica = Arc::new(ScriptedLaneReplica::new(0, VecDeque::new(), sends_tx));
+        replica.hold_durability();
+        let mut writer = Writer::new(
+            vec![replica.clone()],
+            ClientConfig::default(),
+            protocol_metadata(),
+            vec![AppendToken {
+                zone: 0,
+                generation: Some(1),
+                metageneration: Some(1),
+                persisted_size: 0,
+                write_handle: None,
+            }],
+            metrics,
+        );
+
+        let encoded = record(b"first").encode().unwrap().len();
+        let first = writer
+            .enqueue_data_window(vec![record(b"first")])
+            .await
+            .unwrap()
+            .into_pending()
+            .remove(0);
+        assert_eq!(sends_rx.recv().await, Some(encoded as i64));
+
+        let second = writer
+            .enqueue_data_window(vec![record(b"other")])
+            .await
+            .unwrap()
+            .into_pending()
+            .remove(0);
+        let third = writer
+            .enqueue_data_window(vec![record(b"third")])
+            .await
+            .unwrap()
+            .into_pending()
+            .remove(0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sends_rx.recv())
+                .await
+                .is_err(),
+            "a second flush was staged before the first became durable"
+        );
+
+        replica.publish_next_durable();
+        assert_eq!(sends_rx.recv().await, Some((encoded * 3) as i64));
+        replica.publish_next_durable();
+
+        assert_eq!(first.wait().await.unwrap(), 0);
+        assert_eq!(second.wait().await.unwrap(), 1);
+        assert_eq!(third.wait().await.unwrap(), 2);
+        assert_eq!(writer.committed_len(), 3);
     }
 
     #[tokio::test]
