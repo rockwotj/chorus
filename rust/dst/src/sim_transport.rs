@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -109,9 +111,22 @@ fn persisted_size_of(response: &bidi_write_object_response::WriteStatus) -> Opti
 struct Session {
     spec: AppendObjectSpec,
     stream_id: u64,
+    /// Distinguishes this session from earlier ones on the same replica. A
+    /// resumed session keeps its stream id, so the id alone cannot tell an
+    /// apply from a replaced session apart from one for the current session.
+    epoch: u64,
     durable: i64,
     pending: VecDeque<Vec<BidiWriteObjectRequest>>,
 }
+
+/// The application of one lane group: the fence it met, if any, and the
+/// session's durable offset after committing it.
+struct LaneApplied {
+    durable: i64,
+    fence: Option<TransportError>,
+}
+
+type LaneApply = Pin<Box<dyn Future<Output = Option<LaneApplied>> + Send>>;
 
 /// In-memory replica factory backed by one [`FakeGcs`] zone.
 pub struct InMemoryReplicaFactory {
@@ -145,7 +160,9 @@ impl ReplicaFactory for InMemoryReplicaFactory {
             bucket: self.bucket.clone(),
             object: object.to_string(),
             zone: self.zone,
-            session: tokio::sync::Mutex::new(None),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+            next_epoch: std::sync::atomic::AtomicU64::new(0),
+            apply: tokio::sync::Mutex::new(None),
             shutdown,
         })
     }
@@ -202,7 +219,13 @@ struct InMemoryReplica {
     bucket: String,
     object: String,
     zone: usize,
-    session: tokio::sync::Mutex<Option<Session>>,
+    session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    next_epoch: std::sync::atomic::AtomicU64,
+    /// The group application `lane_durable_change` is driving. The lane
+    /// select cancels that call whenever new work arrives, so the application
+    /// lives here and resumes on the next call instead of restarting with a
+    /// fresh latency charge.
+    apply: tokio::sync::Mutex<Option<(u64, LaneApply)>>,
     /// Signals an in-flight open to abort, mirroring how the gRPC transport's
     /// `shutdown` closes the stream and unblocks a held open. `cancel_provision_attempt`
     /// calls `shutdown()` while joining the provision future; without this race an
@@ -302,13 +325,123 @@ impl InMemoryReplica {
                 .as_ref()
                 .and_then(persisted_size_of)
                 .unwrap_or(0);
+            let epoch = self
+                .next_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *self.session.lock().await = Some(Session {
                 spec,
                 stream_id,
+                epoch,
                 durable: persisted,
                 pending: VecDeque::new(),
             });
         }
+    }
+}
+
+/// Apply one lane group to the fake, then commit its progress to the session
+/// it was taken from. Each message charges the op's fault and latency on the
+/// virtual clock, and a flush hold parks here. Only flushed messages report
+/// durable progress, matching the gRPC transport, which receives a persisted
+/// size only for requests that carry flush and state_lookup. Returns `None`
+/// when the session was replaced or shut down before the commit.
+async fn apply_lane_group(
+    fake: FakeGcs,
+    session: Arc<tokio::sync::Mutex<Option<Session>>>,
+    spec: AppendObjectSpec,
+    stream_id: u64,
+    epoch: u64,
+    group: Vec<BidiWriteObjectRequest>,
+    zone: usize,
+) -> Option<LaneApplied> {
+    let mut persisted = None;
+    let mut fence = None;
+    for request in group {
+        let flushed = request.flush;
+        match fake.sim_lane_apply(&spec, stream_id, request, None).await {
+            Ok((response, close)) => {
+                // sim_lane_apply already slept the charged latency before
+                // applying the write. Fold the applied progress first so a
+                // post-response stream close still reports durable progress
+                // alongside the fence (matching the gRPC lane).
+                if flushed {
+                    if let Some(size) = response.write_status.as_ref().and_then(persisted_size_of) {
+                        persisted = Some(size);
+                    }
+                }
+                if let Some(status) = close {
+                    fence = Some(status_err(zone, &status));
+                    break;
+                }
+            }
+            Err(status) => {
+                fence = Some(status_err(zone, &status));
+                break;
+            }
+        }
+    }
+    let mut guard = session.lock().await;
+    let session = guard.as_mut().filter(|session| session.epoch == epoch)?;
+    session.pending.pop_front();
+    if let Some(size) = persisted {
+        session.durable = session.durable.max(size);
+    }
+    Some(LaneApplied {
+        durable: session.durable,
+        fence,
+    })
+}
+
+impl InMemoryReplica {
+    /// Enqueue one lane group. When `flush` is set, the final message carries
+    /// flush and state_lookup, matching the gRPC lane's write group.
+    async fn enqueue_lane_group(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+        flush: bool,
+    ) -> Result<(), TransportError> {
+        if chunks.is_empty() {
+            return Err(err(
+                self.zone,
+                TransportCode::Internal,
+                "append lane cannot send an empty flush group",
+            ));
+        }
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or_else(|| {
+            err(
+                self.zone,
+                TransportCode::FailedPrecondition,
+                "append session disconnected while sending",
+            )
+        })?;
+        // Build the flush group's wire messages; the final message carries
+        // flush + state_lookup, matching the gRPC lane's flushed write group.
+        // Only enqueue here — the apply (which may park on an injected flush
+        // hold) happens in `lane_durable_change`, so this stays non-blocking.
+        let last_index = chunks.len() - 1;
+        let mut relative_offset = 0i64;
+        let mut group = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index == last_index;
+            group.push(BidiWriteObjectRequest {
+                first_message: None,
+                write_offset: write_offset + relative_offset,
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(crc32c::crc32c(chunk)),
+                        content: chunk.to_vec(),
+                    },
+                )),
+                flush: flush && last,
+                state_lookup: flush && last,
+                ..Default::default()
+            });
+            relative_offset += chunk.len() as i64;
+        }
+        session.pending.push_back(group);
+        Ok(())
     }
 }
 
@@ -645,57 +778,43 @@ impl Replica for InMemoryReplica {
     }
 
     async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        if chunks.is_empty() {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "append lane cannot send an empty flush group",
-            ));
-        }
+        self.enqueue_lane_group(write_offset, chunks, true).await
+    }
+
+    async fn lane_send_unflushed(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+    ) -> Result<(), TransportError> {
+        self.enqueue_lane_group(write_offset, chunks, false).await
+    }
+
+    async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
         let mut guard = self.session.lock().await;
         let session = guard.as_mut().ok_or_else(|| {
             err(
                 self.zone,
                 TransportCode::FailedPrecondition,
-                "append session disconnected while sending",
+                "append session disconnected while flushing",
             )
         })?;
-        // Build the flush group's wire messages; the final message carries
-        // flush + state_lookup, matching the gRPC lane's flushed write group.
-        // Only enqueue here — the apply (which may park on an injected flush
-        // hold) happens in `lane_durable_change`, so this stays non-blocking.
-        let last_index = chunks.len() - 1;
-        let mut relative_offset = 0i64;
-        let mut group = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.iter().enumerate() {
-            let last = index == last_index;
-            group.push(BidiWriteObjectRequest {
-                first_message: None,
-                write_offset: write_offset + relative_offset,
-                data: Some(bidi_write_object_request::Data::ChecksummedData(
-                    ChecksummedData {
-                        crc32c: Some(crc32c::crc32c(chunk)),
-                        content: chunk.to_vec(),
-                    },
-                )),
-                flush: last,
-                state_lookup: last,
-                ..Default::default()
-            });
-            relative_offset += chunk.len() as i64;
-        }
-        session.pending.push_back(group);
+        session.pending.push_back(vec![BidiWriteObjectRequest {
+            first_message: None,
+            write_offset,
+            data: None,
+            flush: true,
+            state_lookup: true,
+            ..Default::default()
+        }]);
         Ok(())
     }
 
     async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError> {
+        let mut apply = self.apply.lock().await;
         loop {
-            // Take the next enqueued flush group plus the session identity, then
-            // release the lock so the apply can park on an injected flush hold
-            // without blocking a concurrent shutdown/shed.
-            let (group, spec, stream_id) = {
-                let mut guard = self.session.lock().await;
-                let session = guard.as_mut().ok_or_else(|| {
+            {
+                let guard = self.session.lock().await;
+                let session = guard.as_ref().ok_or_else(|| {
                     err(
                         self.zone,
                         TransportCode::FailedPrecondition,
@@ -708,70 +827,57 @@ impl Replica for InMemoryReplica {
                         error: None,
                     });
                 }
-                match session.pending.front() {
-                    Some(group) => (group.clone(), session.spec.clone(), session.stream_id),
-                    None => {
+                if apply
+                    .as_ref()
+                    .is_some_and(|(epoch, _)| *epoch != session.epoch)
+                {
+                    *apply = None;
+                }
+                if apply.is_none() {
+                    let Some(group) = session.pending.front() else {
                         return Err(err(
                             self.zone,
                             TransportCode::Internal,
                             "append session made no progress",
-                        ))
-                    }
+                        ));
+                    };
+                    *apply = Some((
+                        session.epoch,
+                        Box::pin(apply_lane_group(
+                            self.fake.clone(),
+                            Arc::clone(&self.session),
+                            session.spec.clone(),
+                            session.stream_id,
+                            session.epoch,
+                            group.clone(),
+                            self.zone,
+                        )),
+                    ));
                 }
+            }
+            // Drive the application with the session lock released so a flush
+            // hold can park here without blocking a concurrent shutdown or
+            // shed. Cancellation leaves it in the slot for the next call.
+            let applied = apply
+                .as_mut()
+                .expect("an application was just staged")
+                .1
+                .as_mut()
+                .await;
+            *apply = None;
+            let Some(applied) = applied else {
+                // The session was replaced or shut down during the apply.
+                continue;
             };
-            // Apply the group with no lock held: each message charges the op's
-            // fault/latency on the virtual clock, and a flush hold parks here.
-            let mut persisted = None;
-            let mut fence = None;
-            for request in &group {
-                match self
-                    .fake
-                    .sim_lane_apply(&spec, stream_id, request.clone(), None)
-                    .await
-                {
-                    Ok((response, close)) => {
-                        // sim_lane_apply already slept the charged latency before
-                        // applying the write. Fold the applied progress first so a
-                        // post-response stream close still reports durable progress
-                        // alongside the fence (matching the gRPC lane).
-                        if let Some(size) =
-                            response.write_status.as_ref().and_then(persisted_size_of)
-                        {
-                            persisted = Some(size);
-                        }
-                        if let Some(status) = close {
-                            fence = Some(status_err(self.zone, &status));
-                            break;
-                        }
-                    }
-                    Err(status) => {
-                        fence = Some(status_err(self.zone, &status));
-                        break;
-                    }
-                }
-            }
-            // Re-acquire and commit the applied group's progress in send order.
-            let mut guard = self.session.lock().await;
-            let session = guard.as_mut().ok_or_else(|| {
-                err(
-                    self.zone,
-                    TransportCode::FailedPrecondition,
-                    "append session reader ended",
-                )
-            })?;
-            session.pending.pop_front();
-            if let Some(size) = persisted {
-                session.durable = session.durable.max(size);
-            }
-            if let Some(error) = fence {
+            if let Some(error) = applied.fence {
                 return Ok(LaneDurableChange {
-                    persisted_size: session.durable,
+                    persisted_size: applied.durable,
                     error: Some(error),
                 });
             }
-            if session.durable > seen {
+            if applied.durable > seen {
                 return Ok(LaneDurableChange {
-                    persisted_size: session.durable,
+                    persisted_size: applied.durable,
                     error: None,
                 });
             }

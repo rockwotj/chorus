@@ -1995,12 +1995,15 @@ impl Drop for AbortLanesOnDrop {
     }
 }
 
-/// The per-lane writer receives batches in offset order. It keeps at most one
-/// flushed group outstanding: while that group becomes durable, later batches
-/// accumulate in the work channel. Once the durable tail covers the group, the
-/// lane snapshots and drains everything currently queued and sends that next
-/// group with one flush on its final data message. An individual engine batch
-/// is therefore never split, while adjacent batches may still be coalesced.
+/// The per-lane writer receives batches in offset order. It keeps at most
+/// [`MAX_OUTSTANDING_FLUSHES`] flushed groups outstanding. When a flush slot is
+/// free, the lane sends everything it holds as one group with a flush on its
+/// final data message. While every slot is taken, batches accumulate in the
+/// lane; once at least [`LANE_UNFLUSHED_SEND_BYTES`] are held, the lane writes
+/// them without a flush so the transfer overlaps the outstanding flushes. When
+/// a flush completes and written bytes remain unflushed with nothing held, the
+/// lane sends a flush that carries no data. An individual engine batch is
+/// never split, while adjacent batches may still be coalesced.
 /// Durable-tail movement publishes one monotonic byte watermark. On a session
 /// disturbance it resumes via the session handle and resends the retained
 /// unacknowledged suffix; a fence or exhausted retries publishes one terminal
@@ -2022,6 +2025,21 @@ impl LaneDeath {
     }
 }
 
+/// Flushed groups a lane keeps outstanding on its append session. Measured
+/// against live Rapid buckets, a stream completes roughly one flush per
+/// millisecond and queues flushes beyond that rate, so unbounded flushes
+/// collapse under load. With one outstanding flush, a record that arrives
+/// during a flush waits for that flush to complete before its own flush is
+/// sent. Two outstanding flushes remove most of that wait and stay under the
+/// service's flush rate.
+const MAX_OUTSTANDING_FLUSHES: usize = 2;
+
+/// Held bytes at which a lane with no free flush slot writes its held batches
+/// without a flush. The service spends about as long on a small wire message
+/// as on a large one, so smaller remainders wait for the next flush instead of
+/// being written as many small messages.
+const LANE_UNFLUSHED_SEND_BYTES: i64 = 1 << 20;
+
 struct LaneRuntime {
     replica: Arc<dyn Replica>,
     token: AppendToken,
@@ -2031,6 +2049,11 @@ struct LaneRuntime {
     stall_timeout: Arc<LaneStallTimeout>,
     durable: i64,
     retained: VecDeque<RetainedBatch>,
+    /// Batches received and not yet written to the session.
+    held: VecDeque<LaneBatch>,
+    held_bytes: i64,
+    /// End offsets of sent flushes the durable tail does not yet cover.
+    flushes: VecDeque<i64>,
     monitor_session: bool,
     last_progress: tokio::time::Instant,
 }
@@ -2054,6 +2077,9 @@ impl LaneRuntime {
             stall_timeout,
             durable,
             retained: VecDeque::new(),
+            held: VecDeque::new(),
+            held_bytes: 0,
+            flushes: VecDeque::new(),
             // Keep observing an idle live stream so a trailing fence cannot
             // disappear merely because its persisted-size response drained
             // the retained suffix.
@@ -2098,16 +2124,94 @@ impl LaneRuntime {
         Ok(stream_failed || !self.retained.is_empty())
     }
 
-    async fn stage(&mut self, batches: Vec<LaneBatch>) -> Result<bool, LaneDeath> {
-        match tokio::time::timeout_at(
+    /// End offset of the bytes written to the session.
+    fn sent_end(&self) -> i64 {
+        self.retained
+            .back()
+            .map_or(self.durable, |retained| retained.batch.end())
+            .max(self.durable)
+    }
+
+    fn hold(&mut self, batch: LaneBatch) {
+        self.held_bytes += batch.batch.end() - batch.batch.start;
+        self.held.push_back(batch);
+    }
+
+    /// Write held batches as the flush slots allow. A free slot flushes
+    /// everything held, or flushes already written bytes with a data-less
+    /// message when nothing is held. Without a free slot, held batches are
+    /// written unflushed once they reach [`LANE_UNFLUSHED_SEND_BYTES`].
+    async fn dispatch(&mut self) -> Result<(), LaneDeath> {
+        while self.flushes.front().is_some_and(|end| *end <= self.durable) {
+            self.flushes.pop_front();
+        }
+        if self.flushes.len() < MAX_OUTSTANDING_FLUSHES {
+            if !self.held.is_empty() {
+                let batches = self.held.drain(..).collect();
+                self.held_bytes = 0;
+                return self.stage(batches, true).await;
+            }
+            let sent_end = self.sent_end();
+            let flushed_through = self.flushes.back().copied().unwrap_or(self.durable);
+            if sent_end > flushed_through {
+                let failed = match tokio::time::timeout_at(
+                    self.stall_deadline(),
+                    self.replica.lane_flush(sent_end),
+                )
+                .await
+                {
+                    Ok(sent) => sent.is_err(),
+                    Err(_) => self.confirm_timeout().await?,
+                };
+                self.flushes.push_back(sent_end);
+                if failed {
+                    self.recover().await?;
+                }
+            }
+            return Ok(());
+        }
+        while self.held_bytes >= LANE_UNFLUSHED_SEND_BYTES {
+            let mut bytes = 0;
+            let mut count = 0;
+            while bytes < LANE_UNFLUSHED_SEND_BYTES {
+                let batch = &self.held[count].batch;
+                bytes += batch.end() - batch.start;
+                count += 1;
+            }
+            let batches = self.held.drain(..count).collect();
+            self.held_bytes -= bytes;
+            self.stage(batches, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Write one coalesced group, flushed or not, and run recovery if the
+    /// session rejects it.
+    async fn stage(&mut self, batches: Vec<LaneBatch>, flush: bool) -> Result<(), LaneDeath> {
+        if self.retained.is_empty() {
+            self.last_progress = tokio::time::Instant::now();
+        }
+        let end = batches
+            .last()
+            .expect("coalesced group is non-empty")
+            .batch
+            .end();
+        let failed = match tokio::time::timeout_at(
             self.stall_deadline(),
-            stage_group(&self.replica, batches, &mut self.retained),
+            stage_group(&self.replica, batches, &mut self.retained, flush),
         )
         .await
         {
-            Ok(failed) => Ok(failed),
-            Err(_) => self.confirm_timeout().await,
+            Ok(failed) => failed,
+            Err(_) => self.confirm_timeout().await?,
+        };
+        if flush {
+            self.flushes.push_back(end);
         }
+        if failed {
+            self.recover().await?;
+        }
+        Ok(())
     }
 }
 
@@ -2123,7 +2227,7 @@ async fn run_lane(
     let mut lane = LaneRuntime::new(replica, token, config, metrics, commits, stall_timeout);
     let mut closed = false;
     let death: Option<LaneDeath> = loop {
-        if closed && lane.retained.is_empty() {
+        if closed && lane.retained.is_empty() && lane.held.is_empty() {
             break None;
         }
         tokio::select! {
@@ -2163,7 +2267,7 @@ async fn run_lane(
                     }
                     LaneProgress::Failed(_) => {
                         lane.monitor_session = false;
-                        if lane.retained.is_empty() {
+                        if lane.retained.is_empty() && lane.held.is_empty() {
                             continue;
                         }
                         if let Err(error) = lane.recover().await {
@@ -2172,24 +2276,22 @@ async fn run_lane(
                         lane.monitor_session = true;
                     }
                 }
+                // A completed flush frees a slot for held batches or for
+                // written bytes that no flush covers yet.
+                if let Err(error) = lane.dispatch().await {
+                    break Some(error);
+                }
             }
-            // Do not pipeline another flush behind one that has not become
-            // durable. Keeping the work arm closed makes concurrent arrivals
-            // accumulate naturally; after progress releases the retained
-            // group, the existing snapshot-and-drain below coalesces all work
-            // that is already ready. An idle lane still flushes its first
-            // batch immediately, without a timer or a target fill level.
-            batch = work.recv(), if !closed && lane.retained.is_empty() => match batch {
+            batch = work.recv(), if !closed => match batch {
                 Some(batch) => {
-                    // Snapshot and drain everything already queued, then flush
-                    // on the final data message. Work arriving after the
-                    // snapshot forms the next group, so sustained producers
-                    // cannot postpone this flush indefinitely.
-                    let mut batches = vec![batch];
+                    // Snapshot and drain everything already queued. Work
+                    // arriving after the snapshot forms the next group, so
+                    // sustained producers cannot postpone a flush indefinitely.
+                    lane.hold(batch);
                     let queued = work.len();
                     for _ in 0..queued {
                         match work.try_recv() {
-                            Ok(batch) => batches.push(batch),
+                            Ok(batch) => lane.hold(batch),
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                 closed = true;
@@ -2197,17 +2299,8 @@ async fn run_lane(
                             }
                         }
                     }
-                    if lane.retained.is_empty() {
-                        lane.last_progress = tokio::time::Instant::now();
-                    }
-                    let failed = match lane.stage(batches).await {
-                        Ok(failed) => failed,
-                        Err(error) => break Some(error),
-                    };
-                    if failed {
-                        if let Err(error) = lane.recover().await {
-                            break Some(error);
-                        }
+                    if let Err(error) = lane.dispatch().await {
+                        break Some(error);
                     }
                     lane.monitor_session = true;
                 }
@@ -2262,13 +2355,15 @@ async fn run_lane(
 }
 
 /// Stage one coalesced group onto the session: record every batch's chunks for
-/// acknowledgment matching and resend, then send all group chunks together so
-/// the transport flushes on the final data message. Returns whether the send
-/// failed so the caller can run lane recovery, which also flushes its resend.
+/// acknowledgment matching and resend, then send all group chunks together.
+/// With `flush`, the transport flushes on the final data message. Returns
+/// whether the send failed so the caller can run lane recovery, which also
+/// flushes its resend.
 async fn stage_group(
     replica: &Arc<dyn Replica>,
     batches: Vec<LaneBatch>,
     retained: &mut VecDeque<RetainedBatch>,
+    flush: bool,
 ) -> bool {
     let group_start = batches
         .first()
@@ -2279,10 +2374,14 @@ async fn stage_group(
     for batch in batches {
         retained.push_back(batch.into_retained());
     }
-    replica
-        .lane_send_packed(group_start, &packed)
-        .await
-        .is_err()
+    let sent = if flush {
+        replica.lane_send_packed(group_start, &packed).await
+    } else {
+        replica
+            .lane_send_packed_unflushed(group_start, &packed)
+            .await
+    };
+    sent.is_err()
 }
 
 /// Advance each retained batch's byte cursor and release fully durable batches.
@@ -2470,6 +2569,7 @@ impl LaneRuntime {
                         }
                     }
                     if suffix.is_empty() {
+                        self.flushes.clear();
                         return Ok(());
                     }
                     let packed = pack_append(suffix);
@@ -2497,7 +2597,13 @@ impl LaneRuntime {
                         }
                     };
                     match sent {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => {
+                            // The resend flushes every written byte, which
+                            // replaces any flushes sent on the prior session.
+                            self.flushes.clear();
+                            self.flushes.push_back(self.durable + resend_bytes as i64);
+                            return Ok(());
+                        }
                         Err(error)
                             if error.code.transient() && attempt < self.config.max_retries =>
                         {
@@ -2801,6 +2907,7 @@ mod tests {
         pending_durable: std::sync::Mutex<VecDeque<i64>>,
         send_releases: Mutex<VecDeque<oneshot::Receiver<()>>>,
         sends: mpsc::UnboundedSender<i64>,
+        unflushed: std::sync::Mutex<Vec<i64>>,
     }
 
     impl ScriptedLaneReplica {
@@ -2817,7 +2924,20 @@ mod tests {
                 pending_durable: std::sync::Mutex::new(VecDeque::new()),
                 send_releases: Mutex::new(send_releases),
                 sends,
+                unflushed: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn stage_durable(&self, end: i64) {
+            if self.auto_durable.load(Ordering::SeqCst) {
+                self.durable.send_replace(end);
+            } else {
+                self.pending_durable
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push_back(end);
+            }
+            let _ = self.sends.send(end);
         }
 
         fn hold_durability(&self) {
@@ -2963,19 +3083,29 @@ mod tests {
             chunks: &[Bytes],
         ) -> Result<(), TransportError> {
             let end = write_offset + chunks.iter().map(|chunk| chunk.len() as i64).sum::<i64>();
-            if self.auto_durable.load(Ordering::SeqCst) {
-                self.durable.send_replace(end);
-            } else {
-                self.pending_durable
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push_back(end);
-            }
-            let _ = self.sends.send(end);
+            self.stage_durable(end);
             let release = self.send_releases.lock().await.pop_front();
             if let Some(release) = release {
                 let _ = release.await;
             }
+            Ok(())
+        }
+
+        async fn lane_send_unflushed(
+            &self,
+            write_offset: i64,
+            chunks: &[Bytes],
+        ) -> Result<(), TransportError> {
+            let end = write_offset + chunks.iter().map(|chunk| chunk.len() as i64).sum::<i64>();
+            self.unflushed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(end);
+            Ok(())
+        }
+
+        async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
+            self.stage_durable(write_offset);
             Ok(())
         }
 
@@ -3892,7 +4022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lane_accumulates_complete_batches_until_the_prior_flush_is_durable() {
+    async fn lane_accumulates_complete_batches_while_both_flush_slots_are_busy() {
         let recorder = Arc::new(TestMetricsRecorder::default());
         let metrics = Arc::new(Metrics::new(recorder.as_ref(), 1));
         let (sends_tx, mut sends_rx) = mpsc::unbounded_channel();
@@ -3912,42 +4042,125 @@ mod tests {
             metrics,
         );
 
-        let encoded = record(b"first").encode().unwrap().len();
-        let first = writer
-            .enqueue_data_window(vec![record(b"first")])
-            .await
-            .unwrap()
-            .into_pending()
-            .remove(0);
-        assert_eq!(sends_rx.recv().await, Some(encoded as i64));
-
-        let second = writer
-            .enqueue_data_window(vec![record(b"other")])
-            .await
-            .unwrap()
-            .into_pending()
-            .remove(0);
-        let third = writer
-            .enqueue_data_window(vec![record(b"third")])
-            .await
-            .unwrap()
-            .into_pending()
-            .remove(0);
+        let encoded = record(b"first").encode().unwrap().len() as i64;
+        let mut pending = Vec::new();
+        for (index, payload) in [b"first", b"other"].into_iter().enumerate() {
+            pending.push(
+                writer
+                    .enqueue_data_window(vec![record(payload)])
+                    .await
+                    .unwrap()
+                    .into_pending()
+                    .remove(0),
+            );
+            assert_eq!(sends_rx.recv().await, Some(encoded * (index as i64 + 1)));
+        }
+        for payload in [b"third", b"final"] {
+            pending.push(
+                writer
+                    .enqueue_data_window(vec![record(payload)])
+                    .await
+                    .unwrap()
+                    .into_pending()
+                    .remove(0),
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(20), sends_rx.recv())
                 .await
                 .is_err(),
-            "a second flush was staged before the first became durable"
+            "a third flush was staged while two were outstanding"
         );
 
         replica.publish_next_durable();
-        assert_eq!(sends_rx.recv().await, Some((encoded * 3) as i64));
+        assert_eq!(sends_rx.recv().await, Some(encoded * 4));
+        replica.publish_next_durable();
         replica.publish_next_durable();
 
-        assert_eq!(first.wait().await.unwrap(), 0);
-        assert_eq!(second.wait().await.unwrap(), 1);
-        assert_eq!(third.wait().await.unwrap(), 2);
-        assert_eq!(writer.committed_len(), 3);
+        for (seqno, completion) in pending.into_iter().enumerate() {
+            assert_eq!(completion.wait().await.unwrap(), seqno as u64);
+        }
+        assert_eq!(writer.committed_len(), 4);
+    }
+
+    #[tokio::test]
+    async fn lane_writes_large_backlogs_unflushed_and_covers_them_with_a_data_less_flush() {
+        let recorder = Arc::new(TestMetricsRecorder::default());
+        let metrics = Arc::new(Metrics::new(recorder.as_ref(), 1));
+        let (sends_tx, mut sends_rx) = mpsc::unbounded_channel();
+        let replica = Arc::new(ScriptedLaneReplica::new(0, VecDeque::new(), sends_tx));
+        replica.hold_durability();
+        let mut writer = Writer::new(
+            vec![replica.clone()],
+            ClientConfig::default(),
+            protocol_metadata(),
+            vec![AppendToken {
+                zone: 0,
+                generation: Some(1),
+                metageneration: Some(1),
+                persisted_size: 0,
+                write_handle: None,
+            }],
+            metrics,
+        );
+
+        let encoded = record(b"first").encode().unwrap().len() as i64;
+        let mut pending = Vec::new();
+        for (index, payload) in [b"first", b"other"].into_iter().enumerate() {
+            pending.extend(
+                writer
+                    .enqueue_data_window(vec![record(payload)])
+                    .await
+                    .unwrap()
+                    .into_pending(),
+            );
+            assert_eq!(sends_rx.recv().await, Some(encoded * (index as i64 + 1)));
+        }
+
+        // Both flush slots are busy, so a backlog of at least
+        // LANE_UNFLUSHED_SEND_BYTES is written without a flush.
+        let large = vec![0x5a; 4096];
+        let backlog = (0..LANE_UNFLUSHED_SEND_BYTES / 4096 + 1)
+            .map(|_| record(&large))
+            .collect::<Vec<_>>();
+        let backlog_len = backlog
+            .iter()
+            .map(|frame| frame.encode().unwrap().len() as i64)
+            .sum::<i64>();
+        pending.extend(
+            writer
+                .enqueue_data_window(backlog)
+                .await
+                .unwrap()
+                .into_pending(),
+        );
+        let sent_end = encoded * 2 + backlog_len;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while replica
+                .unflushed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .last()
+                != Some(&sent_end)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the backlog was written unflushed");
+
+        // The first flush completing frees a slot. Nothing is held, so the lane
+        // covers the unflushed backlog with a data-less flush.
+        replica.publish_next_durable();
+        assert_eq!(sends_rx.recv().await, Some(sent_end));
+        replica.publish_next_durable();
+        replica.publish_next_durable();
+
+        let committed = pending.len();
+        for completion in pending {
+            completion.wait().await.unwrap();
+        }
+        assert_eq!(writer.committed_len(), committed);
     }
 
     #[tokio::test]

@@ -1305,6 +1305,50 @@ impl ReplicaFactory for GrpcReplicaFactory {
     }
 }
 
+impl GrpcReplica {
+    /// Send a packed group's wire messages in order. When `flush` is set, the
+    /// final message carries flush and state_lookup.
+    async fn lane_send_messages(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+        flush: bool,
+    ) -> Result<(), TransportError> {
+        if packed.is_empty() {
+            return Err(self.error(
+                TransportCode::Internal,
+                "append lane cannot send an empty flush group",
+            ));
+        }
+        let handle = self.live_session()?;
+        // The coalesced group was packed once before replica dispatch. Each
+        // lane builds only its protobuf envelopes and shallow-clones the
+        // refcounted message bytes; CRC32C and byte concatenation are shared.
+        let messages = packed.messages();
+        let last_index = messages.len() - 1;
+        for (index, message) in messages.iter().enumerate() {
+            let last = index == last_index;
+            let request = BidiWriteObjectRequest {
+                first_message: None,
+                write_offset: write_offset + message.relative_offset,
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(message.crc32c),
+                        content: message.content.clone(),
+                    },
+                )),
+                flush: flush && last,
+                state_lookup: flush && last,
+                ..Default::default()
+            };
+            handle
+                .send(self, request, "append session disconnected while sending")
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Replica for GrpcReplica {
     async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
@@ -1845,43 +1889,44 @@ impl Replica for GrpcReplica {
         self.lane_send_packed(write_offset, &packed).await
     }
 
+    async fn lane_send_unflushed(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+    ) -> Result<(), TransportError> {
+        let packed = pack_append(chunks.to_vec());
+        self.lane_send_packed_unflushed(write_offset, &packed).await
+    }
+
     async fn lane_send_packed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
-        if packed.is_empty() {
-            return Err(self.error(
-                TransportCode::Internal,
-                "append lane cannot send an empty flush group",
-            ));
-        }
+        self.lane_send_messages(write_offset, packed, true).await
+    }
+
+    async fn lane_send_packed_unflushed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.lane_send_messages(write_offset, packed, false).await
+    }
+
+    async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
         let handle = self.live_session()?;
-        // The coalesced group was packed once before replica dispatch. Each
-        // lane builds only its protobuf envelopes and shallow-clones the
-        // refcounted message bytes; CRC32C and byte concatenation are shared.
-        let messages = packed.messages();
-        let last_index = messages.len() - 1;
-        for (index, message) in messages.iter().enumerate() {
-            let last = index == last_index;
-            let request = BidiWriteObjectRequest {
-                first_message: None,
-                write_offset: write_offset + message.relative_offset,
-                data: Some(bidi_write_object_request::Data::ChecksummedData(
-                    ChecksummedData {
-                        crc32c: Some(message.crc32c),
-                        content: message.content.clone(),
-                    },
-                )),
-                flush: last,
-                state_lookup: last,
-                ..Default::default()
-            };
-            handle
-                .send(self, request, "append session disconnected while sending")
-                .await?;
-        }
-        Ok(())
+        let request = BidiWriteObjectRequest {
+            first_message: None,
+            write_offset,
+            data: None,
+            flush: true,
+            state_lookup: true,
+            ..Default::default()
+        };
+        handle
+            .send(self, request, "append session disconnected while flushing")
+            .await
     }
 
     async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError> {
