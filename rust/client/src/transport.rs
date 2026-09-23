@@ -374,6 +374,35 @@ pub trait Replica: Send + Sync {
         self.lane_send(write_offset, packed.chunks()).await
     }
 
+    /// Queue a non-empty ordered group on the live append session without a
+    /// flush. A later flushed group or [`Replica::lane_flush`] makes these
+    /// bytes durable. Backends that cannot defer a flush keep the default,
+    /// which flushes the group.
+    async fn lane_send_unflushed(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+    ) -> Result<(), TransportError> {
+        self.lane_send(write_offset, chunks).await
+    }
+
+    /// Unflushed counterpart of [`Replica::lane_send_packed`].
+    async fn lane_send_packed_unflushed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.lane_send_unflushed(write_offset, packed.chunks())
+            .await
+    }
+
+    /// Flush every byte queued on the live append session through
+    /// `write_offset` with a message that carries no data. Backends whose
+    /// unflushed sends already flush keep the default no-op.
+    async fn lane_flush(&self, _write_offset: i64) -> Result<(), TransportError> {
+        Ok(())
+    }
+
     /// Wait until the session's durable tail exceeds `seen` or the session
     /// fails. A response and stream error may be observed together; in that
     /// case the durable offset and error are returned in one observation so the
@@ -559,6 +588,28 @@ impl Replica for TimedReplica {
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
         self.inner.lane_send_packed(write_offset, packed).await
+    }
+
+    async fn lane_send_unflushed(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+    ) -> Result<(), TransportError> {
+        self.inner.lane_send_unflushed(write_offset, chunks).await
+    }
+
+    async fn lane_send_packed_unflushed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.inner
+            .lane_send_packed_unflushed(write_offset, packed)
+            .await
+    }
+
+    async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
+        self.inner.lane_flush(write_offset).await
     }
 
     async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError> {

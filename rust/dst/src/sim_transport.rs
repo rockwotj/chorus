@@ -312,6 +312,59 @@ impl InMemoryReplica {
     }
 }
 
+impl InMemoryReplica {
+    /// Enqueue one lane group. When `flush` is set, the final message carries
+    /// flush and state_lookup, matching the gRPC lane's write group.
+    async fn enqueue_lane_group(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+        flush: bool,
+    ) -> Result<(), TransportError> {
+        if chunks.is_empty() {
+            return Err(err(
+                self.zone,
+                TransportCode::Internal,
+                "append lane cannot send an empty flush group",
+            ));
+        }
+        let mut guard = self.session.lock().await;
+        let session = guard.as_mut().ok_or_else(|| {
+            err(
+                self.zone,
+                TransportCode::FailedPrecondition,
+                "append session disconnected while sending",
+            )
+        })?;
+        // Build the flush group's wire messages; the final message carries
+        // flush + state_lookup, matching the gRPC lane's flushed write group.
+        // Only enqueue here — the apply (which may park on an injected flush
+        // hold) happens in `lane_durable_change`, so this stays non-blocking.
+        let last_index = chunks.len() - 1;
+        let mut relative_offset = 0i64;
+        let mut group = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let last = index == last_index;
+            group.push(BidiWriteObjectRequest {
+                first_message: None,
+                write_offset: write_offset + relative_offset,
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(crc32c::crc32c(chunk)),
+                        content: chunk.to_vec(),
+                    },
+                )),
+                flush: flush && last,
+                state_lookup: flush && last,
+                ..Default::default()
+            });
+            relative_offset += chunk.len() as i64;
+        }
+        session.pending.push_back(group);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Replica for InMemoryReplica {
     async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
@@ -645,46 +698,34 @@ impl Replica for InMemoryReplica {
     }
 
     async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        if chunks.is_empty() {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "append lane cannot send an empty flush group",
-            ));
-        }
+        self.enqueue_lane_group(write_offset, chunks, true).await
+    }
+
+    async fn lane_send_unflushed(
+        &self,
+        write_offset: i64,
+        chunks: &[Bytes],
+    ) -> Result<(), TransportError> {
+        self.enqueue_lane_group(write_offset, chunks, false).await
+    }
+
+    async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
         let mut guard = self.session.lock().await;
         let session = guard.as_mut().ok_or_else(|| {
             err(
                 self.zone,
                 TransportCode::FailedPrecondition,
-                "append session disconnected while sending",
+                "append session disconnected while flushing",
             )
         })?;
-        // Build the flush group's wire messages; the final message carries
-        // flush + state_lookup, matching the gRPC lane's flushed write group.
-        // Only enqueue here — the apply (which may park on an injected flush
-        // hold) happens in `lane_durable_change`, so this stays non-blocking.
-        let last_index = chunks.len() - 1;
-        let mut relative_offset = 0i64;
-        let mut group = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.iter().enumerate() {
-            let last = index == last_index;
-            group.push(BidiWriteObjectRequest {
-                first_message: None,
-                write_offset: write_offset + relative_offset,
-                data: Some(bidi_write_object_request::Data::ChecksummedData(
-                    ChecksummedData {
-                        crc32c: Some(crc32c::crc32c(chunk)),
-                        content: chunk.to_vec(),
-                    },
-                )),
-                flush: last,
-                state_lookup: last,
-                ..Default::default()
-            });
-            relative_offset += chunk.len() as i64;
-        }
-        session.pending.push_back(group);
+        session.pending.push_back(vec![BidiWriteObjectRequest {
+            first_message: None,
+            write_offset,
+            data: None,
+            flush: true,
+            state_lookup: true,
+            ..Default::default()
+        }]);
         Ok(())
     }
 
