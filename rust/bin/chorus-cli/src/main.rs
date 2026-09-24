@@ -243,8 +243,13 @@ async fn run(args: Args) -> Result<()> {
                     "objects_repaired": report.objects_repaired,
                     "objects_already_healthy": report.objects_already_healthy,
                     "transient_failures": report.transient_failures,
+                    "segments_without_source": report.segments_without_source,
+                    "objects_failed": report.objects_failed,
                 }))?
             );
+            if report.objects_failed > 0 {
+                bail!("{} sealed copies failed to rewrite", report.objects_failed);
+            }
         }
         Command::TruncateBefore { record_index } => {
             let volume = storage.volume(&prefix)?;

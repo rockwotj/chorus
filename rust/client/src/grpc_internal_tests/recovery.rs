@@ -9,7 +9,6 @@ use super::*;
 async fn seal_recovery_memory_profile() {
     use crate::metrics::Metrics;
     use crate::protocol::{digest_bytes, protocol_metadata, QuorumVolume};
-    use chorus_fake_gcs::proto;
 
     let mib: usize = std::env::var("CHORUS_RECOVERY_PROFILE_MIB")
         .unwrap_or_else(|_| "64".into())
@@ -36,42 +35,31 @@ async fn seal_recovery_memory_profile() {
             None,
         )
         .await
-        .unwrap()
-        .with_test_read_message_limit(data.len() + 1024);
+        .unwrap();
         servers.push(server);
         factories.push(factory);
     }
     let object = "seal-recovery-memory/segment";
     // Seed finalized objects without retaining a writer or timing population.
-    // Recovery still takes the actual gRPC snapshot and canonical-selection
+    // The one-shot append splits the segment under the fake's inbound message
+    // cap. Recovery still takes the actual gRPC snapshot and canonical-selection
     // paths, followed by committed-seal enforcement and its verification reads.
-    for (zone, server) in servers.iter().take(3).enumerate() {
-        server
-            .service
-            .sim_write_object(proto::WriteObjectRequest {
-                first_message: Some(proto::write_object_request::FirstMessage::WriteObjectSpec(
-                    proto::WriteObjectSpec {
-                        resource: Some(proto::Object {
-                            bucket: format!("projects/_/buckets/zone-{zone}"),
-                            name: object.into(),
-                            metadata: protocol_metadata(),
-                            ..Default::default()
-                        }),
-                        if_generation_match: Some(0),
-                        ..Default::default()
-                    },
-                )),
-                data: Some(proto::write_object_request::Data::ChecksummedData(
-                    proto::ChecksummedData {
-                        content: data.to_vec(),
-                        crc32c: Some(expected_crc32c),
-                    },
-                )),
-                finish_write: true,
-                ..Default::default()
-            })
+    for factory in &factories {
+        let replica = factory.replica(object);
+        let created = replica
+            .create_appendable(protocol_metadata())
             .await
             .unwrap();
+        let mut token = replica.takeover(&created).await.unwrap();
+        token.persisted_size = replica.append(&token, 0, data.to_vec()).await.unwrap();
+        let sealed = replica
+            .finalize(&mut token, data.len() as i64)
+            .await
+            .unwrap();
+        assert_eq!(sealed.crc32c, Some(expected_crc32c));
+    }
+    for server in servers.iter().take(3) {
+        server.service.reset_operation_counts().await;
     }
     drop(data);
     let volume = QuorumVolume::with_metadata(
@@ -1197,11 +1185,22 @@ async fn repair_rewrites_sealed_copies_larger_than_the_inbound_cap() {
     let segment = writer.catalog()[0].clone();
     let object = segment_object("large-repair-wal", &segment.id);
     let canonical = record(&large).encode().unwrap();
+    // The seal can leave one lagging copy unfinalized, so the source zone is
+    // one the seal finalized and the other two are damaged.
+    let mut source = None;
+    for (zone, factory) in factories.iter().enumerate() {
+        if factory.replica(&object).stat().await.unwrap().finalized {
+            source = Some(zone);
+            break;
+        }
+    }
+    let source = source.expect("the seal finalized a quorum");
+    let [torn_zone, missing_zone] = [(source + 1) % 3, (source + 2) % 3];
 
-    // Zone 1 holds an unfinalized prefix that ends inside the record, so repair
-    // takes the guarded-replace path. Zone 2 lost its copy, so repair creates
-    // it and appends the whole segment in one call.
-    let prefix = factories[1].replica(&object);
+    // One zone holds an unfinalized prefix that ends inside the record, so
+    // repair takes the guarded-replace path. The other lost its copy, so repair
+    // creates it and appends the whole segment in one call.
+    let prefix = factories[torn_zone].replica(&object);
     let generation = prefix.stat().await.unwrap().generation;
     prefix.delete(generation).await.unwrap();
     let created = prefix
@@ -1214,7 +1213,7 @@ async fn repair_rewrites_sealed_copies_larger_than_the_inbound_cap() {
         .append(&token, 0, canonical[..torn].to_vec())
         .await
         .unwrap();
-    let missing = factories[2].replica(&object);
+    let missing = factories[missing_zone].replica(&object);
     let generation = missing.stat().await.unwrap().generation;
     missing.delete(generation).await.unwrap();
 

@@ -1196,6 +1196,7 @@ impl FakeGcs {
             }
             self.flush_hold_gate(stream_id).await;
         }
+        let answered = answers(&first);
         let response = self.apply_bidi(first, stream_id).await?;
         let append = if let Some((bucket, object)) = created_append {
             let spec = self.append_spec_for_created(bucket, object).await?;
@@ -1203,7 +1204,11 @@ impl FakeGcs {
         } else {
             opened
         };
-        self.close_stream_after_response(operation).await?;
+        // As in the gRPC handler, a post-response close follows only a
+        // message the service answers.
+        if answered {
+            self.close_stream_after_response(operation).await?;
+        }
         Ok(SimSessionOpen { response, append })
     }
 
@@ -1259,14 +1264,20 @@ impl FakeGcs {
             self.finalize_hold_gate().await;
         }
         self.flush_hold_gate(stream_id).await;
+        let answered = answers(&request);
         let response = self
             .apply_append_continuation(spec, stream_id, request)
             .await?;
-        // The gRPC fake emits the response, THEN injects the stream close.
-        // Surface the applied response together with the close error so the
-        // lane reports durable progress alongside the fence, exactly as the
-        // gRPC client folds persisted_size + error in one observation.
-        let close = self.close_stream_after_response(operation).await.err();
+        // The gRPC fake emits the response, THEN injects the stream close, and
+        // only for a message it answers. Surface the applied response together
+        // with the close error so the lane reports durable progress alongside
+        // the fence, exactly as the gRPC client folds persisted_size + error in
+        // one observation.
+        let close = if answered {
+            self.close_stream_after_response(operation).await.err()
+        } else {
+            None
+        };
         Ok((response, close))
     }
 
@@ -3344,6 +3355,13 @@ mod tests {
         )
         .await;
         assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            server
+                .service
+                .reported_size_for(bucket, "oversized-continuation")
+                .await,
+            Some((0, false))
+        );
         assert!(server
             .service
             .raw_bytes_for(bucket, "oversized-continuation")
