@@ -172,7 +172,7 @@ const _: () = assert!(WIRE_MESSAGE_TARGET_BYTES * 2 <= SERVICE_INBOUND_MESSAGE_C
 /// each with its own CRC32C. Small chunks are concatenated; a chunk larger
 /// than the target is split, so no message can reach the service's inbound
 /// message cap whatever the size of one record or one rewritten object.
-pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
+pub fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
     fn push(messages: &mut Vec<PackedAppendMessage>, relative_offset: &mut i64, content: Bytes) {
         let len = content.len() as i64;
         messages.push(PackedAppendMessage {
@@ -210,7 +210,10 @@ pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
 /// One-shot write requests carrying `data` from `write_offset`: `first` names
 /// the object on the first message only, every data message stays under the
 /// inbound message cap, and the last message carries flush and state_lookup.
-/// Empty data sends `first` alone.
+/// Empty data sends `first` alone with an empty checksummed payload: the
+/// service answers a data-carrying message with the persisted size, which
+/// `append` and `replace_appendable` wait for, and a data-less one with the
+/// object resource.
 fn one_shot_write_requests(
     first: bidi_write_object_request::FirstMessage,
     write_offset: i64,
@@ -222,6 +225,12 @@ fn one_shot_write_requests(
         return vec![BidiWriteObjectRequest {
             first_message: Some(first),
             write_offset,
+            data: Some(bidi_write_object_request::Data::ChecksummedData(
+                ChecksummedData {
+                    crc32c: Some(crc32c::crc32c(&[])),
+                    content: Bytes::new(),
+                },
+            )),
             flush: true,
             state_lookup: true,
             ..Default::default()
@@ -251,18 +260,18 @@ fn one_shot_write_requests(
         .collect()
 }
 
-/// Whether a RESOURCE_EXHAUSTED status reports an oversized gRPC message rather
-/// than throttling. gRPC servers and tonic use the same code for both; only
-/// the status text tells them apart.
+/// Whether a RESOURCE_EXHAUSTED status reports an oversized inbound message
+/// rather than throttling. The service returns the same code for both, so
+/// only the status text tells them apart. The one phrase matched is the gRPC
+/// C++ core server's inbound-limit rejection, "Received message larger than
+/// max (N vs. LIMIT)", which the GCS gRPC frontend returns for a write
+/// message over the cap. Throttling messages ("rate limit", "quota") do not
+/// contain it. Tonic's own size errors use OUT_OF_RANGE and never reach this
+/// check.
 fn is_message_size_rejection(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "larger than max",
-        "exceeds maximum",
-        "message length too large",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
+    message
+        .to_ascii_lowercase()
+        .contains("received message larger than max")
 }
 
 /// Per-response progress timeout for the persistent session. The session

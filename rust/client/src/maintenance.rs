@@ -763,6 +763,15 @@ impl MaintenanceState {
                         "repair pass found committed sealed segments with no verifiable copy"
                     );
                 }
+                if report.objects_failed > 0 {
+                    tracing::error!(
+                        segments_examined = report.segments_examined,
+                        objects_repaired = report.objects_repaired,
+                        objects_failed = report.objects_failed,
+                        floor,
+                        "repair pass left sealed copies that failed to rewrite"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, floor, "repair pass failed");
@@ -829,6 +838,13 @@ impl MaintenanceState {
                     tracing::error!(
                         segment_base = segment.base_record_index,
                         "targeted post-rotation repair found a committed sealed segment with no verifiable copy"
+                    );
+                }
+                if report.objects_failed > 0 {
+                    tracing::error!(
+                        segment_base = segment.base_record_index,
+                        objects_failed = report.objects_failed,
+                        "targeted post-rotation repair left sealed copies that failed to rewrite"
                     );
                 }
             }

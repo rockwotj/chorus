@@ -46,6 +46,13 @@ fn check_inbound_message_size(encoded_len: usize) -> Result<(), Status> {
     Ok(())
 }
 
+/// Whether the live service answers `request` on a write stream: it responds
+/// only to a message that flushes, looks up state or finishes the write, so a
+/// one-shot client sees no response before its last message.
+fn answers(request: &BidiWriteObjectRequest) -> bool {
+    request.flush || request.state_lookup || request.finish_write
+}
+
 /// The tonic server built for the fake. Its own decode limit is lifted so the
 /// fake's cap check above is the one that rejects an oversized message, with
 /// the service's RESOURCE_EXHAUSTED rather than tonic's OUT_OF_RANGE.
@@ -1780,6 +1787,11 @@ impl Storage for FakeGcs {
                 // resumes, and continuations stay fast so sealing and the
                 // established lanes keep moving while a hold is pending.
                 let new_open = created_append.is_some();
+                // Data messages a one-shot client pipelines behind its first
+                // message while an open hold parks it; the live service
+                // accepts them, so they are applied after the open.
+                let mut pipelined = VecDeque::new();
+                let mut incoming_closed = false;
                 if new_open {
                     let held_at = {
                         let mut state = service.inner.lock().await;
@@ -1803,16 +1815,27 @@ impl Storage for FakeGcs {
                                         "appendable create response stream closed",
                                     ));
                                 }
-                                request = incoming.next() => {
-                                    return match request {
-                                        None => Err(Status::cancelled(
-                                            "appendable create request stream closed",
-                                        )),
-                                        Some(Err(status)) => Err(status),
-                                        Some(Ok(_)) => Err(Status::invalid_argument(
-                                            "appendable create continued before its open response",
-                                        )),
-                                    };
+                                request = incoming.next(), if !incoming_closed => {
+                                    match request {
+                                        // A half-close after pipelined data
+                                        // ends a complete one-shot request.
+                                        None if !pipelined.is_empty() => incoming_closed = true,
+                                        None => {
+                                            return Err(Status::cancelled(
+                                                "appendable create request stream closed",
+                                            ));
+                                        }
+                                        Some(Err(status)) => return Err(status),
+                                        Some(Ok(request)) if request.first_message.is_some() => {
+                                            return Err(Status::invalid_argument(
+                                                "first_message is only valid on the first stream request",
+                                            ));
+                                        }
+                                        Some(Ok(request)) => {
+                                            check_inbound_message_size(request.encoded_len())?;
+                                            pipelined.push_back(request);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1853,19 +1876,29 @@ impl Storage for FakeGcs {
                     }
                     service.flush_hold_gate(stream_id).await;
                 }
+                let first_answered = answers(&first);
                 let first_response = service.apply_bidi(first, stream_id).await?;
                 if let Some((bucket, object)) = created_append {
                     let spec = service.append_spec_for_created(bucket, object).await?;
                     opened_append =
                         Some((spec, stream_id.expect("appendable create stream has an id")));
                 }
-                tx.send(Ok(first_response))
-                    .await
-                    .map_err(|_| Status::cancelled("client closed response stream"))?;
-                service.close_stream_after_response(operation).await?;
+                if first_answered {
+                    tx.send(Ok(first_response))
+                        .await
+                        .map_err(|_| Status::cancelled("client closed response stream"))?;
+                    service.close_stream_after_response(operation).await?;
+                }
                 if let Some((spec, stream_id)) = opened_append.as_ref() {
-                    while let Some(request) = incoming.next().await {
-                        let request = request?;
+                    loop {
+                        let request = match pipelined.pop_front() {
+                            Some(request) => request,
+                            None if incoming_closed => break,
+                            None => match incoming.next().await {
+                                Some(request) => request?,
+                                None => break,
+                            },
+                        };
                         check_inbound_message_size(request.encoded_len())?;
                         let operation = classify_bidi_request(&request, true);
                         service.before(Operation::BidiWrite).await?;
@@ -1880,13 +1913,16 @@ impl Storage for FakeGcs {
                             service.finalize_hold_gate().await;
                         }
                         service.flush_hold_gate(*stream_id).await;
+                        let answered = answers(&request);
                         let response = service
                             .apply_append_continuation(spec, *stream_id, request)
                             .await?;
-                        tx.send(Ok(response))
-                            .await
-                            .map_err(|_| Status::cancelled("client closed response stream"))?;
-                        service.close_stream_after_response(operation).await?;
+                        if answered {
+                            tx.send(Ok(response))
+                                .await
+                                .map_err(|_| Status::cancelled("client closed response stream"))?;
+                            service.close_stream_after_response(operation).await?;
+                        }
                     }
                 } else if incoming.next().await.is_some() {
                     return Err(Status::invalid_argument(

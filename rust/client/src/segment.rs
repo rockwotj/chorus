@@ -567,6 +567,10 @@ pub struct RepairReport {
     /// history, so a nonzero count is the only signal that committed history has
     /// fallen below a finalized quorum.
     pub segments_without_source: usize,
+    /// Damaged zonal copies whose rewrite failed with a non-transient error.
+    /// The pass logs each one and continues, so one failing copy does not
+    /// leave later segments unrepaired; the next pass retries it.
+    pub objects_failed: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3268,7 +3272,7 @@ mod maintenance {
                 {
                     Ok(true) => report.objects_repaired += 1,
                     Ok(false) => report.objects_already_healthy += 1,
-                    Err(RepairCopyFailure { step, error }) => {
+                    Err(RepairCopyFailure { step, error }) if error.code.transient() => {
                         tracing::warn!(
                             zone,
                             segment_base = segment.base_record_index,
@@ -3280,10 +3284,24 @@ mod maintenance {
                             %error,
                             "sealed copy repair failed"
                         );
-                        if !error.code.transient() {
-                            return Err(error.into());
-                        }
                         report.transient_failures += 1;
+                    }
+                    Err(RepairCopyFailure { step, error }) => {
+                        // A copy that cannot be rewritten must not stop the pass:
+                        // every later segment would then go unrepaired on every
+                        // pass.
+                        tracing::error!(
+                            zone,
+                            segment_base = segment.base_record_index,
+                            segment_id = %segment.id,
+                            expected_crc32c = %format_args!("{expected_crc32c:08x}"),
+                            bytes = bytes.len(),
+                            step = step.as_str(),
+                            code = ?error.code,
+                            %error,
+                            "sealed copy repair failed with a non-transient error"
+                        );
+                        report.objects_failed += 1;
                     }
                 }
             }
