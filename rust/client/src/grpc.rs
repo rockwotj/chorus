@@ -152,15 +152,37 @@ struct LaneProgress {
     error: Option<TransportError>,
 }
 
-/// Target wire-message size for packed appends. Large enough to amortize
-/// per-message overhead (protobuf, CRC field, HTTP/2 framing, server
-/// per-message processing). The hard ceiling, measured live, is
-/// the service's 4 MiB gRPC inbound message cap — a 2 MiB + 1 byte chunk is
+/// Target wire-message size for every data-carrying write message. Large
+/// enough to amortize per-message overhead (protobuf, CRC field, HTTP/2
+/// framing, server per-message processing). The hard ceiling, measured live,
+/// is the service's 4 MiB gRPC inbound message cap — a 2 MiB + 1 byte chunk is
 /// accepted, 4 MiB is rejected with ResourceExhausted; the proto's only
 /// documented chunk constant (MaxReadChunkBytes = 2 MiB) is read-side.
 const WIRE_MESSAGE_TARGET_BYTES: usize = 262_144;
 
+/// The service's measured gRPC inbound message cap described above. A
+/// message over it fails with RESOURCE_EXHAUSTED on every attempt. The fake
+/// GCS service enforces the same value as `INBOUND_MESSAGE_CAP_BYTES`.
+const SERVICE_INBOUND_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+// A target-sized message plus its request envelope must stay under the cap.
+const _: () = assert!(WIRE_MESSAGE_TARGET_BYTES * 2 <= SERVICE_INBOUND_MESSAGE_CAP_BYTES);
+
+/// Pack `chunks` into wire messages of at most [`WIRE_MESSAGE_TARGET_BYTES`],
+/// each with its own CRC32C. Small chunks are concatenated; a chunk larger
+/// than the target is split, so no message can reach the service's inbound
+/// message cap whatever the size of one record or one rewritten object.
 pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
+    fn push(messages: &mut Vec<PackedAppendMessage>, relative_offset: &mut i64, content: Bytes) {
+        let len = content.len() as i64;
+        messages.push(PackedAppendMessage {
+            relative_offset: *relative_offset,
+            crc32c: crc32c::crc32c(&content),
+            content,
+        });
+        *relative_offset += len;
+    }
+
     let total_len = chunks.iter().map(Bytes::len).sum::<usize>();
     let mut packed =
         bytes::BytesMut::with_capacity(total_len.min(WIRE_MESSAGE_TARGET_BYTES.saturating_mul(2)));
@@ -168,26 +190,79 @@ pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
     let mut relative_offset = 0i64;
     for data in &chunks {
         if !packed.is_empty() && packed.len() + data.len() > WIRE_MESSAGE_TARGET_BYTES {
-            let content = packed.split().freeze();
-            let len = content.len() as i64;
-            messages.push(PackedAppendMessage {
-                relative_offset,
-                crc32c: crc32c::crc32c(&content),
-                content,
-            });
-            relative_offset += len;
+            push(&mut messages, &mut relative_offset, packed.split().freeze());
         }
-        packed.extend_from_slice(data);
+        // `packed` is empty whenever `rest` exceeds the target, so full-size
+        // pieces are sent as zero-copy slices of the chunk.
+        let mut rest = data.clone();
+        while rest.len() > WIRE_MESSAGE_TARGET_BYTES {
+            let piece = rest.split_to(WIRE_MESSAGE_TARGET_BYTES);
+            push(&mut messages, &mut relative_offset, piece);
+        }
+        packed.extend_from_slice(&rest);
     }
     if !packed.is_empty() {
-        let content = packed.freeze();
-        messages.push(PackedAppendMessage {
-            relative_offset,
-            crc32c: crc32c::crc32c(&content),
-            content,
-        });
+        push(&mut messages, &mut relative_offset, packed.freeze());
     }
     PackedAppend::new(chunks, messages, total_len)
+}
+
+/// One-shot write requests carrying `data` from `write_offset`: `first` names
+/// the object on the first message only, every data message stays under the
+/// inbound message cap, and the last message carries flush and state_lookup.
+/// Empty data sends `first` alone.
+fn one_shot_write_requests(
+    first: bidi_write_object_request::FirstMessage,
+    write_offset: i64,
+    data: Bytes,
+) -> Vec<BidiWriteObjectRequest> {
+    let packed = pack_append(vec![data]);
+    let messages = packed.messages();
+    if messages.is_empty() {
+        return vec![BidiWriteObjectRequest {
+            first_message: Some(first),
+            write_offset,
+            flush: true,
+            state_lookup: true,
+            ..Default::default()
+        }];
+    }
+    let last_index = messages.len() - 1;
+    let mut first = Some(first);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let last = index == last_index;
+            BidiWriteObjectRequest {
+                first_message: first.take(),
+                write_offset: write_offset + message.relative_offset,
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(message.crc32c),
+                        content: message.content.clone(),
+                    },
+                )),
+                flush: last,
+                state_lookup: last,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Whether a RESOURCE_EXHAUSTED status reports an oversized gRPC message rather
+/// than throttling. gRPC servers and tonic use the same code for both; only
+/// the status text tells them apart.
+fn is_message_size_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "larger than max",
+        "exceeds maximum",
+        "message length too large",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 /// Per-response progress timeout for the persistent session. The session
@@ -431,7 +506,18 @@ impl GrpcReplica {
         // tonic's codes. This mapper is shared by append and non-append RPCs:
         // RESOURCE_EXHAUSTED is GCS throttling, not a permanent rejection:
         // per-object mutation-rate and per-project quotas reset over time, so
-        // retrying the valid request with backoff can succeed.
+        // retrying the valid request with backoff can succeed. The exception is
+        // an oversized message, which the same code reports and which fails
+        // identically on every retry, so it maps to InvalidArgument.
+        if status.code() == Code::ResourceExhausted && is_message_size_rejection(status.message()) {
+            tracing::warn!(
+                zone = self.zone,
+                object = %self.object,
+                message = status.message(),
+                "gRPC message size rejected; treating as a non-retryable request error"
+            );
+            return self.error(TransportCode::InvalidArgument, status.message());
+        }
         let code = match status.code() {
             Code::NotFound => TransportCode::NotFound,
             Code::AlreadyExists => TransportCode::AlreadyExists,
@@ -1767,31 +1853,21 @@ impl Replica for GrpcReplica {
             content_type: "application/vnd.chorus.records".into(),
             ..Default::default()
         };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(observed.generation),
-                    if_metageneration_match: Some(observed.metageneration),
-                    appendable: Some(true),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            data: Some(bidi_write_object_request::Data::ChecksummedData(
-                ChecksummedData {
-                    crc32c: Some(crc32c::crc32c(&data)),
-                    content: data.clone(),
-                },
-            )),
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
+        let requests = one_shot_write_requests(
+            bidi_write_object_request::FirstMessage::WriteObjectSpec(WriteObjectSpec {
+                resource: Some(object),
+                if_generation_match: Some(observed.generation),
+                if_metageneration_match: Some(observed.metageneration),
+                appendable: Some(true),
+                ..Default::default()
+            }),
+            0,
+            data.clone(),
+        );
         let expected = data.len() as i64;
         let (persisted_size, error) = self
             .drive_redirect_aware_stream(
-                vec![request],
+                requests,
                 || None,
                 |persisted_size, response| {
                     if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =
@@ -1840,35 +1916,25 @@ impl Replica for GrpcReplica {
                 "one-shot append requires a generation-bound token",
             ));
         };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::AppendObjectSpec(
-                AppendObjectSpec {
-                    bucket: self.bucket.clone(),
-                    object: self.object.clone(),
-                    generation,
-                    if_metageneration_match: token.metageneration,
-                    write_handle: token
-                        .write_handle
-                        .clone()
-                        .map(|handle| BidiWriteHandle { handle }),
-                    ..Default::default()
-                },
-            )),
-            write_offset,
-            data: Some(bidi_write_object_request::Data::ChecksummedData(
-                ChecksummedData {
-                    content: Bytes::from(data.clone()),
-                    crc32c: Some(crc32c::crc32c(&data)),
-                },
-            )),
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
         let expected = write_offset + data.len() as i64;
+        let requests = one_shot_write_requests(
+            bidi_write_object_request::FirstMessage::AppendObjectSpec(AppendObjectSpec {
+                bucket: self.bucket.clone(),
+                object: self.object.clone(),
+                generation,
+                if_metageneration_match: token.metageneration,
+                write_handle: token
+                    .write_handle
+                    .clone()
+                    .map(|handle| BidiWriteHandle { handle }),
+                ..Default::default()
+            }),
+            write_offset,
+            Bytes::from(data),
+        );
         let (persisted_size, error) = self
             .drive_redirect_aware_stream(
-                vec![request],
+                requests,
                 || None,
                 |persisted_size, response| {
                     if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =

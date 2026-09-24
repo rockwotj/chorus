@@ -26,6 +26,33 @@ use proto::{
     Timestamp, UpdateObjectRequest,
 };
 
+/// The live service's gRPC inbound message cap, measured against Rapid
+/// buckets: a 2 MiB + 1 byte write message is accepted and a 4 MiB one is
+/// rejected with RESOURCE_EXHAUSTED. The fake rejects any write request whose
+/// encoded size exceeds it the same way, so an oversized client message fails
+/// here as it would in production. Mirrors `SERVICE_INBOUND_MESSAGE_CAP_BYTES`
+/// in `chorus-client`'s `grpc.rs`, which cannot be shared because that crate
+/// depends on this one.
+pub const INBOUND_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reject a write request message larger than [`INBOUND_MESSAGE_CAP_BYTES`],
+/// with the status a gRPC server returns for an oversized inbound message.
+fn check_inbound_message_size(encoded_len: usize) -> Result<(), Status> {
+    if encoded_len > INBOUND_MESSAGE_CAP_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "Received message larger than max ({encoded_len} vs. {INBOUND_MESSAGE_CAP_BYTES})"
+        )));
+    }
+    Ok(())
+}
+
+/// The tonic server built for the fake. Its own decode limit is lifted so the
+/// fake's cap check above is the one that rejects an oversized message, with
+/// the service's RESOURCE_EXHAUSTED rather than tonic's OUT_OF_RANGE.
+fn storage_server(service: FakeGcs) -> StorageServer<FakeGcs> {
+    StorageServer::new(service).max_decoding_message_size(usize::MAX)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Operation {
     Delete,
@@ -307,7 +334,7 @@ impl FakeGcs {
         let service = self.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(StorageServer::new(service))
+                .add_service(storage_server(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
                 })
@@ -341,7 +368,7 @@ impl FakeGcs {
         IE: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         tonic::transport::Server::builder()
-            .add_service(StorageServer::new(self))
+            .add_service(storage_server(self))
             .serve_with_incoming(incoming)
             .await
     }
@@ -1032,6 +1059,7 @@ impl FakeGcs {
         first: BidiWriteObjectRequest,
         routing_token: Option<&str>,
     ) -> Result<SimSessionOpen, Status> {
+        check_inbound_message_size(first.encoded_len())?;
         self.before(Operation::BidiWrite).await?;
         let operation = classify_bidi_request(&first, false);
         let object = bidi_object(&first).map(|(b, o)| (b.to_string(), o.to_string()));
@@ -1147,6 +1175,7 @@ impl FakeGcs {
         request: BidiWriteObjectRequest,
         routing_token: Option<&str>,
     ) -> Result<(BidiWriteObjectResponse, Option<Status>), Status> {
+        check_inbound_message_size(request.encoded_len())?;
         let operation = classify_bidi_request(&request, true);
         let before_delay = self.before_charge(Operation::BidiWrite).await?;
         let bidi_delay = self
@@ -1261,6 +1290,7 @@ impl FakeGcs {
         &self,
         first: proto::WriteObjectRequest,
     ) -> Result<proto::WriteObjectResponse, Status> {
+        check_inbound_message_size(first.encoded_len())?;
         self.before(Operation::BidiWrite).await?;
         let Some(proto::write_object_request::FirstMessage::WriteObjectSpec(spec)) =
             first.first_message
@@ -1677,6 +1707,7 @@ impl Storage for FakeGcs {
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty write stream"))??;
+        check_inbound_message_size(first.encoded_len())?;
         let Some(proto::write_object_request::FirstMessage::WriteObjectSpec(spec)) =
             first.first_message
         else {
@@ -1699,6 +1730,7 @@ impl Storage for FakeGcs {
         let mut finished = first.finish_write;
         while let Some(next) = incoming.next().await {
             let next = next?;
+            check_inbound_message_size(next.encoded_len())?;
             if let Some(proto::write_object_request::Data::ChecksummedData(data)) = &next.data {
                 bytes.extend_from_slice(&data.content);
             }
@@ -1720,6 +1752,7 @@ impl Storage for FakeGcs {
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty bidi stream"))??;
+        check_inbound_message_size(first.encoded_len())?;
         let operation = classify_bidi_request(&first, false);
         self.before_bidi(operation, routing_token.as_deref(), bidi_object(&first))
             .await?;
@@ -1833,6 +1866,7 @@ impl Storage for FakeGcs {
                 if let Some((spec, stream_id)) = opened_append.as_ref() {
                     while let Some(request) = incoming.next().await {
                         let request = request?;
+                        check_inbound_message_size(request.encoded_len())?;
                         let operation = classify_bidi_request(&request, true);
                         service.before(Operation::BidiWrite).await?;
                         service

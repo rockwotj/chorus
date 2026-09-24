@@ -3061,11 +3061,12 @@ mod maintenance {
     }
 
     /// Health of one zonal copy as the listing describes it.
-    enum CopyHealth {
+    enum CopyHealth<'a> {
         /// Present, finalized, well-formed, and carrying the committed CRC32C.
         Healthy,
-        /// Absent, unfinalized, or carrying a different CRC32C.
-        Damaged,
+        /// Absent (`None`), unfinalized, malformed, or carrying a different
+        /// CRC32C.
+        Damaged(Option<&'a ListedObject>),
         /// The zone did not answer its listing.
         Unknown,
     }
@@ -3101,7 +3102,7 @@ mod maintenance {
             Self { zones }
         }
 
-        fn health(&self, zone: usize, object: &str, expected_crc32c: u32) -> CopyHealth {
+        fn health(&self, zone: usize, object: &str, expected_crc32c: u32) -> CopyHealth<'_> {
             let Some(Some(listed)) = self.zones.get(zone) else {
                 return CopyHealth::Unknown;
             };
@@ -3113,9 +3114,51 @@ mod maintenance {
                 {
                     CopyHealth::Healthy
                 }
-                _ => CopyHealth::Damaged,
+                found => CopyHealth::Damaged(found),
             }
         }
+    }
+
+    /// The `repair_sealed_copy` step that failed, named in the repair log.
+    #[derive(Clone, Copy, Debug)]
+    enum RepairStep {
+        Snapshot,
+        Stat,
+        Delete,
+        ReplaceAppendable,
+        CreateAppendable,
+        Takeover,
+        Append,
+        Finalize,
+    }
+
+    impl RepairStep {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Snapshot => "snapshot",
+                Self::Stat => "stat",
+                Self::Delete => "delete",
+                Self::ReplaceAppendable => "replace_appendable",
+                Self::CreateAppendable => "create_appendable",
+                Self::Takeover => "takeover",
+                Self::Append => "append",
+                Self::Finalize => "finalize",
+            }
+        }
+    }
+
+    /// A failed `repair_sealed_copy`, with the step that returned the error.
+    struct RepairCopyFailure {
+        step: RepairStep,
+        error: TransportError,
+    }
+
+    /// Attach `step` to a transport error from one `repair_sealed_copy` call.
+    fn at_step<T>(
+        step: RepairStep,
+        result: Result<T, TransportError>,
+    ) -> Result<T, RepairCopyFailure> {
+        result.map_err(|error| RepairCopyFailure { step, error })
     }
 
     /// One repair pass over `segments` at the committed `floor`: assess every
@@ -3153,6 +3196,11 @@ mod maintenance {
                 // finalized the object yet: there is no finalized source to copy
                 // from by design, not by loss. The seal's own follow-up pass
                 // returns here with the flag cleared.
+                tracing::debug!(
+                    segment_base = segment.base_record_index,
+                    segment_id = %segment.id,
+                    "repair pass skipped a segment whose committed seal is not yet finalized"
+                );
                 continue;
             }
             report.segments_examined += 1;
@@ -3165,7 +3213,23 @@ mod maintenance {
                 match index.health(zone, &object, expected_crc32c) {
                     CopyHealth::Healthy => report.objects_already_healthy += 1,
                     CopyHealth::Unknown => report.transient_failures += 1,
-                    CopyHealth::Damaged => targets.push(Arc::clone(replica)),
+                    CopyHealth::Damaged(listed) => {
+                        tracing::info!(
+                            zone,
+                            segment_base = segment.base_record_index,
+                            segment_id = %segment.id,
+                            present = listed.is_some(),
+                            listed_size = listed.map(|found| found.size),
+                            finalized = listed.map(|found| found.finalized),
+                            valid_format = listed.map(|found| valid_format(&found.metadata)),
+                            listed_crc32c = ?listed
+                                .and_then(|found| found.crc32c)
+                                .map(|crc| format!("{crc:08x}")),
+                            expected_crc32c = %format_args!("{expected_crc32c:08x}"),
+                            "repair pass found a damaged sealed copy"
+                        );
+                        targets.push((zone, Arc::clone(replica)));
+                    }
                 }
             }
             if targets.is_empty() {
@@ -3193,7 +3257,7 @@ mod maintenance {
             // a rewritten copy carries the constant creation metadata: the
             // format marker only, like every segment object
             let metadata = crate::protocol::protocol_metadata();
-            for replica in targets {
+            for (zone, replica) in targets {
                 match repair_sealed_copy(
                     &replica,
                     Bytes::from(bytes.clone()),
@@ -3204,8 +3268,23 @@ mod maintenance {
                 {
                     Ok(true) => report.objects_repaired += 1,
                     Ok(false) => report.objects_already_healthy += 1,
-                    Err(error) if error.code.transient() => report.transient_failures += 1,
-                    Err(error) => return Err(error.into()),
+                    Err(RepairCopyFailure { step, error }) => {
+                        tracing::warn!(
+                            zone,
+                            segment_base = segment.base_record_index,
+                            segment_id = %segment.id,
+                            expected_crc32c = %format_args!("{expected_crc32c:08x}"),
+                            bytes = bytes.len(),
+                            step = step.as_str(),
+                            code = ?error.code,
+                            %error,
+                            "sealed copy repair failed"
+                        );
+                        if !error.code.transient() {
+                            return Err(error.into());
+                        }
+                        report.transient_failures += 1;
+                    }
                 }
             }
         }
@@ -3478,7 +3557,7 @@ mod maintenance {
         bytes: Bytes,
         metadata: HashMap<String, String>,
         expected_crc32c: u32,
-    ) -> Result<bool, TransportError> {
+    ) -> Result<bool, RepairCopyFailure> {
         let current = match replica.snapshot().await {
             Ok(snapshot) => Some(snapshot),
             Err(error) if error.code == TransportCode::NotFound => None,
@@ -3488,15 +3567,25 @@ mod maintenance {
                 // fall through to recreate from the healthy canonical bytes. A
                 // racing repairer makes the guarded delete fail, and the next
                 // pass converges.
-                let stat = replica.stat().await?;
+                let stat = at_step(RepairStep::Stat, replica.stat().await)?;
                 match replica.delete(stat.generation).await {
                     Ok(()) => {}
                     Err(error) if error.code == TransportCode::NotFound => {}
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(RepairCopyFailure {
+                            step: RepairStep::Delete,
+                            error,
+                        })
+                    }
                 }
                 None
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(RepairCopyFailure {
+                    step: RepairStep::Snapshot,
+                    error,
+                })
+            }
         };
         if current.as_ref().is_some_and(|snapshot| {
             snapshot.finalized
@@ -3511,33 +3600,46 @@ mod maintenance {
         }
 
         let mut token = match current {
-            Some(snapshot) => {
+            Some(snapshot) => at_step(
+                RepairStep::ReplaceAppendable,
                 replica
                     .replace_appendable(&snapshot, bytes.clone(), metadata)
-                    .await?
-            }
+                    .await,
+            )?,
             None => {
-                let created = replica.create_appendable(metadata).await?;
-                let mut token = replica.takeover(&created).await?;
+                let created = at_step(
+                    RepairStep::CreateAppendable,
+                    replica.create_appendable(metadata).await,
+                )?;
+                let mut token = at_step(RepairStep::Takeover, replica.takeover(&created).await)?;
                 if !bytes.is_empty() {
-                    token.persisted_size = replica.append(&token, 0, bytes.to_vec()).await?;
+                    token.persisted_size = at_step(
+                        RepairStep::Append,
+                        replica.append(&token, 0, bytes.to_vec()).await,
+                    )?;
                 }
                 token
             }
         };
         token.persisted_size = bytes.len() as i64;
-        let finalized = replica.finalize(&mut token, bytes.len() as i64).await?;
+        let finalized = at_step(
+            RepairStep::Finalize,
+            replica.finalize(&mut token, bytes.len() as i64).await,
+        )?;
         if finalized.crc32c != Some(expected_crc32c) {
             let actual = finalized
                 .crc32c
                 .map(|crc| format!("{crc:08x}"))
                 .unwrap_or_else(|| "missing".into());
-            return Err(TransportError {
-                zone: finalized.zone,
-                code: TransportCode::DataLoss,
-                message: format!(
-                    "repaired sealed object reported CRC32C {actual}, expected {expected_crc32c:08x}"
-                ),
+            return Err(RepairCopyFailure {
+                step: RepairStep::Finalize,
+                error: TransportError {
+                    zone: finalized.zone,
+                    code: TransportCode::DataLoss,
+                    message: format!(
+                        "repaired sealed object reported CRC32C {actual}, expected {expected_crc32c:08x}"
+                    ),
+                },
             });
         }
         Ok(true)
