@@ -63,17 +63,6 @@ pub struct GrpcReplicaFactory {
     routing_token: RoutingToken,
 }
 
-#[cfg(test)]
-impl GrpcReplicaFactory {
-    // The in-process fake returns an entire object in one read response.
-    // Large manual recovery fixtures need a higher limit than real GCS's
-    // chunked responses; production channels keep the default message limit.
-    pub(crate) fn with_test_read_message_limit(mut self, limit: usize) -> Self {
-        self.client = self.client.max_decoding_message_size(limit);
-        self
-    }
-}
-
 /// A live appendable write stream: an ordered request sender plus a
 /// background reader translating flush acknowledgments into a watchable
 /// durable tail. Send-ahead lanes write through `tx` while waiting on
@@ -152,15 +141,37 @@ struct LaneProgress {
     error: Option<TransportError>,
 }
 
-/// Target wire-message size for packed appends. Large enough to amortize
-/// per-message overhead (protobuf, CRC field, HTTP/2 framing, server
-/// per-message processing). The hard ceiling, measured live, is
-/// the service's 4 MiB gRPC inbound message cap — a 2 MiB + 1 byte chunk is
+/// Target wire-message size for every data-carrying write message. Large
+/// enough to amortize per-message overhead (protobuf, CRC field, HTTP/2
+/// framing, server per-message processing). The hard ceiling, measured live,
+/// is the service's 4 MiB gRPC inbound message cap — a 2 MiB + 1 byte chunk is
 /// accepted, 4 MiB is rejected with ResourceExhausted; the proto's only
 /// documented chunk constant (MaxReadChunkBytes = 2 MiB) is read-side.
 const WIRE_MESSAGE_TARGET_BYTES: usize = 262_144;
 
-pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
+/// The service's measured gRPC inbound message cap described above. A
+/// message over it fails with RESOURCE_EXHAUSTED on every attempt. The fake
+/// GCS service enforces the same value as `INBOUND_MESSAGE_CAP_BYTES`.
+const SERVICE_INBOUND_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+// A target-sized message plus its request envelope must stay under the cap.
+const _: () = assert!(WIRE_MESSAGE_TARGET_BYTES * 2 <= SERVICE_INBOUND_MESSAGE_CAP_BYTES);
+
+/// Pack `chunks` into wire messages of at most [`WIRE_MESSAGE_TARGET_BYTES`],
+/// each with its own CRC32C. Small chunks are concatenated; a chunk larger
+/// than the target is split, so no message can reach the service's inbound
+/// message cap whatever the size of one record or one rewritten object.
+pub fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
+    fn push(messages: &mut Vec<PackedAppendMessage>, relative_offset: &mut i64, content: Bytes) {
+        let len = content.len() as i64;
+        messages.push(PackedAppendMessage {
+            relative_offset: *relative_offset,
+            crc32c: crc32c::crc32c(&content),
+            content,
+        });
+        *relative_offset += len;
+    }
+
     let total_len = chunks.iter().map(Bytes::len).sum::<usize>();
     let mut packed =
         bytes::BytesMut::with_capacity(total_len.min(WIRE_MESSAGE_TARGET_BYTES.saturating_mul(2)));
@@ -168,26 +179,88 @@ pub(crate) fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
     let mut relative_offset = 0i64;
     for data in &chunks {
         if !packed.is_empty() && packed.len() + data.len() > WIRE_MESSAGE_TARGET_BYTES {
-            let content = packed.split().freeze();
-            let len = content.len() as i64;
-            messages.push(PackedAppendMessage {
-                relative_offset,
-                crc32c: crc32c::crc32c(&content),
-                content,
-            });
-            relative_offset += len;
+            push(&mut messages, &mut relative_offset, packed.split().freeze());
         }
-        packed.extend_from_slice(data);
+        // `packed` is empty whenever `rest` exceeds the target, so full-size
+        // pieces are sent as zero-copy slices of the chunk.
+        let mut rest = data.clone();
+        while rest.len() > WIRE_MESSAGE_TARGET_BYTES {
+            let piece = rest.split_to(WIRE_MESSAGE_TARGET_BYTES);
+            push(&mut messages, &mut relative_offset, piece);
+        }
+        packed.extend_from_slice(&rest);
     }
     if !packed.is_empty() {
-        let content = packed.freeze();
-        messages.push(PackedAppendMessage {
-            relative_offset,
-            crc32c: crc32c::crc32c(&content),
-            content,
-        });
+        push(&mut messages, &mut relative_offset, packed.freeze());
     }
     PackedAppend::new(chunks, messages, total_len)
+}
+
+/// One-shot write requests carrying `data` from `write_offset`: `first` names
+/// the object on the first message only, every data message stays under the
+/// inbound message cap, and the last message carries flush and state_lookup.
+/// Empty data sends `first` alone with an empty checksummed payload: the
+/// service answers a data-carrying message with the persisted size, which
+/// `append` and `replace_appendable` wait for, and a data-less one with the
+/// object resource.
+fn one_shot_write_requests(
+    first: bidi_write_object_request::FirstMessage,
+    write_offset: i64,
+    data: Bytes,
+) -> Vec<BidiWriteObjectRequest> {
+    let packed = pack_append(vec![data]);
+    let messages = packed.messages();
+    if messages.is_empty() {
+        return vec![BidiWriteObjectRequest {
+            first_message: Some(first),
+            write_offset,
+            data: Some(bidi_write_object_request::Data::ChecksummedData(
+                ChecksummedData {
+                    crc32c: Some(crc32c::crc32c(&[])),
+                    content: Bytes::new(),
+                },
+            )),
+            flush: true,
+            state_lookup: true,
+            ..Default::default()
+        }];
+    }
+    let last_index = messages.len() - 1;
+    let mut first = Some(first);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let last = index == last_index;
+            BidiWriteObjectRequest {
+                first_message: first.take(),
+                write_offset: write_offset + message.relative_offset,
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(message.crc32c),
+                        content: message.content.clone(),
+                    },
+                )),
+                flush: last,
+                state_lookup: last,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Whether a RESOURCE_EXHAUSTED status reports an oversized inbound message
+/// rather than throttling. The service returns the same code for both, so
+/// only the status text tells them apart. The one phrase matched is the gRPC
+/// C++ core server's inbound-limit rejection, "Received message larger than
+/// max (N vs. LIMIT)", which the GCS gRPC frontend returns for a write
+/// message over the cap. Throttling messages ("rate limit", "quota") do not
+/// contain it. Tonic's own size errors use OUT_OF_RANGE and never reach this
+/// check.
+fn is_message_size_rejection(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("received message larger than max")
 }
 
 /// Per-response progress timeout for the persistent session. The session
@@ -431,7 +504,18 @@ impl GrpcReplica {
         // tonic's codes. This mapper is shared by append and non-append RPCs:
         // RESOURCE_EXHAUSTED is GCS throttling, not a permanent rejection:
         // per-object mutation-rate and per-project quotas reset over time, so
-        // retrying the valid request with backoff can succeed.
+        // retrying the valid request with backoff can succeed. The exception is
+        // an oversized message, which the same code reports and which fails
+        // identically on every retry, so it maps to InvalidArgument.
+        if status.code() == Code::ResourceExhausted && is_message_size_rejection(status.message()) {
+            tracing::warn!(
+                zone = self.zone,
+                object = %self.object,
+                message = status.message(),
+                "gRPC message size rejected; treating as a non-retryable request error"
+            );
+            return self.error(TransportCode::InvalidArgument, status.message());
+        }
         let code = match status.code() {
             Code::NotFound => TransportCode::NotFound,
             Code::AlreadyExists => TransportCode::AlreadyExists,
@@ -1767,31 +1851,21 @@ impl Replica for GrpcReplica {
             content_type: "application/vnd.chorus.records".into(),
             ..Default::default()
         };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(observed.generation),
-                    if_metageneration_match: Some(observed.metageneration),
-                    appendable: Some(true),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            data: Some(bidi_write_object_request::Data::ChecksummedData(
-                ChecksummedData {
-                    crc32c: Some(crc32c::crc32c(&data)),
-                    content: data.clone(),
-                },
-            )),
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
+        let requests = one_shot_write_requests(
+            bidi_write_object_request::FirstMessage::WriteObjectSpec(WriteObjectSpec {
+                resource: Some(object),
+                if_generation_match: Some(observed.generation),
+                if_metageneration_match: Some(observed.metageneration),
+                appendable: Some(true),
+                ..Default::default()
+            }),
+            0,
+            data.clone(),
+        );
         let expected = data.len() as i64;
         let (persisted_size, error) = self
             .drive_redirect_aware_stream(
-                vec![request],
+                requests,
                 || None,
                 |persisted_size, response| {
                     if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =
@@ -1840,35 +1914,25 @@ impl Replica for GrpcReplica {
                 "one-shot append requires a generation-bound token",
             ));
         };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::AppendObjectSpec(
-                AppendObjectSpec {
-                    bucket: self.bucket.clone(),
-                    object: self.object.clone(),
-                    generation,
-                    if_metageneration_match: token.metageneration,
-                    write_handle: token
-                        .write_handle
-                        .clone()
-                        .map(|handle| BidiWriteHandle { handle }),
-                    ..Default::default()
-                },
-            )),
-            write_offset,
-            data: Some(bidi_write_object_request::Data::ChecksummedData(
-                ChecksummedData {
-                    content: Bytes::from(data.clone()),
-                    crc32c: Some(crc32c::crc32c(&data)),
-                },
-            )),
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
         let expected = write_offset + data.len() as i64;
+        let requests = one_shot_write_requests(
+            bidi_write_object_request::FirstMessage::AppendObjectSpec(AppendObjectSpec {
+                bucket: self.bucket.clone(),
+                object: self.object.clone(),
+                generation,
+                if_metageneration_match: token.metageneration,
+                write_handle: token
+                    .write_handle
+                    .clone()
+                    .map(|handle| BidiWriteHandle { handle }),
+                ..Default::default()
+            }),
+            write_offset,
+            Bytes::from(data),
+        );
         let (persisted_size, error) = self
             .drive_redirect_aware_stream(
-                vec![request],
+                requests,
                 || None,
                 |persisted_size, response| {
                     if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =
@@ -2130,4 +2194,165 @@ pub fn redirect_routing_token(status: &Status) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET: usize = WIRE_MESSAGE_TARGET_BYTES;
+
+    fn patterned(len: usize, seed: u8) -> Bytes {
+        (0..len)
+            .map(|index| (index as u8).wrapping_add(seed))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// Assert that `messages` are contiguous from offset zero, carry their own
+    /// CRC32C, stay within the target size, and concatenate to `chunks`.
+    fn assert_frames(messages: &[PackedAppendMessage], chunks: &[Bytes]) {
+        let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        let mut framed = Vec::new();
+        for message in messages {
+            assert_eq!(message.relative_offset, framed.len() as i64);
+            assert_eq!(message.crc32c, crc32c::crc32c(&message.content));
+            assert!(!message.content.is_empty());
+            assert!(message.content.len() <= TARGET);
+            framed.extend_from_slice(&message.content);
+        }
+        assert_eq!(framed, expected);
+    }
+
+    fn data(request: &BidiWriteObjectRequest) -> &ChecksummedData {
+        match request.data.as_ref() {
+            Some(bidi_write_object_request::Data::ChecksummedData(data)) => data,
+            None => panic!("write request carries no data"),
+        }
+    }
+
+    fn append_spec() -> bidi_write_object_request::FirstMessage {
+        bidi_write_object_request::FirstMessage::AppendObjectSpec(AppendObjectSpec {
+            bucket: "projects/_/buckets/zone-0".into(),
+            object: "segment".into(),
+            generation: 7,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn pack_append_splits_a_chunk_larger_than_the_target_into_zero_copy_slices() {
+        let head = patterned(100, 1);
+        let large = patterned(3 * TARGET + 17, 2);
+        let tail = patterned(50, 3);
+        let chunks = vec![head.clone(), large.clone(), tail.clone()];
+        let packed = pack_append(chunks.clone());
+        let messages = packed.messages();
+
+        assert_frames(messages, &chunks);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.len())
+                .collect::<Vec<_>>(),
+            vec![100, TARGET, TARGET, TARGET, 17 + 50]
+        );
+        // Full-size pieces of the large chunk share its allocation.
+        for (piece, message) in messages[1..4].iter().enumerate() {
+            assert_eq!(
+                message.content.as_ptr(),
+                large[piece * TARGET..].as_ptr(),
+                "piece {piece} was copied"
+            );
+        }
+        // The chunk list keeps record boundaries for commit accounting.
+        assert_eq!(packed.chunks(), chunks.as_slice());
+        assert_eq!(packed.len(), 100 + large.len() + 50);
+    }
+
+    #[test]
+    fn pack_append_keeps_a_target_sized_chunk_in_one_message() {
+        let exact = patterned(TARGET, 4);
+        let next = patterned(1, 5);
+        let chunks = vec![exact, next];
+        let packed = pack_append(chunks.clone());
+
+        assert_frames(packed.messages(), &chunks);
+        assert_eq!(packed.messages().len(), 2);
+        assert_eq!(packed.messages()[0].content.len(), TARGET);
+    }
+
+    #[test]
+    fn one_shot_writes_split_data_under_the_inbound_cap() {
+        let payload = patterned(SERVICE_INBOUND_MESSAGE_CAP_BYTES * 2 + 3, 6);
+        let requests = one_shot_write_requests(append_spec(), 40, payload.clone());
+
+        assert_eq!(
+            requests.len(),
+            payload.len().div_ceil(WIRE_MESSAGE_TARGET_BYTES)
+        );
+        let last = requests.len() - 1;
+        let mut written = Vec::new();
+        for (index, request) in requests.iter().enumerate() {
+            assert!(request.encoded_len() <= SERVICE_INBOUND_MESSAGE_CAP_BYTES);
+            assert_eq!(request.first_message.is_some(), index == 0);
+            assert_eq!(request.flush, index == last);
+            assert_eq!(request.state_lookup, index == last);
+            assert!(!request.finish_write);
+            assert_eq!(request.write_offset, 40 + written.len() as i64);
+            let data = data(request);
+            assert_eq!(data.crc32c, Some(crc32c::crc32c(&data.content)));
+            written.extend_from_slice(&data.content);
+        }
+        assert_eq!(written, payload);
+    }
+
+    #[test]
+    fn one_shot_write_of_empty_data_sends_one_checksummed_empty_message() {
+        let requests = one_shot_write_requests(append_spec(), 12, Bytes::new());
+
+        let [request] = requests.as_slice() else {
+            panic!("an empty one-shot write is one message");
+        };
+        assert!(request.first_message.is_some());
+        assert_eq!(request.write_offset, 12);
+        assert!(request.flush);
+        assert!(request.state_lookup);
+        let data = data(request);
+        assert!(data.content.is_empty());
+        assert_eq!(data.crc32c, Some(crc32c::crc32c(&[])));
+    }
+
+    #[tokio::test]
+    async fn only_an_oversized_message_rejection_leaves_the_transient_class() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let factory =
+            GrpcReplicaFactory::from_channel(1, channel, "projects/_/buckets/zone-1", None);
+        let replica = GrpcReplica {
+            zone: factory.zone,
+            bucket: factory.bucket.clone(),
+            object: "segment".into(),
+            auth: None,
+            client: factory.client.clone(),
+            routing_token: factory.routing_token.clone(),
+            read_session: Arc::new(SessionMutex::new(None)),
+            session: Arc::new(SessionSlot::new()),
+        };
+
+        let oversized = replica.status(Status::resource_exhausted(
+            "Received message larger than max (4194400 vs. 4194304)",
+        ));
+        assert_eq!(oversized.zone, 1);
+        assert_eq!(oversized.code, TransportCode::InvalidArgument);
+        assert!(!oversized.code.transient());
+
+        for throttled in [
+            "Quota exceeded for quota metric 'Write requests'",
+            "The object exceeded the rate limit for object mutation operations.",
+        ] {
+            let error = replica.status(Status::resource_exhausted(throttled));
+            assert_eq!(error.code, TransportCode::ResourceExhausted);
+            assert!(error.code.transient());
+        }
+    }
 }

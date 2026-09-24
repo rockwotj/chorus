@@ -109,8 +109,9 @@ pub use transport::TransportCode;
 /// supplies an in-memory `ReplicaFactory` in place of the gRPC transport.
 #[cfg(feature = "dst-support")]
 pub use transport::{
-    AppendSessionId, AppendToken, LaneDurableChange, LaneSessionDiagnostics, ListedObject, Replica,
-    ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot, TransportError,
+    AppendSessionId, AppendToken, LaneDurableChange, LaneSessionDiagnostics, ListedObject,
+    PackedAppend, PackedAppendMessage, Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot,
+    TransportError,
 };
 
 /// Helpers for repository probes that intentionally share transport details.
@@ -136,6 +137,10 @@ pub mod probe_support {
 pub mod dst_support {
     use crate::manifest::directory_has_room_for;
     use crate::manifest_store::GCS_MAX_DIRECTORY_BYTES;
+
+    /// The gRPC transport's wire-message packing, so the simulation transport
+    /// splits lane groups, replacements and one-shot appends identically.
+    pub use crate::grpc::pack_append;
 
     /// Whether the GCS-backed segment directory whose entries are currently
     /// `encoded_segments` (the `chorus.segments` register value) can take

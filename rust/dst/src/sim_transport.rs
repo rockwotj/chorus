@@ -30,9 +30,10 @@ use chorus_fake_gcs::proto::{
 use chorus_fake_gcs::{FakeGcs, SimSessionOpen};
 use tonic::{Code, Request, Status};
 
+use chorus_client::dst_support::pack_append;
 use chorus_client::{
-    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaRangeRead,
-    ReplicaSnapshot, TransportCode, TransportError,
+    AppendToken, LaneDurableChange, ListedObject, PackedAppend, Replica, ReplicaFactory,
+    ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
 };
 
 fn map_code(status: &Status) -> TransportCode {
@@ -270,6 +271,64 @@ impl InMemoryReplica {
         }
     }
 
+    /// Send `template` with `data` split exactly as the gRPC transport's
+    /// one-shot writes split it: `template`'s first message and the first data
+    /// piece open the stream, later pieces continue it, and only the last
+    /// message keeps `template`'s flush, state_lookup and finish_write. The
+    /// returned open carries the last response. Empty data sends `template`
+    /// unchanged.
+    async fn open_split(
+        &self,
+        template: BidiWriteObjectRequest,
+        data: Bytes,
+    ) -> Result<SimSessionOpen, TransportError> {
+        let packed = pack_append(vec![data]);
+        let messages = packed.messages();
+        let Some(last_index) = messages.len().checked_sub(1) else {
+            return self.open(template).await;
+        };
+        let request_for = |index: usize| {
+            let message = &messages[index];
+            let last = index == last_index;
+            BidiWriteObjectRequest {
+                first_message: if index == 0 {
+                    template.first_message.clone()
+                } else {
+                    None
+                },
+                write_offset: template.write_offset + message.relative_offset(),
+                data: Some(bidi_write_object_request::Data::ChecksummedData(
+                    ChecksummedData {
+                        crc32c: Some(message.crc32c()),
+                        content: message.content().to_vec(),
+                    },
+                )),
+                flush: template.flush && last,
+                state_lookup: template.state_lookup && last,
+                finish_write: template.finish_write && last,
+            }
+        };
+        let mut open = self.open(request_for(0)).await?;
+        if last_index == 0 {
+            return Ok(open);
+        }
+        let Some((spec, stream_id)) = open.append.clone() else {
+            return Err(err(
+                self.zone,
+                TransportCode::Internal,
+                "split write opened no stream to continue",
+            ));
+        };
+        for index in 1..=last_index {
+            open.response = self
+                .fake
+                .sim_continue(&spec, stream_id, request_for(index), None)
+                .await
+                .map_err(|status| status_err(self.zone, &status))?;
+        }
+        Ok(open)
+    }
+
     async fn open(&self, first: BidiWriteObjectRequest) -> Result<SimSessionOpen, TransportError> {
         // Race the open against shutdown so a `shutdown()` during graceful
         // provisioner teardown cancels an open parked on an injected open-hold
@@ -398,10 +457,10 @@ impl InMemoryReplica {
     async fn enqueue_lane_group(
         &self,
         write_offset: i64,
-        chunks: &[Bytes],
+        packed: &PackedAppend,
         flush: bool,
     ) -> Result<(), TransportError> {
-        if chunks.is_empty() {
+        if packed.messages().is_empty() {
             return Err(err(
                 self.zone,
                 TransportCode::Internal,
@@ -416,30 +475,32 @@ impl InMemoryReplica {
                 "append session disconnected while sending",
             )
         })?;
-        // Build the flush group's wire messages; the final message carries
-        // flush + state_lookup, matching the gRPC lane's flushed write group.
-        // Only enqueue here — the apply (which may park on an injected flush
-        // hold) happens in `lane_durable_change`, so this stays non-blocking.
-        let last_index = chunks.len() - 1;
-        let mut relative_offset = 0i64;
-        let mut group = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.iter().enumerate() {
-            let last = index == last_index;
-            group.push(BidiWriteObjectRequest {
-                first_message: None,
-                write_offset: write_offset + relative_offset,
-                data: Some(bidi_write_object_request::Data::ChecksummedData(
-                    ChecksummedData {
-                        crc32c: Some(crc32c::crc32c(chunk)),
-                        content: chunk.to_vec(),
-                    },
-                )),
-                flush: flush && last,
-                state_lookup: flush && last,
-                ..Default::default()
-            });
-            relative_offset += chunk.len() as i64;
-        }
+        // Build the flush group's wire messages from the same packing the gRPC
+        // lane sends; the final message carries flush + state_lookup. Only
+        // enqueue here — the apply (which may park on an injected flush hold)
+        // happens in `lane_durable_change`, so this stays non-blocking.
+        let messages = packed.messages();
+        let last_index = messages.len() - 1;
+        let group = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let last = index == last_index;
+                BidiWriteObjectRequest {
+                    first_message: None,
+                    write_offset: write_offset + message.relative_offset(),
+                    data: Some(bidi_write_object_request::Data::ChecksummedData(
+                        ChecksummedData {
+                            crc32c: Some(message.crc32c()),
+                            content: message.content().to_vec(),
+                        },
+                    )),
+                    flush: flush && last,
+                    state_lookup: flush && last,
+                    ..Default::default()
+                }
+            })
+            .collect();
         session.pending.push_back(group);
         Ok(())
     }
@@ -715,17 +776,11 @@ impl Replica for InMemoryReplica {
                 },
             )),
             write_offset: 0,
-            data: (!data.is_empty()).then(|| {
-                bidi_write_object_request::Data::ChecksummedData(ChecksummedData {
-                    crc32c: Some(crc32c::crc32c(&data)),
-                    content: data.to_vec(),
-                })
-            }),
             flush: true,
             state_lookup: true,
             ..Default::default()
         };
-        let open = self.open(request).await?;
+        let open = self.open_split(request, data).await?;
         let (persisted_size, write_handle) = self.token_from_open(&open, None);
         self.store_session(&open).await;
         Ok(AppendToken {
@@ -751,15 +806,18 @@ impl Replica for InMemoryReplica {
             ));
         };
         let expected = write_offset + data.len() as i64;
+        // An empty append keeps its empty checksummed payload, which the
+        // service answers with a persisted size.
+        let data = Bytes::from(data);
         let request = self.open_request_append(
             generation,
             token.metageneration,
             token.write_handle.clone(),
             write_offset,
-            Some(data),
+            data.is_empty().then(Vec::new),
             false,
         );
-        let open = self.open(request).await?;
+        let open = self.open_split(request, data).await?;
         let persisted = open
             .response
             .write_status
@@ -778,7 +836,16 @@ impl Replica for InMemoryReplica {
     }
 
     async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, chunks, true).await
+        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), true)
+            .await
+    }
+
+    async fn lane_send_packed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.enqueue_lane_group(write_offset, packed, true).await
     }
 
     async fn lane_send_unflushed(
@@ -786,7 +853,16 @@ impl Replica for InMemoryReplica {
         write_offset: i64,
         chunks: &[Bytes],
     ) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, chunks, false).await
+        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), false)
+            .await
+    }
+
+    async fn lane_send_packed_unflushed(
+        &self,
+        write_offset: i64,
+        packed: &PackedAppend,
+    ) -> Result<(), TransportError> {
+        self.enqueue_lane_group(write_offset, packed, false).await
     }
 
     async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {

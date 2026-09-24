@@ -203,3 +203,52 @@ async fn pipeline_returns_per_record_quorum_futures() {
     .unwrap();
     assert_eq!(offsets, vec![0, 1, 2]);
 }
+
+#[tokio::test]
+async fn lane_appends_a_record_larger_than_the_inbound_cap() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "large-record-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    let large: Vec<u8> = (0..chorus_fake_gcs::INBOUND_MESSAGE_CAP_BYTES + 12_345)
+        .map(|index| index as u8)
+        .collect();
+    let commits = writer
+        .enqueue_records(vec![record(b"before"), record(&large), record(b"after")])
+        .await
+        .unwrap();
+    let mut committed = Vec::new();
+    for commit in commits {
+        committed.push(commit.wait().await.unwrap());
+    }
+    assert_eq!(committed, vec![0, 1, 2]);
+    writer.rotate().await.unwrap();
+
+    let expected = [
+        record(b"before").encode().unwrap(),
+        record(&large).encode().unwrap(),
+        record(b"after").encode().unwrap(),
+    ]
+    .concat();
+    let mut sealed = 0;
+    for factory in &factories {
+        let object =
+            segment_object_for_base(factory, &manifest_factory, "large-record-wal", 0).await;
+        let snapshot = factory.replica(&object).snapshot().await.unwrap();
+        if snapshot.finalized {
+            sealed += 1;
+            assert_eq!(snapshot.bytes, expected);
+        }
+    }
+    assert!(sealed >= 2);
+    drop(writer);
+
+    let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
+    assert_eq!(end, WalSeqNo::record(3));
+    assert_eq!(records[0].payload, b"before".as_slice());
+    assert_eq!(records[1].payload, large.as_slice());
+    assert_eq!(records[2].payload, b"after".as_slice());
+}

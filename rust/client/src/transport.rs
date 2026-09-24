@@ -101,10 +101,32 @@ pub struct AppendToken {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PackedAppendMessage {
+/// One wire message of a [`PackedAppend`]: at most the transport's target
+/// message size, with its offset relative to the group start and its CRC32C.
+pub struct PackedAppendMessage {
     pub(crate) relative_offset: i64,
     pub(crate) content: Bytes,
     pub(crate) crc32c: u32,
+}
+
+/// Accessors for the simulation transport, the only consumer outside this
+/// crate.
+#[cfg(feature = "dst-support")]
+impl PackedAppendMessage {
+    /// Byte offset of this message relative to the start of its group.
+    pub fn relative_offset(&self) -> i64 {
+        self.relative_offset
+    }
+
+    /// Message payload.
+    pub fn content(&self) -> &Bytes {
+        &self.content
+    }
+
+    /// CRC32C of [`Self::content`].
+    pub fn crc32c(&self) -> u32 {
+        self.crc32c
+    }
 }
 
 /// An append group whose immutable wire messages were packed once before
@@ -130,7 +152,9 @@ impl PackedAppend {
         &self.chunks
     }
 
-    pub(crate) fn messages(&self) -> &[PackedAppendMessage] {
+    /// Wire messages in send order. The simulation transport sends these so
+    /// it frames lane groups exactly as the gRPC transport does.
+    pub fn messages(&self) -> &[PackedAppendMessage] {
         &self.messages
     }
 

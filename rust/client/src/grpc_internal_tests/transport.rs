@@ -123,3 +123,42 @@ async fn lane_session_diagnostics_describe_the_live_session() {
     assert!(opened.session_id.is_some());
     assert_eq!(opened.response_stream_open, Some(true));
 }
+
+#[tokio::test]
+async fn one_shot_writes_larger_than_the_inbound_cap_round_trip() {
+    let server = FakeGcs::default().start().await.unwrap();
+    let factory =
+        GrpcReplicaFactory::connect(0, &server.endpoint, "projects/_/buckets/zone-0", None)
+            .await
+            .unwrap();
+    let replica = factory.replica("one-shot-over-cap");
+    let cap = chorus_fake_gcs::INBOUND_MESSAGE_CAP_BYTES;
+    let appended: Vec<u8> = (0..2 * cap + 11).map(|index| index as u8).collect();
+
+    let created = replica.create_appendable(HashMap::new()).await.unwrap();
+    let token = replica.takeover(&created).await.unwrap();
+    let persisted = replica.append(&token, 0, appended.clone()).await.unwrap();
+    assert_eq!(persisted, appended.len() as i64);
+    let observed = replica.snapshot().await.unwrap();
+    assert_eq!(observed.bytes, appended);
+
+    // A fresh handle, as repair uses: `takeover` left a live session on the
+    // first one, and `finalize` would finish that session.
+    let replica = factory.replica("one-shot-over-cap");
+    let replacement = bytes::Bytes::from(vec![0x5a; cap + 7]);
+    let metadata = HashMap::from([("chorus.format".to_string(), "1".to_string())]);
+    let mut token = replica
+        .replace_appendable(&observed, replacement.clone(), metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(token.persisted_size, replacement.len() as i64);
+    let finalized = replica
+        .finalize(&mut token, replacement.len() as i64)
+        .await
+        .unwrap();
+    assert_eq!(finalized.crc32c, Some(crc32c::crc32c(&replacement)));
+    let replaced = replica.snapshot().await.unwrap();
+    assert!(replaced.finalized);
+    assert_eq!(replaced.bytes, replacement);
+    assert_eq!(replaced.metadata, metadata);
+}

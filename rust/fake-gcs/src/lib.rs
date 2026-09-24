@@ -26,6 +26,99 @@ use proto::{
     Timestamp, UpdateObjectRequest,
 };
 
+/// The live service's gRPC inbound message cap, measured against Rapid
+/// buckets: a 2 MiB + 1 byte write message is accepted and a 4 MiB one is
+/// rejected with RESOURCE_EXHAUSTED. The fake rejects any write request whose
+/// encoded size exceeds it the same way, so an oversized client message fails
+/// here as it would in production. Mirrors `SERVICE_INBOUND_MESSAGE_CAP_BYTES`
+/// in `chorus-client`'s `grpc.rs`, which cannot be shared because that crate
+/// depends on this one.
+pub const INBOUND_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reject a write request message larger than [`INBOUND_MESSAGE_CAP_BYTES`],
+/// with the status a gRPC server returns for an oversized inbound message.
+fn check_inbound_message_size(encoded_len: usize) -> Result<(), Status> {
+    if encoded_len > INBOUND_MESSAGE_CAP_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "Received message larger than max ({encoded_len} vs. {INBOUND_MESSAGE_CAP_BYTES})"
+        )));
+    }
+    Ok(())
+}
+
+/// The largest data chunk the live service puts in one read response, the
+/// proto's `ServiceConstants.MAX_READ_CHUNK_BYTES`. The gRPC read handler
+/// splits each range into responses of at most this size, so a client reads
+/// an object larger than its 4 MiB decode limit as it would in production.
+pub const MAX_READ_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Split each range of a read response into responses carrying at most
+/// [`MAX_READ_CHUNK_BYTES`] of data. Metadata stays on the first response and
+/// `range_end` on the last piece of its range.
+fn chunk_read_response(response: BidiReadObjectResponse) -> Vec<BidiReadObjectResponse> {
+    let mut metadata = response.metadata;
+    let mut read_handle = response.read_handle;
+    let mut chunked = Vec::new();
+    for range in response.object_data_ranges {
+        let Some(data) = range
+            .checksummed_data
+            .as_ref()
+            .filter(|data| data.content.len() > MAX_READ_CHUNK_BYTES)
+        else {
+            chunked.push(BidiReadObjectResponse {
+                object_data_ranges: vec![range],
+                metadata: metadata.take(),
+                read_handle: read_handle.take(),
+            });
+            continue;
+        };
+        let read_offset = range.read_range.as_ref().map_or(0, |read| read.read_offset);
+        let read_id = range.read_range.as_ref().map_or(0, |read| read.read_id);
+        let pieces = data.content.len().div_ceil(MAX_READ_CHUNK_BYTES);
+        for (index, piece) in data.content.chunks(MAX_READ_CHUNK_BYTES).enumerate() {
+            let offset = index * MAX_READ_CHUNK_BYTES;
+            chunked.push(BidiReadObjectResponse {
+                object_data_ranges: vec![ObjectRangeData {
+                    checksummed_data: Some(proto::ChecksummedData {
+                        crc32c: Some(crc32c::crc32c(piece)),
+                        content: piece.to_vec(),
+                    }),
+                    read_range: Some(ReadRange {
+                        read_offset: read_offset + offset as i64,
+                        read_length: piece.len() as i64,
+                        read_id,
+                    }),
+                    range_end: range.range_end && index + 1 == pieces,
+                }],
+                metadata: metadata.take(),
+                read_handle: read_handle.take(),
+            });
+        }
+    }
+    if chunked.is_empty() {
+        chunked.push(BidiReadObjectResponse {
+            object_data_ranges: Vec::new(),
+            metadata,
+            read_handle,
+        });
+    }
+    chunked
+}
+
+/// Whether the live service answers `request` on a write stream: it responds
+/// only to a message that flushes, looks up state or finishes the write, so a
+/// one-shot client sees no response before its last message.
+fn answers(request: &BidiWriteObjectRequest) -> bool {
+    request.flush || request.state_lookup || request.finish_write
+}
+
+/// The tonic server built for the fake. Its own decode limit is lifted so the
+/// fake's cap check above is the one that rejects an oversized message, with
+/// the service's RESOURCE_EXHAUSTED rather than tonic's OUT_OF_RANGE.
+fn storage_server(service: FakeGcs) -> StorageServer<FakeGcs> {
+    StorageServer::new(service).max_decoding_message_size(usize::MAX)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Operation {
     Delete,
@@ -307,7 +400,7 @@ impl FakeGcs {
         let service = self.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(StorageServer::new(service))
+                .add_service(storage_server(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
                 })
@@ -341,7 +434,7 @@ impl FakeGcs {
         IE: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         tonic::transport::Server::builder()
-            .add_service(StorageServer::new(self))
+            .add_service(storage_server(self))
             .serve_with_incoming(incoming)
             .await
     }
@@ -1032,6 +1125,7 @@ impl FakeGcs {
         first: BidiWriteObjectRequest,
         routing_token: Option<&str>,
     ) -> Result<SimSessionOpen, Status> {
+        check_inbound_message_size(first.encoded_len())?;
         self.before(Operation::BidiWrite).await?;
         let operation = classify_bidi_request(&first, false);
         let object = bidi_object(&first).map(|(b, o)| (b.to_string(), o.to_string()));
@@ -1102,6 +1196,7 @@ impl FakeGcs {
             }
             self.flush_hold_gate(stream_id).await;
         }
+        let answered = answers(&first);
         let response = self.apply_bidi(first, stream_id).await?;
         let append = if let Some((bucket, object)) = created_append {
             let spec = self.append_spec_for_created(bucket, object).await?;
@@ -1109,7 +1204,11 @@ impl FakeGcs {
         } else {
             opened
         };
-        self.close_stream_after_response(operation).await?;
+        // As in the gRPC handler, a post-response close follows only a
+        // message the service answers.
+        if answered {
+            self.close_stream_after_response(operation).await?;
+        }
         Ok(SimSessionOpen { response, append })
     }
 
@@ -1147,6 +1246,7 @@ impl FakeGcs {
         request: BidiWriteObjectRequest,
         routing_token: Option<&str>,
     ) -> Result<(BidiWriteObjectResponse, Option<Status>), Status> {
+        check_inbound_message_size(request.encoded_len())?;
         let operation = classify_bidi_request(&request, true);
         let before_delay = self.before_charge(Operation::BidiWrite).await?;
         let bidi_delay = self
@@ -1164,14 +1264,20 @@ impl FakeGcs {
             self.finalize_hold_gate().await;
         }
         self.flush_hold_gate(stream_id).await;
+        let answered = answers(&request);
         let response = self
             .apply_append_continuation(spec, stream_id, request)
             .await?;
-        // The gRPC fake emits the response, THEN injects the stream close.
-        // Surface the applied response together with the close error so the
-        // lane reports durable progress alongside the fence, exactly as the
-        // gRPC client folds persisted_size + error in one observation.
-        let close = self.close_stream_after_response(operation).await.err();
+        // The gRPC fake emits the response, THEN injects the stream close, and
+        // only for a message it answers. Surface the applied response together
+        // with the close error so the lane reports durable progress alongside
+        // the fence, exactly as the gRPC client folds persisted_size + error in
+        // one observation.
+        let close = if answered {
+            self.close_stream_after_response(operation).await.err()
+        } else {
+            None
+        };
         Ok((response, close))
     }
 
@@ -1261,6 +1367,7 @@ impl FakeGcs {
         &self,
         first: proto::WriteObjectRequest,
     ) -> Result<proto::WriteObjectResponse, Status> {
+        check_inbound_message_size(first.encoded_len())?;
         self.before(Operation::BidiWrite).await?;
         let Some(proto::write_object_request::FirstMessage::WriteObjectSpec(spec)) =
             first.first_message
@@ -1601,8 +1708,10 @@ impl Storage for FakeGcs {
                     {
                         Ok(response) => {
                             include_metadata = false;
-                            if tx.send(Ok(response)).await.is_err() {
-                                return;
+                            for response in chunk_read_response(response) {
+                                if tx.send(Ok(response)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(status) => {
@@ -1677,6 +1786,7 @@ impl Storage for FakeGcs {
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty write stream"))??;
+        check_inbound_message_size(first.encoded_len())?;
         let Some(proto::write_object_request::FirstMessage::WriteObjectSpec(spec)) =
             first.first_message
         else {
@@ -1699,6 +1809,7 @@ impl Storage for FakeGcs {
         let mut finished = first.finish_write;
         while let Some(next) = incoming.next().await {
             let next = next?;
+            check_inbound_message_size(next.encoded_len())?;
             if let Some(proto::write_object_request::Data::ChecksummedData(data)) = &next.data {
                 bytes.extend_from_slice(&data.content);
             }
@@ -1720,6 +1831,7 @@ impl Storage for FakeGcs {
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty bidi stream"))??;
+        check_inbound_message_size(first.encoded_len())?;
         let operation = classify_bidi_request(&first, false);
         self.before_bidi(operation, routing_token.as_deref(), bidi_object(&first))
             .await?;
@@ -1747,6 +1859,11 @@ impl Storage for FakeGcs {
                 // resumes, and continuations stay fast so sealing and the
                 // established lanes keep moving while a hold is pending.
                 let new_open = created_append.is_some();
+                // Data messages a one-shot client pipelines behind its first
+                // message while an open hold parks it; the live service
+                // accepts them, so they are applied after the open.
+                let mut pipelined = VecDeque::new();
+                let mut incoming_closed = false;
                 if new_open {
                     let held_at = {
                         let mut state = service.inner.lock().await;
@@ -1770,16 +1887,27 @@ impl Storage for FakeGcs {
                                         "appendable create response stream closed",
                                     ));
                                 }
-                                request = incoming.next() => {
-                                    return match request {
-                                        None => Err(Status::cancelled(
-                                            "appendable create request stream closed",
-                                        )),
-                                        Some(Err(status)) => Err(status),
-                                        Some(Ok(_)) => Err(Status::invalid_argument(
-                                            "appendable create continued before its open response",
-                                        )),
-                                    };
+                                request = incoming.next(), if !incoming_closed => {
+                                    match request {
+                                        // A half-close after pipelined data
+                                        // ends a complete one-shot request.
+                                        None if !pipelined.is_empty() => incoming_closed = true,
+                                        None => {
+                                            return Err(Status::cancelled(
+                                                "appendable create request stream closed",
+                                            ));
+                                        }
+                                        Some(Err(status)) => return Err(status),
+                                        Some(Ok(request)) if request.first_message.is_some() => {
+                                            return Err(Status::invalid_argument(
+                                                "first_message is only valid on the first stream request",
+                                            ));
+                                        }
+                                        Some(Ok(request)) => {
+                                            check_inbound_message_size(request.encoded_len())?;
+                                            pipelined.push_back(request);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1820,19 +1948,30 @@ impl Storage for FakeGcs {
                     }
                     service.flush_hold_gate(stream_id).await;
                 }
+                let first_answered = answers(&first);
                 let first_response = service.apply_bidi(first, stream_id).await?;
                 if let Some((bucket, object)) = created_append {
                     let spec = service.append_spec_for_created(bucket, object).await?;
                     opened_append =
                         Some((spec, stream_id.expect("appendable create stream has an id")));
                 }
-                tx.send(Ok(first_response))
-                    .await
-                    .map_err(|_| Status::cancelled("client closed response stream"))?;
-                service.close_stream_after_response(operation).await?;
+                if first_answered {
+                    tx.send(Ok(first_response))
+                        .await
+                        .map_err(|_| Status::cancelled("client closed response stream"))?;
+                    service.close_stream_after_response(operation).await?;
+                }
                 if let Some((spec, stream_id)) = opened_append.as_ref() {
-                    while let Some(request) = incoming.next().await {
-                        let request = request?;
+                    loop {
+                        let request = match pipelined.pop_front() {
+                            Some(request) => request,
+                            None if incoming_closed => break,
+                            None => match incoming.next().await {
+                                Some(request) => request?,
+                                None => break,
+                            },
+                        };
+                        check_inbound_message_size(request.encoded_len())?;
                         let operation = classify_bidi_request(&request, true);
                         service.before(Operation::BidiWrite).await?;
                         service
@@ -1846,13 +1985,16 @@ impl Storage for FakeGcs {
                             service.finalize_hold_gate().await;
                         }
                         service.flush_hold_gate(*stream_id).await;
+                        let answered = answers(&request);
                         let response = service
                             .apply_append_continuation(spec, *stream_id, request)
                             .await?;
-                        tx.send(Ok(response))
-                            .await
-                            .map_err(|_| Status::cancelled("client closed response stream"))?;
-                        service.close_stream_after_response(operation).await?;
+                        if answered {
+                            tx.send(Ok(response))
+                                .await
+                                .map_err(|_| Status::cancelled("client closed response stream"))?;
+                            service.close_stream_after_response(operation).await?;
+                        }
                     }
                 } else if incoming.next().await.is_some() {
                     return Err(Status::invalid_argument(
@@ -3153,5 +3295,153 @@ mod tests {
             .into_inner();
         assert_eq!(second.objects[0].name, "wal/segments/00000000000000000010");
         assert!(second.next_page_token.is_empty());
+    }
+
+    /// Drive a write stream to its terminal status, skipping any responses
+    /// that arrive before it.
+    async fn write_stream_status(
+        client: &mut StorageClient<tonic::transport::Channel>,
+        requests: Vec<BidiWriteObjectRequest>,
+    ) -> Status {
+        let mut responses = match client.bidi_write_object(tokio_stream::iter(requests)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => return status,
+        };
+        loop {
+            match responses.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("write stream ended without an error"),
+                Err(status) => return status,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_messages_over_the_inbound_cap_are_rejected_as_resource_exhausted() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let oversized = vec![0x5a; INBOUND_MESSAGE_CAP_BYTES];
+        let crc = crc32c::crc32c(&oversized);
+
+        let mut create = create_request(bucket, "oversized-first");
+        create.data = request(0, &oversized, crc).data;
+        let status = write_stream_status(&mut client, vec![create]).await;
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(status
+            .message()
+            .starts_with("Received message larger than max"));
+        let missing = client
+            .get_object(GetObjectRequest {
+                bucket: bucket.into(),
+                object: "oversized-first".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
+
+        let mut continuation = request(0, &oversized, crc);
+        continuation.flush = true;
+        continuation.state_lookup = true;
+        let status = write_stream_status(
+            &mut client,
+            vec![
+                create_request(bucket, "oversized-continuation"),
+                continuation,
+            ],
+        )
+        .await;
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            server
+                .service
+                .reported_size_for(bucket, "oversized-continuation")
+                .await,
+            Some((0, false))
+        );
+        assert!(server
+            .service
+            .raw_bytes_for(bucket, "oversized-continuation")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bidi_read_splits_a_large_range_into_service_sized_chunks() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let name = "large-read";
+        let content: Vec<u8> = (0..2 * MAX_READ_CHUNK_BYTES + 5)
+            .map(|index| index as u8)
+            .collect();
+        let mut writes = Vec::new();
+        for (index, piece) in content.chunks(MAX_READ_CHUNK_BYTES).enumerate() {
+            let offset = (index * MAX_READ_CHUNK_BYTES) as i64;
+            let mut write = request(offset, piece, crc32c::crc32c(piece));
+            if index == 0 {
+                write.first_message = create_request(bucket, name).first_message;
+            }
+            writes.push(write);
+        }
+        let last = writes.last_mut().unwrap();
+        last.flush = true;
+        last.state_lookup = true;
+        let mut responses = client
+            .bidi_write_object(tokio_stream::iter(writes))
+            .await
+            .unwrap()
+            .into_inner();
+        let persisted = responses.message().await.unwrap().unwrap();
+        assert_eq!(
+            persisted.write_status,
+            Some(WriteStatus::PersistedSize(content.len() as i64))
+        );
+
+        let read = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: bucket.into(),
+                object: name.into(),
+                ..Default::default()
+            }),
+            read_ranges: vec![ReadRange {
+                read_offset: 0,
+                read_length: 0,
+                read_id: 7,
+            }],
+        };
+        let mut reads = client
+            .bidi_read_object(tokio_stream::iter([read]))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut chunks = Vec::new();
+        while let Some(response) = reads.message().await.unwrap() {
+            chunks.push(response);
+        }
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].metadata.is_some());
+        assert!(chunks[1..].iter().all(|chunk| chunk.metadata.is_none()));
+        let mut read_back = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let [range] = chunk.object_data_ranges.as_slice() else {
+                panic!("each read response carries one range piece");
+            };
+            let data = range.checksummed_data.as_ref().unwrap();
+            let read_range = range.read_range.as_ref().unwrap();
+            assert!(data.content.len() <= MAX_READ_CHUNK_BYTES);
+            assert_eq!(data.crc32c, Some(crc32c::crc32c(&data.content)));
+            assert_eq!(read_range.read_offset, read_back.len() as i64);
+            assert_eq!(read_range.read_length, data.content.len() as i64);
+            assert_eq!(read_range.read_id, 7);
+            assert_eq!(range.range_end, index == chunks.len() - 1);
+            read_back.extend_from_slice(&data.content);
+        }
+        assert_eq!(read_back, content);
     }
 }
