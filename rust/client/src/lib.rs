@@ -109,8 +109,8 @@ pub use transport::TransportCode;
 /// supplies an in-memory `ReplicaFactory` in place of the gRPC transport.
 #[cfg(feature = "dst-support")]
 pub use transport::{
-    AppendToken, LaneDurableChange, ListedObject, Replica, ReplicaFactory, ReplicaRangeRead,
-    ReplicaSnapshot, TransportError,
+    AppendSessionId, AppendToken, LaneDurableChange, LaneSessionDiagnostics, ListedObject, Replica,
+    ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot, TransportError,
 };
 
 /// Helpers for repository probes that intentionally share transport details.

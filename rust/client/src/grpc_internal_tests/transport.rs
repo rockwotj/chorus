@@ -105,3 +105,21 @@ async fn resource_exhausted_is_classified_transiently() {
         1
     );
 }
+
+#[tokio::test]
+async fn lane_session_diagnostics_describe_the_live_session() {
+    let server = FakeGcs::default().start().await.unwrap();
+    let factory =
+        GrpcReplicaFactory::connect(0, &server.endpoint, "projects/_/buckets/zone-0", None)
+            .await
+            .unwrap();
+    let replica = factory.replica("lane-session-diagnostics");
+    let idle = replica.lane_session_diagnostics();
+    assert!(idle.session_id.is_none());
+    assert!(idle.response_stream_open.is_none());
+
+    replica.create_append_session(HashMap::new()).await.unwrap();
+    let opened = replica.lane_session_diagnostics();
+    assert!(opened.session_id.is_some());
+    assert_eq!(opened.response_stream_open, Some(true));
+}

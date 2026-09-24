@@ -704,6 +704,7 @@ impl CommitTracker {
             // Publish it even when the just-confirmed boundary drained the queue.
             if state.failure.is_none() {
                 state.failure = Some(CommitFailure::Fenced(fence));
+                self.log_failure_locked(&state);
                 self.publish_locked(&state);
             }
             return;
@@ -718,8 +719,23 @@ impl CommitTracker {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.failure.is_none() {
             state.failure = Some(CommitFailure::Poisoned);
+            self.log_failure_locked(&state);
             self.publish_locked(&state);
         }
+    }
+
+    /// Log every lane's durable offset once, when the tracker first fails.
+    fn log_failure_locked(&self, state: &CommitState) {
+        let lane_durable: Vec<i64> = state.lanes.iter().map(|lane| lane.durable).collect();
+        let lane_alive: Vec<bool> = state.lanes.iter().map(|lane| !lane.finished).collect();
+        tracing::warn!(
+            failure = ?state.failure,
+            ?lane_durable,
+            ?lane_alive,
+            quorum_watermark = quorum_durable_watermark(&state.lanes, self.quorum),
+            oldest_unresolved_boundary = state.boundaries.front().copied(),
+            "WAL writer commit tracker failed"
+        );
     }
 
     fn recompute_locked(&self, state: &mut CommitState) {
@@ -753,6 +769,7 @@ impl CommitTracker {
                 .count();
             if possible < self.quorum {
                 state.failure = Some(select_commit_failure(&state.lanes, oldest));
+                self.log_failure_locked(state);
                 changed = true;
             }
         }
@@ -2056,6 +2073,15 @@ struct LaneRuntime {
     flushes: VecDeque<i64>,
     monitor_session: bool,
     last_progress: tokio::time::Instant,
+    /// When the last send or flush returned without error.
+    last_send: Option<tokio::time::Instant>,
+    /// When the last flush was sent, and the offset it flushes through.
+    last_flush: Option<(tokio::time::Instant, i64)>,
+    /// When the durable tail last moved.
+    last_ack: Option<tokio::time::Instant>,
+    /// Whether the stall deadline passed inside a send, flush or resume call
+    /// rather than while waiting for the durable tail.
+    stalled_in_call: bool,
 }
 
 impl LaneRuntime {
@@ -2085,6 +2111,10 @@ impl LaneRuntime {
             // the retained suffix.
             monitor_session: true,
             last_progress: tokio::time::Instant::now(),
+            last_send: None,
+            last_flush: None,
+            last_ack: None,
+            stalled_in_call: false,
         }
     }
 
@@ -2096,15 +2126,56 @@ impl LaneRuntime {
         self.last_progress + self.stall_timeout.get()
     }
 
+    /// Log the lane's send, flush and acknowledgment state when it is shed.
+    fn warn_stalled(&self) {
+        let now = tokio::time::Instant::now();
+        let millis =
+            |at: tokio::time::Instant| now.saturating_duration_since(at).as_millis() as u64;
+        let sent_end = self.sent_end();
+        let flushed_through = self.flushes.back().copied().unwrap_or(self.durable);
+        let outstanding_flushes: Vec<i64> = self
+            .flushes
+            .iter()
+            .copied()
+            .filter(|end| *end > self.durable)
+            .collect();
+        let session = self.replica.lane_session_diagnostics();
+        tracing::warn!(
+            zone = self.zone(),
+            durable_offset = self.durable,
+            retained_chunks = retained_chunk_count(&self.retained),
+            retained_bytes = sent_end - self.durable,
+            unflushed_bytes = (sent_end - flushed_through).max(0),
+            held_bytes = self.held_bytes,
+            outstanding_flushes = outstanding_flushes.len(),
+            outstanding_flush_offsets = ?outstanding_flushes,
+            since_last_send_ms = self.last_send.map(millis),
+            last_flush_offset = self.last_flush.map(|(_, end)| end),
+            since_last_flush_ms = self.last_flush.map(|(at, _)| millis(at)),
+            since_last_ack_ms = self.last_ack.map(millis),
+            stalled_in_call = self.stalled_in_call,
+            stall_timeout_ms = self.stall_timeout.get().as_millis() as u64,
+            generation = self.token.generation,
+            session_id = session.session_id.map(tracing::field::display),
+            response_stream_open = session.response_stream_open,
+            "append lane shed after making no durable progress"
+        );
+    }
+
     fn publish_advance(&mut self, change: LaneDurableChange) -> Result<bool, LaneDeath> {
-        publish_lane_advance(
+        let previous = self.durable;
+        let result = publish_lane_advance(
             change,
             self.zone(),
             &mut self.durable,
             &mut self.last_progress,
             &mut self.retained,
             &self.commits,
-        )
+        );
+        if self.durable > previous {
+            self.last_ack = Some(tokio::time::Instant::now());
+        }
+        result
     }
 
     /// Resolve an elapsed lane deadline against the durable-tail stream.
@@ -2119,7 +2190,8 @@ impl LaneRuntime {
             self.stall_deadline(),
             &self.metrics,
         )
-        .await?;
+        .await
+        .inspect_err(|death| self.stalled_in_call = matches!(death, LaneDeath::Stalled))?;
         let stream_failed = self.publish_advance(change)?;
         Ok(stream_failed || !self.retained.is_empty())
     }
@@ -2163,6 +2235,11 @@ impl LaneRuntime {
                     Ok(sent) => sent.is_err(),
                     Err(_) => self.confirm_timeout().await?,
                 };
+                let now = tokio::time::Instant::now();
+                if !failed {
+                    self.last_send = Some(now);
+                }
+                self.last_flush = Some((now, sent_end));
                 self.flushes.push_back(sent_end);
                 if failed {
                     self.recover().await?;
@@ -2205,7 +2282,12 @@ impl LaneRuntime {
             Ok(failed) => failed,
             Err(_) => self.confirm_timeout().await?,
         };
+        let now = tokio::time::Instant::now();
+        if !failed {
+            self.last_send = Some(now);
+        }
         if flush {
+            self.last_flush = Some((now, end));
             self.flushes.push_back(end);
         }
         if failed {
@@ -2315,13 +2397,7 @@ async fn run_lane(
             Some(lane.token)
         }
         Some(LaneDeath::Stalled) => {
-            tracing::warn!(
-                zone = lane.zone(),
-                durable_offset = lane.durable,
-                retained_chunks = retained_chunk_count(&lane.retained),
-                stall_timeout_ms = lane.stall_timeout.get().as_millis(),
-                "append lane shed after making no durable progress"
-            );
+            lane.warn_stalled();
             lane.commits.finish_lane(lane.zone(), None);
             lane.retained.clear();
             work.close();
@@ -2538,6 +2614,9 @@ impl LaneRuntime {
             };
             match resumed {
                 Ok(tail) => {
+                    if tail > self.durable {
+                        self.last_ack = Some(tokio::time::Instant::now());
+                    }
                     publish_lane_progress(
                         tail,
                         self.zone(),
@@ -2600,8 +2679,12 @@ impl LaneRuntime {
                         Ok(()) => {
                             // The resend flushes every written byte, which
                             // replaces any flushes sent on the prior session.
+                            let end = self.durable + resend_bytes as i64;
+                            let now = tokio::time::Instant::now();
+                            self.last_send = Some(now);
+                            self.last_flush = Some((now, end));
                             self.flushes.clear();
-                            self.flushes.push_back(self.durable + resend_bytes as i64);
+                            self.flushes.push_back(end);
                             return Ok(());
                         }
                         Err(error)
