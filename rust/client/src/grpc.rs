@@ -22,8 +22,9 @@ use tonic::{Code, Request, Status, Streaming};
 use crate::auth::BearerAuth;
 use crate::error::Error;
 use crate::transport::{
-    AppendToken, LaneDurableChange, ListedObject, PackedAppend, PackedAppendMessage, Replica,
-    ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
+    AppendSessionId, AppendToken, LaneDurableChange, LaneSessionDiagnostics, ListedObject,
+    PackedAppend, PackedAppendMessage, Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot,
+    TransportCode, TransportError,
 };
 
 /// Cached zonal routing token, learned from a bidirectional read or write
@@ -85,7 +86,10 @@ struct AppendSession {
 struct AppendSessionHandle {
     tx: mpsc::Sender<BidiWriteObjectRequest>,
     state: tokio::sync::watch::Receiver<LaneProgress>,
+    id: AppendSessionId,
 }
+
+static NEXT_APPEND_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 struct RedirectAwareStream {
     tx: Option<mpsc::Sender<BidiWriteObjectRequest>>,
@@ -756,8 +760,12 @@ impl GrpcReplica {
                 }
             }
         });
+        let session_id = AppendSessionId(
+            NEXT_APPEND_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
         tracing::debug!(
             zone = self.zone,
+            %session_id,
             persisted_size = persisted,
             has_write_handle = handle.is_some(),
             attempt = opened.attempt,
@@ -774,6 +782,7 @@ impl GrpcReplica {
                 handle: Arc::new(AppendSessionHandle {
                     tx,
                     state: state_rx,
+                    id: session_id,
                 }),
                 reader,
             },
@@ -1958,6 +1967,18 @@ impl Replica for GrpcReplica {
             self.clear_session_if(&handle).await;
         }
         Ok(change)
+    }
+
+    fn lane_session_diagnostics(&self) -> LaneSessionDiagnostics {
+        let Some(handle) = self.session.current.load_full() else {
+            return LaneSessionDiagnostics::default();
+        };
+        // The reader drops its sender when the response stream ends.
+        let reader_running = handle.state.has_changed().is_ok();
+        LaneSessionDiagnostics {
+            session_id: Some(handle.id),
+            response_stream_open: Some(reader_running && handle.state.borrow().error.is_none()),
+        }
     }
     async fn delete(&self, generation: i64) -> Result<(), TransportError> {
         let request = DeleteObjectRequest {

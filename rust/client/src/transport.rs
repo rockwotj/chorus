@@ -224,6 +224,27 @@ pub struct LaneDurableChange {
     pub error: Option<TransportError>,
 }
 
+/// Process-wide sequence number of one append session. Stall logs and the
+/// session's open log line carry the same value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendSessionId(pub u64);
+
+impl std::fmt::Display for AppendSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Point-in-time view of a lane's live append session, logged when a lane
+/// stops making durable progress. Fields a backend cannot observe stay `None`.
+#[derive(Clone, Debug, Default)]
+pub struct LaneSessionDiagnostics {
+    /// The live append session, or `None` when no session is live.
+    pub session_id: Option<AppendSessionId>,
+    /// Whether the session's response stream is still open.
+    pub response_stream_open: Option<bool>,
+}
+
 #[async_trait]
 /// Creates object-specific replicas and lists one zonal bucket.
 ///
@@ -408,6 +429,12 @@ pub trait Replica: Send + Sync {
     /// case the durable offset and error are returned in one observation so the
     /// protocol can publish the physical progress before classifying the error.
     async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError>;
+
+    /// Describe the live append session for lane stall diagnostics. This must
+    /// not block or perform I/O.
+    fn lane_session_diagnostics(&self) -> LaneSessionDiagnostics {
+        LaneSessionDiagnostics::default()
+    }
 
     /// Delete exactly the supplied object generation; missing is handled by the
     /// caller as idempotent success.
@@ -614,6 +641,10 @@ impl Replica for TimedReplica {
 
     async fn lane_durable_change(&self, seen: i64) -> Result<LaneDurableChange, TransportError> {
         self.inner.lane_durable_change(seen).await
+    }
+
+    fn lane_session_diagnostics(&self) -> LaneSessionDiagnostics {
+        self.inner.lane_session_diagnostics()
     }
 
     async fn delete(&self, generation: i64) -> Result<(), TransportError> {
