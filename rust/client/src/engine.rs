@@ -665,10 +665,11 @@ impl WalHandle {
     /// Deletion is best effort across zones. The returned report contains only
     /// deletion statistics; the database remains the authority for the durable
     /// checkpoint it supplied. Startup and periodic maintenance retry
-    /// tombstones whose zones were unavailable during this call. A successful
-    /// truncation also makes the engine re-read directory capacity, so an active
-    /// segment held at [`Error::ActiveSegmentFull`] can rotate and resume
-    /// admission once enough entries are removed.
+    /// tombstones whose zones were unavailable during this call. A truncation
+    /// that removes segments from the directory also makes the engine re-read
+    /// directory capacity, so an active segment held at
+    /// [`Error::ActiveSegmentFull`] can rotate and resume admission once enough
+    /// entries are removed.
     /// The returned future owns its maintenance connection, not a borrow of
     /// this handle, so callers can continue admitting records while it runs.
     pub fn truncate_before(
@@ -681,9 +682,15 @@ impl WalHandle {
             let report = maintenance.truncate(floor).await?;
             // The maintenance manifest and writer manifest are independent
             // handles. One pending wake is enough to make the engine refresh its
-            // copy after every completed truncation: if the slot is full, its
-            // queued wake has not been received yet; otherwise this call fills it.
-            let _ = rotation_recheck.try_send(());
+            // copy after a truncation that removed directory entries: if the
+            // slot is full, its queued wake has not been received yet; otherwise
+            // this call fills it. A truncation that removed nothing cannot free
+            // capacity. Waking on it anyway lets a caller that truncates in a
+            // tight loop keep the engine's recheck arm ready on every poll,
+            // starving the provisioning result that completes a rotation.
+            if report.deleted_segments > 0 {
+                let _ = rotation_recheck.try_send(());
+            }
             Ok(report)
         }
     }
