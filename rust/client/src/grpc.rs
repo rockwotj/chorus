@@ -2206,3 +2206,164 @@ pub fn redirect_routing_token(status: &Status) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET: usize = WIRE_MESSAGE_TARGET_BYTES;
+
+    fn patterned(len: usize, seed: u8) -> Bytes {
+        (0..len)
+            .map(|index| (index as u8).wrapping_add(seed))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// Assert that `messages` are contiguous from offset zero, carry their own
+    /// CRC32C, stay within the target size, and concatenate to `chunks`.
+    fn assert_frames(messages: &[PackedAppendMessage], chunks: &[Bytes]) {
+        let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        let mut framed = Vec::new();
+        for message in messages {
+            assert_eq!(message.relative_offset, framed.len() as i64);
+            assert_eq!(message.crc32c, crc32c::crc32c(&message.content));
+            assert!(!message.content.is_empty());
+            assert!(message.content.len() <= TARGET);
+            framed.extend_from_slice(&message.content);
+        }
+        assert_eq!(framed, expected);
+    }
+
+    fn data(request: &BidiWriteObjectRequest) -> &ChecksummedData {
+        match request.data.as_ref() {
+            Some(bidi_write_object_request::Data::ChecksummedData(data)) => data,
+            None => panic!("write request carries no data"),
+        }
+    }
+
+    fn append_spec() -> bidi_write_object_request::FirstMessage {
+        bidi_write_object_request::FirstMessage::AppendObjectSpec(AppendObjectSpec {
+            bucket: "projects/_/buckets/zone-0".into(),
+            object: "segment".into(),
+            generation: 7,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn pack_append_splits_a_chunk_larger_than_the_target_into_zero_copy_slices() {
+        let head = patterned(100, 1);
+        let large = patterned(3 * TARGET + 17, 2);
+        let tail = patterned(50, 3);
+        let chunks = vec![head.clone(), large.clone(), tail.clone()];
+        let packed = pack_append(chunks.clone());
+        let messages = packed.messages();
+
+        assert_frames(messages, &chunks);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.len())
+                .collect::<Vec<_>>(),
+            vec![100, TARGET, TARGET, TARGET, 17 + 50]
+        );
+        // Full-size pieces of the large chunk share its allocation.
+        for (piece, message) in messages[1..4].iter().enumerate() {
+            assert_eq!(
+                message.content.as_ptr(),
+                large[piece * TARGET..].as_ptr(),
+                "piece {piece} was copied"
+            );
+        }
+        // The chunk list keeps record boundaries for commit accounting.
+        assert_eq!(packed.chunks(), chunks.as_slice());
+        assert_eq!(packed.len(), 100 + large.len() + 50);
+    }
+
+    #[test]
+    fn pack_append_keeps_a_target_sized_chunk_in_one_message() {
+        let exact = patterned(TARGET, 4);
+        let next = patterned(1, 5);
+        let chunks = vec![exact, next];
+        let packed = pack_append(chunks.clone());
+
+        assert_frames(packed.messages(), &chunks);
+        assert_eq!(packed.messages().len(), 2);
+        assert_eq!(packed.messages()[0].content.len(), TARGET);
+    }
+
+    #[test]
+    fn one_shot_writes_split_data_under_the_inbound_cap() {
+        let payload = patterned(SERVICE_INBOUND_MESSAGE_CAP_BYTES * 2 + 3, 6);
+        let requests = one_shot_write_requests(append_spec(), 40, payload.clone());
+
+        assert_eq!(
+            requests.len(),
+            payload.len().div_ceil(WIRE_MESSAGE_TARGET_BYTES)
+        );
+        let last = requests.len() - 1;
+        let mut written = Vec::new();
+        for (index, request) in requests.iter().enumerate() {
+            assert!(request.encoded_len() <= SERVICE_INBOUND_MESSAGE_CAP_BYTES);
+            assert_eq!(request.first_message.is_some(), index == 0);
+            assert_eq!(request.flush, index == last);
+            assert_eq!(request.state_lookup, index == last);
+            assert!(!request.finish_write);
+            assert_eq!(request.write_offset, 40 + written.len() as i64);
+            let data = data(request);
+            assert_eq!(data.crc32c, Some(crc32c::crc32c(&data.content)));
+            written.extend_from_slice(&data.content);
+        }
+        assert_eq!(written, payload);
+    }
+
+    #[test]
+    fn one_shot_write_of_empty_data_sends_one_checksummed_empty_message() {
+        let requests = one_shot_write_requests(append_spec(), 12, Bytes::new());
+
+        let [request] = requests.as_slice() else {
+            panic!("an empty one-shot write is one message");
+        };
+        assert!(request.first_message.is_some());
+        assert_eq!(request.write_offset, 12);
+        assert!(request.flush);
+        assert!(request.state_lookup);
+        let data = data(request);
+        assert!(data.content.is_empty());
+        assert_eq!(data.crc32c, Some(crc32c::crc32c(&[])));
+    }
+
+    #[tokio::test]
+    async fn only_an_oversized_message_rejection_leaves_the_transient_class() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let factory =
+            GrpcReplicaFactory::from_channel(1, channel, "projects/_/buckets/zone-1", None);
+        let replica = GrpcReplica {
+            zone: factory.zone,
+            bucket: factory.bucket.clone(),
+            object: "segment".into(),
+            auth: None,
+            client: factory.client.clone(),
+            routing_token: factory.routing_token.clone(),
+            read_session: Arc::new(SessionMutex::new(None)),
+            session: Arc::new(SessionSlot::new()),
+        };
+
+        let oversized = replica.status(Status::resource_exhausted(
+            "Received message larger than max (4194400 vs. 4194304)",
+        ));
+        assert_eq!(oversized.zone, 1);
+        assert_eq!(oversized.code, TransportCode::InvalidArgument);
+        assert!(!oversized.code.transient());
+
+        for throttled in [
+            "Quota exceeded for quota metric 'Write requests'",
+            "The object exceeded the rate limit for object mutation operations.",
+        ] {
+            let error = replica.status(Status::resource_exhausted(throttled));
+            assert_eq!(error.code, TransportCode::ResourceExhausted);
+            assert!(error.code.transient());
+        }
+    }
+}

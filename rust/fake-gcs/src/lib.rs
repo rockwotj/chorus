@@ -46,6 +46,65 @@ fn check_inbound_message_size(encoded_len: usize) -> Result<(), Status> {
     Ok(())
 }
 
+/// The largest data chunk the live service puts in one read response, the
+/// proto's `ServiceConstants.MAX_READ_CHUNK_BYTES`. The gRPC read handler
+/// splits each range into responses of at most this size, so a client reads
+/// an object larger than its 4 MiB decode limit as it would in production.
+pub const MAX_READ_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Split each range of a read response into responses carrying at most
+/// [`MAX_READ_CHUNK_BYTES`] of data. Metadata stays on the first response and
+/// `range_end` on the last piece of its range.
+fn chunk_read_response(response: BidiReadObjectResponse) -> Vec<BidiReadObjectResponse> {
+    let mut metadata = response.metadata;
+    let mut read_handle = response.read_handle;
+    let mut chunked = Vec::new();
+    for range in response.object_data_ranges {
+        let Some(data) = range
+            .checksummed_data
+            .as_ref()
+            .filter(|data| data.content.len() > MAX_READ_CHUNK_BYTES)
+        else {
+            chunked.push(BidiReadObjectResponse {
+                object_data_ranges: vec![range],
+                metadata: metadata.take(),
+                read_handle: read_handle.take(),
+            });
+            continue;
+        };
+        let read_offset = range.read_range.as_ref().map_or(0, |read| read.read_offset);
+        let read_id = range.read_range.as_ref().map_or(0, |read| read.read_id);
+        let pieces = data.content.len().div_ceil(MAX_READ_CHUNK_BYTES);
+        for (index, piece) in data.content.chunks(MAX_READ_CHUNK_BYTES).enumerate() {
+            let offset = index * MAX_READ_CHUNK_BYTES;
+            chunked.push(BidiReadObjectResponse {
+                object_data_ranges: vec![ObjectRangeData {
+                    checksummed_data: Some(proto::ChecksummedData {
+                        crc32c: Some(crc32c::crc32c(piece)),
+                        content: piece.to_vec(),
+                    }),
+                    read_range: Some(ReadRange {
+                        read_offset: read_offset + offset as i64,
+                        read_length: piece.len() as i64,
+                        read_id,
+                    }),
+                    range_end: range.range_end && index + 1 == pieces,
+                }],
+                metadata: metadata.take(),
+                read_handle: read_handle.take(),
+            });
+        }
+    }
+    if chunked.is_empty() {
+        chunked.push(BidiReadObjectResponse {
+            object_data_ranges: Vec::new(),
+            metadata,
+            read_handle,
+        });
+    }
+    chunked
+}
+
 /// Whether the live service answers `request` on a write stream: it responds
 /// only to a message that flushes, looks up state or finishes the write, so a
 /// one-shot client sees no response before its last message.
@@ -1638,8 +1697,10 @@ impl Storage for FakeGcs {
                     {
                         Ok(response) => {
                             include_metadata = false;
-                            if tx.send(Ok(response)).await.is_err() {
-                                return;
+                            for response in chunk_read_response(response) {
+                                if tx.send(Ok(response)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(status) => {
@@ -3223,5 +3284,146 @@ mod tests {
             .into_inner();
         assert_eq!(second.objects[0].name, "wal/segments/00000000000000000010");
         assert!(second.next_page_token.is_empty());
+    }
+
+    /// Drive a write stream to its terminal status, skipping any responses
+    /// that arrive before it.
+    async fn write_stream_status(
+        client: &mut StorageClient<tonic::transport::Channel>,
+        requests: Vec<BidiWriteObjectRequest>,
+    ) -> Status {
+        let mut responses = match client.bidi_write_object(tokio_stream::iter(requests)).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => return status,
+        };
+        loop {
+            match responses.message().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("write stream ended without an error"),
+                Err(status) => return status,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_messages_over_the_inbound_cap_are_rejected_as_resource_exhausted() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let oversized = vec![0x5a; INBOUND_MESSAGE_CAP_BYTES];
+        let crc = crc32c::crc32c(&oversized);
+
+        let mut create = create_request(bucket, "oversized-first");
+        create.data = request(0, &oversized, crc).data;
+        let status = write_stream_status(&mut client, vec![create]).await;
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(status
+            .message()
+            .starts_with("Received message larger than max"));
+        let missing = client
+            .get_object(GetObjectRequest {
+                bucket: bucket.into(),
+                object: "oversized-first".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
+
+        let mut continuation = request(0, &oversized, crc);
+        continuation.flush = true;
+        continuation.state_lookup = true;
+        let status = write_stream_status(
+            &mut client,
+            vec![
+                create_request(bucket, "oversized-continuation"),
+                continuation,
+            ],
+        )
+        .await;
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(server
+            .service
+            .raw_bytes_for(bucket, "oversized-continuation")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bidi_read_splits_a_large_range_into_service_sized_chunks() {
+        let server = FakeGcs::default().start().await.unwrap();
+        let mut client = StorageClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+        let bucket = "projects/_/buckets/zone-0";
+        let name = "large-read";
+        let content: Vec<u8> = (0..2 * MAX_READ_CHUNK_BYTES + 5)
+            .map(|index| index as u8)
+            .collect();
+        let mut writes = Vec::new();
+        for (index, piece) in content.chunks(MAX_READ_CHUNK_BYTES).enumerate() {
+            let offset = (index * MAX_READ_CHUNK_BYTES) as i64;
+            let mut write = request(offset, piece, crc32c::crc32c(piece));
+            if index == 0 {
+                write.first_message = create_request(bucket, name).first_message;
+            }
+            writes.push(write);
+        }
+        let last = writes.last_mut().unwrap();
+        last.flush = true;
+        last.state_lookup = true;
+        let mut responses = client
+            .bidi_write_object(tokio_stream::iter(writes))
+            .await
+            .unwrap()
+            .into_inner();
+        let persisted = responses.message().await.unwrap().unwrap();
+        assert_eq!(
+            persisted.write_status,
+            Some(WriteStatus::PersistedSize(content.len() as i64))
+        );
+
+        let read = BidiReadObjectRequest {
+            read_object_spec: Some(BidiReadObjectSpec {
+                bucket: bucket.into(),
+                object: name.into(),
+                ..Default::default()
+            }),
+            read_ranges: vec![ReadRange {
+                read_offset: 0,
+                read_length: 0,
+                read_id: 7,
+            }],
+        };
+        let mut reads = client
+            .bidi_read_object(tokio_stream::iter([read]))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut chunks = Vec::new();
+        while let Some(response) = reads.message().await.unwrap() {
+            chunks.push(response);
+        }
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].metadata.is_some());
+        assert!(chunks[1..].iter().all(|chunk| chunk.metadata.is_none()));
+        let mut read_back = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let [range] = chunk.object_data_ranges.as_slice() else {
+                panic!("each read response carries one range piece");
+            };
+            let data = range.checksummed_data.as_ref().unwrap();
+            let read_range = range.read_range.as_ref().unwrap();
+            assert!(data.content.len() <= MAX_READ_CHUNK_BYTES);
+            assert_eq!(data.crc32c, Some(crc32c::crc32c(&data.content)));
+            assert_eq!(read_range.read_offset, read_back.len() as i64);
+            assert_eq!(read_range.read_length, data.content.len() as i64);
+            assert_eq!(read_range.read_id, 7);
+            assert_eq!(range.range_end, index == chunks.len() - 1);
+            read_back.extend_from_slice(&data.content);
+        }
+        assert_eq!(read_back, content);
     }
 }

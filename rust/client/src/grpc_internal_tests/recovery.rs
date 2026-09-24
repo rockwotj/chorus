@@ -1141,3 +1141,135 @@ async fn startup_replay_uses_gcs_integrity_and_ignores_one_corrupt_replica() {
     let (_, records) = recover_records(&volume, WalSeqNo::ZERO).await;
     assert_eq!(records[0].payload, b"sealed".as_slice());
 }
+
+fn large_payload() -> Vec<u8> {
+    (0..chorus_fake_gcs::INBOUND_MESSAGE_CAP_BYTES + 54_321)
+        .map(|index| (index % 251) as u8)
+        .collect()
+}
+
+#[tokio::test]
+async fn takeover_rewrites_a_lagging_copy_larger_than_the_inbound_cap() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "large-takeover-wal",
+    );
+    let mut first = volume.recover_writer().await.unwrap();
+    let object =
+        active_segment_object(&factories[2], &manifest_factory, "large-takeover-wal").await;
+    servers[2].service.set_crashed(true).await;
+    let large = large_payload();
+    append_one(&mut first, &large).await;
+    drop(first);
+    servers[2].service.set_crashed(false).await;
+    assert!(factories[2]
+        .replica(&object)
+        .snapshot()
+        .await
+        .unwrap()
+        .bytes
+        .is_empty());
+
+    // Sealing the old segment installs its canonical prefix on the zone that
+    // missed the record, with a replacement write larger than the cap.
+    let recovered = volume.recover_writer().await.unwrap();
+    assert_eq!(recovered.active_segment_base(), 1);
+    let expected = record(&large).encode().unwrap();
+    let rewritten = factories[2].replica(&object).snapshot().await.unwrap();
+    assert!(rewritten.finalized);
+    assert_eq!(rewritten.bytes, expected);
+}
+
+#[tokio::test]
+async fn repair_rewrites_sealed_copies_larger_than_the_inbound_cap() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "large-repair-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    let large = large_payload();
+    append_one(&mut writer, &large).await;
+    writer.rotate().await.unwrap();
+    let segment = writer.catalog()[0].clone();
+    let object = segment_object("large-repair-wal", &segment.id);
+    let canonical = record(&large).encode().unwrap();
+
+    // Zone 1 holds an unfinalized prefix that ends inside the record, so repair
+    // takes the guarded-replace path. Zone 2 lost its copy, so repair creates
+    // it and appends the whole segment in one call.
+    let prefix = factories[1].replica(&object);
+    let generation = prefix.stat().await.unwrap().generation;
+    prefix.delete(generation).await.unwrap();
+    let created = prefix
+        .create_appendable(crate::protocol::protocol_metadata())
+        .await
+        .unwrap();
+    let token = prefix.takeover(&created).await.unwrap();
+    let torn = 1 << 20;
+    prefix
+        .append(&token, 0, canonical[..torn].to_vec())
+        .await
+        .unwrap();
+    let missing = factories[2].replica(&object);
+    let generation = missing.stat().await.unwrap().generation;
+    missing.delete(generation).await.unwrap();
+
+    let report = writer.repair_sealed_segments().await.unwrap();
+    assert_eq!(report.objects_repaired, 2);
+    assert_eq!(report.objects_failed, 0);
+    assert_eq!(report.transient_failures, 0);
+    for replica in [prefix, missing] {
+        let repaired = replica.snapshot().await.unwrap();
+        assert!(repaired.finalized);
+        assert_eq!(repaired.crc32c, segment.crc32c);
+        assert_eq!(repaired.bytes, canonical);
+    }
+}
+
+#[tokio::test]
+async fn repair_counts_a_non_transient_copy_failure_and_repairs_later_segments() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "repair-copy-failure-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        append_one(&mut writer, payload).await;
+        writer.rotate().await.unwrap();
+    }
+    let copies: Vec<_> = writer.catalog()[..2]
+        .iter()
+        .map(|segment| {
+            factories[2].replica(&segment_object("repair-copy-failure-wal", &segment.id))
+        })
+        .collect();
+    for copy in &copies {
+        let generation = copy.stat().await.unwrap().generation;
+        copy.delete(generation).await.unwrap();
+    }
+
+    servers[2]
+        .service
+        .inject(Operation::BidiCreate, Code::PermissionDenied)
+        .await;
+    let report = writer.repair_sealed_segments().await.unwrap();
+    assert_eq!(report.objects_failed, 1);
+    assert_eq!(report.objects_repaired, 1);
+    assert_eq!(report.transient_failures, 0);
+    assert_eq!(
+        copies[0].snapshot().await.unwrap_err().code,
+        TransportCode::NotFound
+    );
+    assert!(copies[1].snapshot().await.unwrap().finalized);
+
+    let report = writer.repair_sealed_segments().await.unwrap();
+    assert_eq!(report.objects_failed, 0);
+    assert_eq!(report.objects_repaired, 1);
+    assert!(copies[0].snapshot().await.unwrap().finalized);
+}
