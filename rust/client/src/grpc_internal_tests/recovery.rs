@@ -7,8 +7,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "manual full-segment recovery memory profile"]
 async fn seal_recovery_memory_profile() {
-    use crate::metrics::Metrics;
-    use crate::protocol::{digest_bytes, protocol_metadata, QuorumVolume};
+    use crate::protocol::digest_bytes;
 
     let mib: usize = std::env::var("CHORUS_RECOVERY_PROFILE_MIB")
         .unwrap_or_else(|_| "64".into())
@@ -24,63 +23,18 @@ async fn seal_recovery_memory_profile() {
     let data = bytes::Bytes::from(bytes);
     let expected_digest = digest_bytes(&data);
     let expected_crc32c = crc32c::crc32c(&data);
-    let mut servers = Vec::new();
-    let mut factories = Vec::new();
-    for zone in 0..3 {
-        let server = FakeGcs::default().start().await.unwrap();
-        let factory = GrpcReplicaFactory::connect(
-            zone,
-            &server.endpoint,
-            format!("projects/_/buckets/zone-{zone}"),
-            None,
-        )
-        .await
-        .unwrap();
-        servers.push(server);
-        factories.push(factory);
-    }
-    let object = "seal-recovery-memory/segment";
-    // Seed finalized objects without retaining a writer or timing population.
-    // The one-shot append splits the segment under the fake's inbound message
-    // cap. Recovery still takes the actual gRPC snapshot and canonical-selection
-    // paths, followed by committed-seal enforcement and its verification reads.
-    for factory in &factories {
-        let replica = factory.replica(object);
-        let created = replica
-            .create_appendable(protocol_metadata())
-            .await
-            .unwrap();
-        let mut token = replica.takeover(&created).await.unwrap();
-        token.persisted_size = replica.append(&token, 0, data.to_vec()).await.unwrap();
-        let sealed = replica
-            .finalize(&mut token, data.len() as i64)
-            .await
-            .unwrap();
-        assert_eq!(sealed.crc32c, Some(expected_crc32c));
-    }
-    for server in servers.iter().take(3) {
-        server.service.reset_operation_counts().await;
-    }
+    let (servers, _factories, volume) =
+        finalized_segment_volume("seal-recovery-memory/segment", &data).await;
     drop(data);
-    let volume = QuorumVolume::with_metadata(
-        factories
-            .iter()
-            .map(|factory| factory.replica(object))
-            .collect(),
-        test_config(),
-        protocol_metadata(),
-        Arc::new(Metrics::new(&crate::NoopMetricsRecorder, 3)),
-    )
-    .unwrap();
     let start = std::time::Instant::now();
     let recovered = volume.recover_for_seal(Some(records)).await.unwrap();
     assert_eq!(recovered.digest(), expected_digest);
     assert_eq!(recovered.crc32c(), expected_crc32c);
-    assert_eq!(recovered.canonical().len(), records);
+    assert_eq!(recovered.len(), records);
     assert!(!recovered.had_discarded_suffix());
-    volume.enforce_seal(recovered.canonical()).await.unwrap();
-    for server in servers.iter().take(3) {
-        assert!(server.service.operation_count(Operation::Read).await >= 2);
+    volume.enforce_seal(&recovered).await.unwrap();
+    for server in &servers {
+        assert_eq!(server.service.operation_count(Operation::Read).await, 1);
     }
     eprintln!(
         "seal recovery: replicas=3 segment_mib={mib} records={records} elapsed={:?}",
@@ -152,6 +106,257 @@ async fn recovery_ignores_one_corrupt_open_lane() {
         RecordFrame::decode_all(&healed.bytes).unwrap()[0].payload,
         b"committed".as_slice()
     );
+}
+
+#[tokio::test]
+async fn recovery_reads_each_live_tail_copy_once() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "single-read-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"first").await;
+    append_one(&mut writer, b"second").await;
+    let object = active_segment_object(&factories[0], &manifest_factory, "single-read-wal").await;
+    drop(writer);
+    for server in &servers {
+        server.service.reset_operation_counts().await;
+    }
+
+    let recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
+    // Canonical selection reads each fenced copy once. Seal enforcement then
+    // confirms the unchanged finalized copies from object metadata.
+    for server in servers.iter().take(3) {
+        assert_eq!(server.service.operation_count(Operation::Read).await, 1);
+    }
+    let records = recovery.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.payload.as_ref())
+            .collect::<Vec<_>>(),
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    for factory in &factories {
+        assert!(factory.replica(&object).stat().await.unwrap().finalized);
+    }
+}
+
+#[tokio::test]
+async fn recovery_rewrites_a_divergent_tail_copy() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "divergent-tail-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"first").await;
+    append_one(&mut writer, b"second").await;
+    let object =
+        active_segment_object(&factories[0], &manifest_factory, "divergent-tail-wal").await;
+    drop(writer);
+    // Same size, different payload byte, provider checksum updated.
+    assert!(
+        servers[0]
+            .service
+            .diverge_byte_for("projects/_/buckets/zone-0", &object, 4)
+            .await
+    );
+    for server in &servers {
+        server.service.reset_operation_counts().await;
+    }
+
+    let recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
+    // The matching copies are read once, for selection. The divergent copy is
+    // also read in full by seal enforcement and by the transport's
+    // replacement verification.
+    assert_eq!(servers[0].service.operation_count(Operation::Read).await, 3);
+    assert_eq!(servers[1].service.operation_count(Operation::Read).await, 1);
+    assert_eq!(servers[2].service.operation_count(Operation::Read).await, 1);
+    let records = recovery.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.payload.as_ref())
+            .collect::<Vec<_>>(),
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    let canonical = factories[1].replica(&object).snapshot().await.unwrap();
+    let repaired = factories[0].replica(&object).snapshot().await.unwrap();
+    assert!(repaired.finalized);
+    assert_eq!(repaired.bytes, canonical.bytes);
+    assert_eq!(repaired.crc32c, canonical.crc32c);
+}
+
+/// Seed `data` on every zone as a finalized object and return a quorum
+/// volume over it with zeroed operation counts.
+async fn finalized_segment_volume(
+    object: &str,
+    data: &bytes::Bytes,
+) -> (
+    Vec<chorus_fake_gcs::RunningFake>,
+    Vec<GrpcReplicaFactory>,
+    crate::protocol::QuorumVolume,
+) {
+    use crate::metrics::Metrics;
+    use crate::protocol::{protocol_metadata, QuorumVolume};
+
+    let mut servers = Vec::new();
+    let mut factories = Vec::new();
+    for zone in 0..3 {
+        let server = FakeGcs::default().start().await.unwrap();
+        let factory = GrpcReplicaFactory::connect(
+            zone,
+            &server.endpoint,
+            format!("projects/_/buckets/zone-{zone}"),
+            None,
+        )
+        .await
+        .unwrap();
+        servers.push(server);
+        factories.push(factory);
+    }
+    // The one-shot append splits the segment under the fake's inbound message
+    // cap.
+    for factory in &factories {
+        let replica = factory.replica(object);
+        let created = replica
+            .create_appendable(protocol_metadata())
+            .await
+            .unwrap();
+        let mut token = replica.takeover(&created).await.unwrap();
+        token.persisted_size = replica.append(&token, 0, data.to_vec()).await.unwrap();
+        let sealed = replica
+            .finalize(&mut token, data.len() as i64)
+            .await
+            .unwrap();
+        assert_eq!(sealed.crc32c, Some(crc32c::crc32c(data)));
+    }
+    for server in &servers {
+        server.service.reset_operation_counts().await;
+    }
+    let volume = QuorumVolume::with_metadata(
+        factories
+            .iter()
+            .map(|factory| factory.replica(object))
+            .collect(),
+        test_config(),
+        protocol_metadata(),
+        Arc::new(Metrics::new(&crate::NoopMetricsRecorder, 3)),
+    )
+    .unwrap();
+    (servers, factories, volume)
+}
+
+/// Replace `object` on one zone with a new finalized generation of `data`.
+async fn replace_finalized(factory: &GrpcReplicaFactory, object: &str, data: bytes::Bytes) {
+    let replica = factory.replica(object);
+    let observed = replica.stat().await.unwrap();
+    let mut token = replica
+        .replace_appendable(
+            &observed,
+            data.clone(),
+            crate::protocol::protocol_metadata(),
+        )
+        .await
+        .unwrap();
+    replica
+        .finalize(&mut token, data.len() as i64)
+        .await
+        .unwrap();
+}
+
+fn two_record_segment() -> bytes::Bytes {
+    let mut data = record(b"first").encode().unwrap().to_vec();
+    data.extend_from_slice(&record(b"second").encode().unwrap());
+    bytes::Bytes::from(data)
+}
+
+#[tokio::test]
+async fn seal_enforcement_rereads_a_new_generation_with_canonical_bytes() {
+    let object = "regenerated-after-recovery/segment";
+    let data = two_record_segment();
+    let (servers, factories, volume) = finalized_segment_volume(object, &data).await;
+    let recovered = volume.recover_for_seal(None).await.unwrap();
+    // Size, format and CRC32C still match; only the generation differs.
+    replace_finalized(&factories[1], object, data.clone()).await;
+    for server in &servers {
+        server.service.reset_operation_counts().await;
+    }
+
+    volume.enforce_seal(&recovered).await.unwrap();
+    // The new generation is read in full. It already holds the canonical
+    // bytes, so it is accepted without a replacement.
+    assert_eq!(servers[0].service.operation_count(Operation::Read).await, 0);
+    assert_eq!(servers[1].service.operation_count(Operation::Read).await, 1);
+    assert_eq!(servers[2].service.operation_count(Operation::Read).await, 0);
+}
+
+#[tokio::test]
+async fn seal_enforcement_does_not_count_confirmed_copies_below_a_quorum() {
+    let object = "confirmed-minority/segment";
+    let data = two_record_segment();
+    let (servers, _factories, volume) = finalized_segment_volume(object, &data).await;
+    let recovered = volume.recover_for_seal(None).await.unwrap();
+    // Zone 1 changes after recovery and can no longer be repaired; zone 2 is
+    // unavailable. Only zone 0 can be confirmed.
+    assert!(
+        servers[1]
+            .service
+            .diverge_byte_for("projects/_/buckets/zone-1", object, 4)
+            .await
+    );
+    servers[1].service.set_crashed(true).await;
+    servers[2].service.set_crashed(true).await;
+
+    let error = volume.enforce_seal(&recovered).await.unwrap_err();
+    assert!(
+        matches!(error, crate::protocol::ProtocolError::NoQuorum),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn seal_enforcement_rereads_copies_changed_after_recovery() {
+    let object = "changed-after-recovery/segment";
+    let data = two_record_segment();
+    let (servers, factories, volume) = finalized_segment_volume(object, &data).await;
+    let recovered = volume.recover_for_seal(None).await.unwrap();
+    for server in &servers {
+        assert_eq!(server.service.operation_count(Operation::Read).await, 1);
+        server.service.reset_operation_counts().await;
+    }
+
+    // Zone 1 gets a new generation with other bytes. Zone 2 keeps its
+    // generation but its content and checksum change in place.
+    replace_finalized(&factories[1], object, record(b"other").encode().unwrap()).await;
+    assert!(
+        servers[2]
+            .service
+            .diverge_byte_for("projects/_/buckets/zone-2", object, 4)
+            .await
+    );
+
+    for server in &servers {
+        server.service.reset_operation_counts().await;
+    }
+
+    volume.enforce_seal(&recovered).await.unwrap();
+    // The unchanged copy is confirmed from metadata. Each changed copy is
+    // read in full, replaced, and read again by the transport's replacement
+    // verification.
+    assert_eq!(servers[0].service.operation_count(Operation::Get).await, 1);
+    assert_eq!(servers[0].service.operation_count(Operation::Read).await, 0);
+    assert_eq!(servers[1].service.operation_count(Operation::Read).await, 2);
+    assert_eq!(servers[2].service.operation_count(Operation::Read).await, 2);
+    for (zone, factory) in factories.iter().enumerate() {
+        let sealed = factory.replica(object).snapshot().await.unwrap();
+        assert!(sealed.finalized, "zone {zone}");
+        assert_eq!(sealed.bytes, data[..], "zone {zone}");
+    }
 }
 
 #[tokio::test]

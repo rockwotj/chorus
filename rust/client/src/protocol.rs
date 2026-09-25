@@ -243,11 +243,36 @@ impl SealReport {
     }
 }
 
+/// Complete-record prefix selected by recovery. `bytes` is shared with seal
+/// enforcement's rewrites, and record payloads are decoded only on request.
 #[derive(Debug, Default)]
 pub(crate) struct CanonicalPrefix {
-    bytes: Vec<u8>,
-    records: Vec<RecordFrame>,
+    bytes: Bytes,
     record_ends: Vec<usize>,
+}
+
+/// One quorum-sized candidate's view of a recovery witness: its well-formed
+/// prefix borrowed from the snapshot, and the end offset of each record.
+struct WitnessPrefix<'a> {
+    bytes: &'a [u8],
+    record_ends: Vec<usize>,
+}
+
+/// The witness whose well-formed prefix [`select_canonical_quorum`] chose,
+/// as an index into its input and the prefix's record end offsets.
+struct CanonicalSelection {
+    witness: usize,
+    record_ends: Vec<usize>,
+}
+
+/// A recovery witness that was finalized with exactly the canonical bytes
+/// when recovery read it. A finalized generation's content is immutable, so
+/// seal enforcement confirms such a copy with a metadata `stat` of the same
+/// generation instead of reading it again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SealedWitness {
+    zone: usize,
+    generation: i64,
 }
 
 /// The canonical content of a fenced tail segment, computed by
@@ -256,7 +281,9 @@ pub(crate) struct CanonicalPrefix {
 /// [`QuorumVolume::enforce_seal`] then installs and finalizes the bytes.
 pub(crate) struct RecoveredTail {
     canonical: CanonicalPrefix,
+    crc32c: u32,
     had_discarded_suffix: bool,
+    sealed_witnesses: Vec<SealedWitness>,
 }
 
 /// Result of fencing one manifest candidate in recovery order.
@@ -287,11 +314,7 @@ impl RecoveredTail {
 
     /// Full-object CRC32C of the exact canonical bytes.
     pub fn crc32c(&self) -> u32 {
-        crc32c::crc32c(&self.canonical.bytes)
-    }
-
-    pub fn canonical(&self) -> &CanonicalPrefix {
-        &self.canonical
+        self.crc32c
     }
 
     /// Whether any fenced witness extended past the recovered complete-record
@@ -436,47 +459,36 @@ pub(crate) enum ProtocolError {
 
 impl CanonicalPrefix {
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.record_ends.len()
     }
 
+    /// Decode the records. Each payload is a slice of the shared prefix.
     pub fn into_records(self) -> Vec<RecordFrame> {
-        self.records
+        RecordFrame::decode_all_bytes(self.bytes)
+            .expect("a canonical prefix contains only complete records")
+    }
+}
+
+impl<'a> WitnessPrefix<'a> {
+    fn from_snapshot(snapshot: &'a ReplicaSnapshot) -> Self {
+        let record_ends = RecordFrame::complete_prefix_ends(&snapshot.bytes);
+        let consumed = record_ends.last().copied().unwrap_or(0);
+        Self {
+            bytes: &snapshot.bytes[..consumed],
+            record_ends,
+        }
     }
 
-    fn truncate(&mut self, records: usize) {
-        self.records.truncate(records);
-        self.record_ends.truncate(records);
-        self.bytes.truncate(self.committed_bytes_len(records));
-    }
-
-    fn committed_bytes_len(&self, records: usize) -> usize {
-        records
-            .checked_sub(1)
-            .and_then(|index| self.record_ends.get(index).copied())
-            .unwrap_or(0)
+    fn len(&self) -> usize {
+        self.record_ends.len()
     }
 
     fn record_bytes(&self, index: usize) -> &[u8] {
         let start = index
             .checked_sub(1)
-            .and_then(|previous| self.record_ends.get(previous).copied())
+            .map(|previous| self.record_ends[previous])
             .unwrap_or(0);
         &self.bytes[start..self.record_ends[index]]
-    }
-
-    fn from_snapshot(snapshot: &ReplicaSnapshot) -> Self {
-        let (records, consumed) = RecordFrame::decode_complete_prefix(&snapshot.bytes);
-        let mut record_ends = Vec::with_capacity(records.len());
-        let mut end = 0usize;
-        for record in &records {
-            end += record.encode().expect("a decoded record must encode").len();
-            record_ends.push(end);
-        }
-        Self {
-            bytes: snapshot.bytes[..consumed].to_vec(),
-            records,
-            record_ends,
-        }
     }
 }
 
@@ -1162,6 +1174,14 @@ impl QuorumVolume {
                 recovery_snapshots.push(snapshot);
             }
         }
+        // Whole-object lengths before truncation identify the copies that
+        // already hold exactly the canonical bytes. The missing-zone
+        // placeholders appended below have no entry, so `zip` excludes them
+        // from the sealed witnesses.
+        let observed_lens: Vec<_> = recovery_snapshots
+            .iter()
+            .map(|snapshot| snapshot.bytes.len())
+            .collect();
         for snapshot in &mut recovery_snapshots {
             snapshot
                 .bytes
@@ -1177,25 +1197,56 @@ impl QuorumVolume {
             metadata: self.metadata.clone(),
             bytes: Vec::new(),
         }));
-        let mut canonical = select_canonical_quorum(&recovery_snapshots, self.quorum())?;
-        let had_discarded_suffix = max_observed_size > canonical.bytes.len();
+        let CanonicalSelection {
+            witness,
+            mut record_ends,
+        } = select_canonical_quorum(&recovery_snapshots, self.quorum())?;
+        let selected_len = record_ends.last().copied().unwrap_or(0);
+        let had_discarded_suffix = max_observed_size > selected_len;
         if let Some(expected) = expected_records {
-            if canonical.len() < expected {
+            if record_ends.len() < expected {
                 return Err(ProtocolError::RecoveryPrefixTooShort {
                     expected,
-                    actual: canonical.len(),
+                    actual: record_ends.len(),
                 });
             }
-            canonical.truncate(expected);
+            record_ends.truncate(expected);
         }
-        if canonical.len() == 0 {
+        let Some(&canonical_len) = record_ends.last() else {
             return Ok(RecoveryCandidate::Empty {
                 reusable_writer: None,
             });
+        };
+        let canonical_bytes = &recovery_snapshots[witness].bytes[..canonical_len];
+        let sealed_witnesses = recovery_snapshots
+            .iter()
+            .zip(&observed_lens)
+            .filter(|(snapshot, &observed_len)| {
+                snapshot.finalized
+                    && observed_len == canonical_len
+                    && snapshot.bytes == canonical_bytes
+            })
+            .map(|(snapshot, _)| SealedWitness {
+                zone: snapshot.zone,
+                generation: snapshot.generation,
+            })
+            .collect();
+        // The selected snapshot's buffer becomes the canonical prefix; the
+        // other snapshots are released when this function returns.
+        let mut bytes = std::mem::take(&mut recovery_snapshots[witness].bytes);
+        bytes.truncate(canonical_len);
+        // The read buffer can carry a discarded suffix and growth capacity.
+        // The deferred seal keeps this prefix alive until enforcement, so
+        // release the excess when it is large.
+        if bytes.capacity() - canonical_len > canonical_len / 8 {
+            bytes.shrink_to_fit();
         }
+        let bytes = Bytes::from(bytes);
         Ok(RecoveryCandidate::NonEmpty(RecoveredTail {
-            canonical,
+            crc32c: crc32c::crc32c(&bytes),
+            canonical: CanonicalPrefix { bytes, record_ends },
             had_discarded_suffix,
+            sealed_witnesses,
         }))
     }
 
@@ -1209,17 +1260,59 @@ impl QuorumVolume {
     /// at least one object throughout the rewrite; the operation is
     /// idempotent and convergent under crashes and races because the bytes
     /// are fixed by the committed decision.
-    pub async fn enforce_seal(&self, canonical: &CanonicalPrefix) -> Result<(), ProtocolError> {
-        let data = Bytes::from(canonical.bytes.clone());
-        let reads = join_all(
-            self.replicas
+    ///
+    /// A copy that recovery read as finalized with exactly the canonical
+    /// bytes is confirmed with a `stat` instead of a second full read: the
+    /// same finalized generation, size, format and CRC32C prove it still holds
+    /// those bytes. Any other copy, including one replaced or changed since
+    /// recovery read it, is read in full and rewritten as before. `stat`
+    /// does not read content, so a confirmed copy whose storage began
+    /// failing reads after recovery read it still counts here; the repair
+    /// pass restores such a copy from the committed CRC32C.
+    pub async fn enforce_seal(&self, tail: &RecoveredTail) -> Result<(), ProtocolError> {
+        enum Observed {
+            Sealed,
+            Read(Result<ReplicaSnapshot, TransportError>),
+        }
+
+        let canonical = &tail.canonical;
+        let data = canonical.bytes.clone();
+        let reads = join_all(self.replicas.iter().enumerate().map(|(zone, replica)| {
+            let sealed = tail
+                .sealed_witnesses
                 .iter()
-                .map(|replica| snapshot_with_retry(replica, &self.config)),
-        )
+                .find(|witness| witness.zone == zone)
+                .copied();
+            let config = &self.config;
+            let data_len = data.len() as i64;
+            async move {
+                if let Some(witness) = sealed {
+                    if let Ok(current) = stat_with_retry(replica, config).await {
+                        if current.generation == witness.generation
+                            && current.finalized
+                            && valid_format(&current.metadata)
+                            && current.persisted_size == data_len
+                            && current.crc32c == Some(tail.crc32c)
+                        {
+                            return Observed::Sealed;
+                        }
+                    }
+                }
+                Observed::Read(snapshot_with_retry(replica, config).await)
+            }
+        }))
         .await;
+        let mut finalized = 0usize;
         let mut witnesses: Vec<ReplicaSnapshot> = Vec::new();
         let mut missing: Vec<usize> = Vec::new();
-        for (zone, read) in reads.into_iter().enumerate() {
+        for (zone, observed) in reads.into_iter().enumerate() {
+            let read = match observed {
+                Observed::Sealed => {
+                    finalized += 1;
+                    continue;
+                }
+                Observed::Read(read) => read,
+            };
             match read {
                 Ok(snapshot) if valid_format(&snapshot.metadata) => witnesses.push(snapshot),
                 Ok(_) => {}
@@ -1257,7 +1350,6 @@ impl QuorumVolume {
                 * canonical.bytes.len()
                 + shared
         });
-        let mut finalized = 0usize;
         for snapshot in witnesses {
             match self.enforce_witness(snapshot, &data).await {
                 Ok(true) => finalized += 1,
@@ -1717,7 +1809,7 @@ impl Writer {
                     actual: actual_crc32c,
                 });
             }
-            volume.enforce_seal(recovered.canonical()).await?;
+            volume.enforce_seal(&recovered).await?;
             // Enforcement guarantees a sealed quorum, but does not promise that
             // every replica was reachable. Conservatively request targeted repair.
             Ok(SealReport::default())
@@ -2801,7 +2893,14 @@ pub(crate) fn canonical_prefix(
     snapshots: &[ReplicaSnapshot],
     quorum: usize,
 ) -> Result<Vec<RecordFrame>, ProtocolError> {
-    select_canonical_quorum(snapshots, quorum).map(CanonicalPrefix::into_records)
+    let selection = select_canonical_quorum(snapshots, quorum)?;
+    let end = selection.record_ends.last().copied().unwrap_or(0);
+    let bytes = Bytes::copy_from_slice(&snapshots[selection.witness].bytes[..end]);
+    Ok(CanonicalPrefix {
+        bytes,
+        record_ends: selection.record_ends,
+    }
+    .into_records())
 }
 
 /// Ascending index combinations of size `quorum` out of `count` snapshots,
@@ -2838,14 +2937,13 @@ fn quorum_subsets(count: usize, quorum: usize) -> Vec<Vec<usize>> {
 fn select_canonical_quorum(
     snapshots: &[ReplicaSnapshot],
     quorum: usize,
-) -> Result<CanonicalPrefix, ProtocolError> {
+) -> Result<CanonicalSelection, ProtocolError> {
     if snapshots.len() < quorum {
         return Err(ProtocolError::NoQuorum);
     }
-    let mut decoded: Vec<_> = snapshots
-        .iter()
-        .map(CanonicalPrefix::from_snapshot)
-        .collect();
+    // Views borrow each snapshot's bytes. Only the caller copies or moves the
+    // selected witness's prefix.
+    let mut decoded: Vec<_> = snapshots.iter().map(WitnessPrefix::from_snapshot).collect();
     let mut conflicts = vec![false; decoded.len() * decoded.len()];
     let mut first_conflict = None;
     for left in 0..decoded.len() {
@@ -2876,9 +2974,6 @@ fn select_canonical_quorum(
                 longest_member = member;
             }
         }
-        // Candidates only identify existing buffers. Cloning a canonical
-        // prefix and every witness here duplicates whole segments for each
-        // quorum combination, although callers only need the selected prefix.
         candidates.push((longest_member, subset));
     }
     let longest = candidates
@@ -2914,8 +3009,10 @@ fn select_canonical_quorum(
             right_zones.cmp(left_zones)
         })
         .expect("at least one equivalent candidate remains");
-    // Move the winner once; all other decoded prefixes are released here.
-    Ok(decoded.swap_remove(selected))
+    Ok(CanonicalSelection {
+        witness: selected,
+        record_ends: decoded.swap_remove(selected).record_ends,
+    })
 }
 
 pub(crate) fn protocol_metadata() -> HashMap<String, String> {

@@ -88,6 +88,19 @@ impl RecordFrame {
         (records, consumed)
     }
 
+    /// End offset of each record in the prefix that
+    /// [`Self::decode_complete_prefix`] would decode, without copying any
+    /// payload.
+    pub(crate) fn complete_prefix_ends(input: &[u8]) -> Vec<usize> {
+        let mut ends = Vec::new();
+        let mut consumed = 0usize;
+        while let Ok(record_len) = Self::decoded_len(&input[consumed..]) {
+            consumed += record_len;
+            ends.push(consumed);
+        }
+        ends
+    }
+
     fn decode_one(input: &[u8]) -> Result<(Self, usize), RecordError> {
         let total_len = Self::decoded_len(input)?;
         Ok((
