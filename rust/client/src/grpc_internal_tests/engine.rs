@@ -1608,3 +1608,201 @@ async fn shutdown_deadline_aborts_a_stuck_append_pipeline() {
         matches!(error, Error::ShutdownTimeout { timeout } if timeout == Duration::from_millis(50))
     );
 }
+
+async fn append_and_shutdown(handle: WalHandle, records: u64) {
+    let mut handle = handle;
+    let mut completions = Vec::new();
+    for seqno in 0..records {
+        completions.push(
+            handle
+                .enqueue_append(
+                    WalSeqNo::record(seqno),
+                    bytes::Bytes::from(format!("transaction-{seqno}")),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    for completion in completions {
+        completion.await.unwrap();
+    }
+    shutdown_engine(handle).await;
+}
+
+async fn reset_zone_counts(servers: &[chorus_fake_gcs::RunningFake]) {
+    for server in &servers[..3] {
+        server.service.reset_operation_counts().await;
+    }
+}
+
+async fn zone_count(servers: &[chorus_fake_gcs::RunningFake], operation: Operation) -> u64 {
+    let mut total = 0;
+    for server in &servers[..3] {
+        total += server.service.operation_count(operation).await;
+    }
+    total
+}
+
+#[tokio::test]
+async fn graceful_shutdown_seals_the_tail_so_recovery_reads_no_segment_bytes() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let (volume, metrics) =
+        volume_with_metrics(factories, manifest_factory.clone(), "shutdown-seal-wal");
+    let handle = WalEngine::start(
+        volume.recover_writer().await.unwrap(),
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_, pending_before) = manifest_frontier_ids(&manifest_factory, "shutdown-seal-wal").await;
+    append_and_shutdown(handle, 3).await;
+    assert_eq!(metrics.counter("chorus.wal.seal.segments"), 1);
+
+    // The pending segment became the empty tail, and the sealed segment is
+    // the directory's only entry.
+    let (tail, _) = manifest_frontier_ids(&manifest_factory, "shutdown-seal-wal").await;
+    assert_eq!(tail, pending_before);
+    let manifest = manifest_factory
+        .replica("shutdown-seal-wal/manifest")
+        .stat()
+        .await
+        .unwrap();
+    assert_eq!(manifest.metadata["chorus.tail_base"], "3");
+
+    reset_zone_counts(&servers).await;
+    let recovery = volume.recover(WalSeqNo::record(3)).await.unwrap();
+    assert_eq!(recovery.end, WalSeqNo::record(3));
+    assert_eq!(recovery.sealed_segment_count(), 1);
+    let handle = {
+        let mut recovery = recovery;
+        assert!(recovery.try_next().await.unwrap().is_none());
+        recovery
+            .start(WalEngineConfig {
+                repair_interval: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    };
+    // Recovery took over both empty frontier objects and verified the seal
+    // from stat metadata: no segment bytes were read, rewritten, finalized,
+    // or created.
+    for operation in [
+        Operation::Read,
+        Operation::BidiRead,
+        Operation::BidiGuardedReplace,
+        Operation::BidiFinalize,
+        Operation::BidiCreate,
+    ] {
+        assert_eq!(zone_count(&servers, operation).await, 0, "{operation:?}");
+    }
+    let (tail_after, _) = manifest_frontier_ids(&manifest_factory, "shutdown-seal-wal").await;
+    assert_eq!(tail_after, pending_before);
+
+    let mut handle = handle;
+    handle
+        .enqueue_append(WalSeqNo::record(3), bytes::Bytes::from_static(b"after"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    shutdown_engine(handle).await;
+    let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
+    assert_eq!(end, WalSeqNo::record(4));
+    let payloads: Vec<_> = records
+        .iter()
+        .map(|record| record.payload.clone())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![
+            bytes::Bytes::from_static(b"transaction-0"),
+            bytes::Bytes::from_static(b"transaction-1"),
+            bytes::Bytes::from_static(b"transaction-2"),
+            bytes::Bytes::from_static(b"after"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn shutdown_with_an_empty_active_segment_changes_nothing() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let (volume, metrics) =
+        volume_with_metrics(factories, manifest_factory.clone(), "shutdown-empty-wal");
+    let handle = WalEngine::start(
+        volume.recover_writer().await.unwrap(),
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = manifest_frontier_ids(&manifest_factory, "shutdown-empty-wal").await;
+    reset_zone_counts(&servers).await;
+    shutdown_engine(handle).await;
+    assert_eq!(
+        manifest_frontier_ids(&manifest_factory, "shutdown-empty-wal").await,
+        before
+    );
+    assert_eq!(zone_count(&servers, Operation::BidiCreate).await, 0);
+    assert_eq!(zone_count(&servers, Operation::BidiFinalize).await, 0);
+    assert_eq!(metrics.counter("chorus.wal.seal.segments"), 0);
+}
+
+#[tokio::test]
+async fn shutdown_seal_of_a_fenced_writer_leaves_the_new_owner_manifest_alone() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let prefix = "shutdown-fenced-wal";
+    let volume = volume(factories, manifest_factory.clone(), prefix);
+    let mut stale = WalEngine::start(
+        volume.recover_writer().await.unwrap(),
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for seqno in 0..3 {
+        stale
+            .enqueue_append(
+                WalSeqNo::record(seqno),
+                bytes::Bytes::from(format!("transaction-{seqno}")),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    // A newer writer claims the manifest while the stale engine still runs.
+    let mut owner = volume.recover_writer().await.unwrap();
+    let owner_manifest = manifest_factory
+        .replica(&format!("{prefix}/manifest"))
+        .stat()
+        .await
+        .unwrap()
+        .metadata;
+    reset_zone_counts(&servers).await;
+    shutdown_engine(stale).await;
+    assert_eq!(
+        manifest_factory
+            .replica(&format!("{prefix}/manifest"))
+            .stat()
+            .await
+            .unwrap()
+            .metadata,
+        owner_manifest
+    );
+    // The stale engine provisioned a refill, so it reached the fold CAS,
+    // which its old epoch could not satisfy.
+    assert!(zone_count(&servers, Operation::BidiCreate).await > 0);
+    assert_eq!(zone_count(&servers, Operation::BidiFinalize).await, 0);
+
+    assert_eq!(append_one(&mut owner, b"owner").await, 3);
+    owner.shutdown_background_tasks().await;
+    let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
+    assert_eq!(end, WalSeqNo::record(4));
+    assert_eq!(records[3].payload, bytes::Bytes::from_static(b"owner"));
+}

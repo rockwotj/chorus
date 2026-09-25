@@ -96,6 +96,9 @@ pub struct WalEngineConfig {
     /// Maximum time graceful shutdown may spend draining accepted work and
     /// joining owned background tasks before aborting them.
     ///
+    /// Shutdown seals a non-empty active segment after the drain, within the
+    /// first half of this timeout; see [`WalHandle::shutdown`].
+    ///
     /// The default is five minutes, long enough for the default storage retry
     /// budget while still turning a wedged backend or task into a bounded error.
     pub shutdown_timeout: Duration,
@@ -316,7 +319,11 @@ impl AdmittedAppend {
 
 enum Command {
     Append(AdmittedAppend),
-    Shutdown { response: oneshot::Sender<()> },
+    Shutdown {
+        response: oneshot::Sender<()>,
+        /// After this instant the engine starts no new shutdown seal step.
+        seal_deadline: tokio::time::Instant,
+    },
 }
 
 struct CompletionBatch {
@@ -334,6 +341,7 @@ struct EngineState {
     last_dispatched_admission_bytes: u128,
     input_closed: bool,
     shutdown_response: Option<oneshot::Sender<()>>,
+    seal_deadline: Option<tokio::time::Instant>,
 }
 
 impl EngineState {
@@ -348,6 +356,7 @@ impl EngineState {
             last_dispatched_admission_bytes: 0,
             input_closed: false,
             shutdown_response: None,
+            seal_deadline: None,
         }
     }
 
@@ -744,6 +753,16 @@ impl WalHandle {
     /// Consume the admission handle, drain accepted work, finish every
     /// committed seal, and wait for all owned tasks to exit.
     ///
+    /// After the drain, a non-empty active segment is sealed with the same
+    /// manifest fold as a rotation, so the next recovery starts from an empty
+    /// tail and reads no segment bytes. An empty active segment is not
+    /// sealed, and neither is one while an earlier rotation is unfinished or
+    /// the directory is full. The seal starts each step only within the first
+    /// half of [`WalEngineConfig::shutdown_timeout`], counted from this call,
+    /// and stops waiting for finalization after it. A seal already handed to
+    /// maintenance finishes in maintenance's drain. A seal that is fenced or
+    /// cannot complete does not fail shutdown; recovery then seals the
+    /// segment as it would after a crash.
     pub async fn shutdown(self) -> Result<(), Error> {
         let WalHandle {
             sender,
@@ -755,6 +774,10 @@ impl WalHandle {
             shutdown_timeout,
             ..
         } = self;
+        // The seal gets the first half of the shutdown budget, which leaves
+        // the rest for a manifest update already sent, maintenance's drain,
+        // and joining the owned tasks.
+        let seal_deadline = tokio::time::Instant::now() + shutdown_timeout / 2;
         let mut engine_task = engine_task;
         let mut provisioner_task = provisioner_task;
         let mut maintenance_task = maintenance_task;
@@ -762,7 +785,10 @@ impl WalHandle {
         let provisioner_timeout_shutdown = provisioner_shutdown.clone();
         let graceful = async {
             let (response, receiver) = oneshot::channel();
-            let sent = sender.send(Command::Shutdown { response });
+            let sent = sender.send(Command::Shutdown {
+                response,
+                seal_deadline,
+            });
             drop(sender);
             let acknowledged = if sent.is_ok() {
                 receiver.await.is_ok()
@@ -1065,9 +1091,13 @@ async fn run_engine(
 
         if state.pending_records == 0 && !matches!(state.queue.front(), Some(Command::Append(_))) {
             match state.queue.pop_front() {
-                Some(Command::Shutdown { response }) => {
+                Some(Command::Shutdown {
+                    response,
+                    seal_deadline,
+                }) => {
                     fail_all(&mut state.queue, Error::Closed, &metrics);
                     state.shutdown_response = Some(response);
+                    state.seal_deadline = Some(seal_deadline);
                     break;
                 }
                 Some(Command::Append(_)) => unreachable!(),
@@ -1333,6 +1363,12 @@ async fn run_engine(
             }
         }
     }
+    if state.shutdown_response.is_some() {
+        if let Some(deadline) = state.seal_deadline {
+            seal_active_on_shutdown(&mut writer, &mut rotation, &catalog, &maintenance, deadline)
+                .await;
+        }
+    }
     writer.shutdown_background_tasks().await;
     rotation.shutdown_background_tasks().await;
     if let Some(response) = state.shutdown_response {
@@ -1342,6 +1378,184 @@ async fn run_engine(
         tracing::warn!("WAL engine stopped without graceful shutdown");
     }
     metrics.queue_bytes.set(0);
+}
+
+/// Seal the drained active segment with the swap and fold a rotation
+/// performs, so the manifest tail is the empty pending segment when the
+/// engine exits.
+///
+/// Every step either leaves the manifest unchanged or commits the same
+/// transition as a live rotation, so any failure leaves a state recovery
+/// already handles after a crash. The fold CAS is guarded by this writer's
+/// epoch: a writer fenced by a newer claim gets `Fenced` and changes nothing.
+/// Each step starts only before `deadline`. The fold CAS is not cancelled at
+/// the deadline, but the outer shutdown timeout may abort it; a CAS that
+/// lands afterwards is still epoch-guarded, and recovery finishes its seal.
+async fn seal_active_on_shutdown(
+    writer: &mut SegmentedWriter,
+    rotation: &mut Rotation,
+    catalog: &watch::Sender<Vec<crate::segment::SegmentDescriptor>>,
+    maintenance: &crate::maintenance::MaintenanceHandle,
+    deadline: tokio::time::Instant,
+) {
+    let expired = || tokio::time::Instant::now() >= deadline;
+    match rotation {
+        Rotation::Idle | Rotation::Due => {}
+        Rotation::Sealing { enforced } => {
+            // The manifest seal record still names the previous segment, and
+            // a fold would replace it. Wait for that segment's finalized
+            // quorum first, as the next live rotation would.
+            if !matches!(
+                tokio::time::timeout_at(deadline, enforced).await,
+                Ok(Ok(()))
+            ) {
+                tracing::info!("WAL shutdown seal skipped: the previous seal is not enforced");
+                return;
+            }
+            *rotation = Rotation::Idle;
+        }
+        Rotation::Draining { .. } | Rotation::Disabled { .. } => {
+            tracing::info!("WAL shutdown seal skipped: an earlier rotation is unfinished");
+            return;
+        }
+    }
+    if !writer.shutdown_seal_ready() {
+        // See `shutdown_seal_ready` for the skipped cases. An empty active
+        // segment already recovers without reading bytes.
+        return;
+    }
+    if expired() {
+        tracing::info!("WAL shutdown seal skipped: the drain used the seal budget");
+        return;
+    }
+    let parts = match writer.provision_parts() {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::warn!(%error, "WAL shutdown seal skipped");
+            return;
+        }
+    };
+
+    // Provision the refill first. The fold names it as the next pending
+    // segment, and nothing has changed yet if provisioning fails.
+    let refill_id = writer.next_segment_id();
+    let replicas = crate::segment::provision_replicas(&parts.factories, &parts.prefix, &refill_id);
+    let provision = crate::segment::provision_spare_with_replicas(
+        replicas.clone(),
+        parts.client_config.clone(),
+        parts.max_replica_lag_bytes,
+        parts.lane_stall_timeout,
+        refill_id,
+        Arc::clone(&parts.metrics),
+    );
+    let provisioned = tokio::time::timeout_at(deadline, provision).await;
+    let (refill_id, mut refill) = match provisioned {
+        Ok(Ok(refill)) => refill,
+        failed => {
+            // A failed create can leave sessions open on the zones that
+            // succeeded, and a create held by one zone may not resolve after
+            // its session closes, so close every session and drop the attempt.
+            // An object the service already created is unreferenced under
+            // this epoch, and the next writer's dead-segment sweep deletes it.
+            join_all(replicas.iter().map(|replica| replica.shutdown())).await;
+            match failed {
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "WAL shutdown seal skipped: refill provisioning failed");
+                }
+                _ => tracing::warn!(
+                    "WAL shutdown seal skipped: refill provisioning exceeded the seal budget"
+                ),
+            }
+            return;
+        }
+    };
+
+    // `begin_swap` waits for the digest worker, which only hashes records
+    // that are already committed. It cannot be cancelled midway without
+    // losing the spare, so the budget is checked before it starts.
+    if expired() {
+        refill.shutdown_background_tasks().await;
+        tracing::info!("WAL shutdown seal skipped: refill provisioning used the seal budget");
+        return;
+    }
+    let swap = match writer.begin_swap().await {
+        Ok(Some(swap)) => swap,
+        Ok(None) => {
+            refill.shutdown_background_tasks().await;
+            return;
+        }
+        Err(error) => {
+            refill.shutdown_background_tasks().await;
+            tracing::warn!(%error, "WAL shutdown seal skipped: swap failed");
+            return;
+        }
+    };
+    writer.adopt_unregistered_spare(refill_id, refill);
+    let folded = if expired() {
+        tracing::info!("WAL shutdown seal skipped: the swap used the seal budget");
+        false
+    } else {
+        let result = writer
+            .pending_fold_request(&swap)
+            .map(|fold| crate::segment::fold_registered_pending(parts.manifest, fold));
+        let result = match result {
+            Ok(fold) => fold.await,
+            Err(error) => Err(error),
+        };
+        match result.and_then(|update| writer.confirm_fold(&swap, update)) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "WAL shutdown seal left the active segment unsealed");
+                false
+            }
+        }
+    };
+    if !folded {
+        // The engine exit path closes the swapped-out segment's lanes.
+        *rotation = Rotation::Draining {
+            swap: Box::new(swap),
+            fold_attempts: 0,
+            retry: None,
+            fold_capacity_blocked: false,
+            successor_due: false,
+        };
+        return;
+    }
+
+    // Publish the catalog before queueing the seal, as a live rotation does:
+    // its `seal_pending` entry keeps maintenance truncation from deleting
+    // copies the seal is still finalizing.
+    let _ = catalog.send(writer.sealed_segments_snapshot());
+    let base = swap.base_record_index;
+    let Some(segment) = swap.into_segment() else {
+        return;
+    };
+    let enforced = match maintenance.seal_segment(segment).await {
+        Ok(enforced) => enforced,
+        Err(error) => {
+            tracing::warn!(
+                segment_base = base,
+                %error,
+                "WAL shutdown seal committed but maintenance stopped; recovery will finalize"
+            );
+            return;
+        }
+    };
+    match tokio::time::timeout_at(deadline, enforced).await {
+        Ok(Ok(())) => tracing::info!(
+            segment_base = base,
+            "WAL shutdown sealed the active segment"
+        ),
+        Ok(Err(_)) => tracing::warn!(
+            segment_base = base,
+            "WAL shutdown seal committed but enforcement failed; recovery will finalize"
+        ),
+        // Maintenance finishes the queued seal during its shutdown drain.
+        Err(_) => tracing::info!(
+            segment_base = base,
+            "WAL shutdown seal committed; maintenance is still finalizing it"
+        ),
+    }
 }
 
 /// What the rotation wake arm of the engine's `select!` observed: the two
@@ -1605,8 +1819,14 @@ fn admit_command(command: Command, queue: &mut VecDeque<Command>, next_admission
             queue.push_back(Command::Append(append));
             *next_admission += 1;
         }
-        Command::Shutdown { response } => {
-            queue.push_back(Command::Shutdown { response });
+        Command::Shutdown {
+            response,
+            seal_deadline,
+        } => {
+            queue.push_back(Command::Shutdown {
+                response,
+                seal_deadline,
+            });
         }
     }
 }
@@ -1615,7 +1835,7 @@ fn fail_all(queue: &mut VecDeque<Command>, error: Error, metrics: &Metrics) {
     while let Some(command) = queue.pop_front() {
         match command {
             Command::Append(append) => fail_append(append, error.clone(), metrics),
-            Command::Shutdown { response } => {
+            Command::Shutdown { response, .. } => {
                 let _ = response.send(());
             }
         }

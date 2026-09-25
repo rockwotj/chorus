@@ -2206,6 +2206,24 @@ mod writer {
             admitted != 0 && admitted == self.segment_writer.committed_len()
         }
 
+        /// Whether graceful shutdown can seal the active segment: it holds
+        /// committed records, nothing admitted is unresolved, the registered
+        /// pending segment can become the tail, and the directory has room
+        /// for the entry.
+        ///
+        /// One entry is enough, unlike the two [`Self::rotation_due`]
+        /// reserves. No record is admitted after the shutdown swap, so a
+        /// crash in the swap window leaves the consumed pending segment
+        /// empty and recovery seals only the old tail. Recovery of an
+        /// unsealed tail adds the same entry, so the seal leaves the next
+        /// writer's directory no fuller.
+        pub(crate) fn shutdown_seal_ready(&self) -> bool {
+            !self.segment_writer.is_poisoned()
+                && self.swap_boundary_ready()
+                && self.spare_ready()
+                && self.active_segment_has_seal_room()
+        }
+
         /// Whether the engine should start provisioning a spare. One spare is
         /// kept warm at all times: it is an empty object plus one idle session
         /// per zone, and a session the service expires self-heals through

@@ -276,13 +276,14 @@ pub(crate) async fn run(
         .context("timed out waiting for readonly follower")??
         .context("readonly follower task failed")?;
     let total_elapsed = benchmark_started.elapsed();
+    // Check before shutdown, which seals the active segment.
+    let seal_count = metrics.seal_count();
     writer.shutdown().await?;
 
-    if metrics.seal_count() != 0 {
+    if seal_count != 0 {
         bail!(
             "readonly active-tail benchmark unexpectedly rotated away from its active \
-             segment, sealing {} segments",
-            metrics.seal_count()
+             segment, sealing {seal_count} segments"
         );
     }
 
