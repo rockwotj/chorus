@@ -21,7 +21,7 @@ machine ManifestRegister {
             rec = (epoch=0, owner=0, tailBase=0, tailGen=0,
                 pending=-1, sealBase=-1,
                 sealId=-1, sealEnd=0, sealSum=0, trunc=0,
-                directory=default(seq[tDirectoryEntry]));
+                archive=default(tArchiveRecord), directory=default(seq[tDirectoryEntry]));
             faultBudget = config.failures;
         }
 
@@ -76,6 +76,48 @@ machine ManifestRegister {
         }
 
         on eDirectoryRemove do HandleDirectoryRemove;
+        on eArchiveEnable do (request: (caller: machine)) {
+            if (!rec.archive.enabled) {
+                rec.archive = (enabled=true, startOffset=rec.trunc, root=0,
+                    end=rec.trunc, cleaned=rec.trunc);
+                metagen = metagen + 1;
+            }
+            send request.caller, eManifestCasResponse,
+                (status=STATUS_OK, metagen=metagen, rec=rec);
+        }
+        on eArchivePublish do (request: (caller: machine, expMetagen: int,
+            previous: int, root: int, segmentEntry: tDirectoryEntry, end: int)) {
+            if (Flaky()) {
+                send request.caller, eManifestCasResponse,
+                    (status=STATUS_TRANSIENT, metagen=0, rec=rec);
+                return;
+            }
+            if (request.expMetagen != metagen || !rec.archive.enabled ||
+                request.previous != rec.archive.root || sizeof(rec.directory) < 2) {
+                send request.caller, eManifestCasResponse,
+                    (status=STATUS_FENCED, metagen=metagen, rec=rec);
+                return;
+            }
+            if (rec.directory[0] != request.segmentEntry ||
+                rec.directory[1].base != request.end ||
+                request.segmentEntry.id == rec.sealId ||
+                request.segmentEntry.base != rec.archive.end) {
+                send request.caller, eManifestCasResponse,
+                    (status=STATUS_FENCED, metagen=metagen, rec=rec);
+                return;
+            }
+            rec.archive.root = request.root;
+            rec.archive.end = request.end;
+            rec.directory -= (0);
+            metagen = metagen + 1;
+            if (Flaky()) {
+                send request.caller, eManifestCasResponse,
+                    (status=STATUS_TRANSIENT, metagen=0, rec=rec);
+            } else {
+                send request.caller, eManifestCasResponse,
+                    (status=STATUS_OK, metagen=metagen, rec=rec);
+            }
+        }
     }
 
     // Regular register CASes either preserve the directory exactly or append
@@ -83,6 +125,7 @@ machine ManifestRegister {
     // removal transition below.
     fun ValidCasDirectory(next: tManifestRecord): bool {
         var index: int;
+        if (next.archive != rec.archive) { return false; }
         if (sizeof(next.directory) > 4) { return false; }
         if (next.sealId == rec.sealId) {
             return next.directory == rec.directory &&
@@ -165,6 +208,7 @@ machine ManifestRegister {
             return;
         }
         if (request.floor > rec.trunc ||
+            (rec.archive.enabled && request.floor > rec.archive.startOffset) ||
             !(0 in request.absentZones) ||
             !(1 in request.absentZones) ||
             !(2 in request.absentZones)) {

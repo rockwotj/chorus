@@ -1,7 +1,7 @@
 <Project>
-  <ProjectName>QuorumProof</ProjectName>
+  <ProjectName>ArchiveProof</ProjectName>
   <InputFiles>
-    <PFile>./proof/QuorumProof.p</PFile>
+    <PFile>./proof/ArchiveProof.p</PFile>
   </InputFiles>
   <OutputDir>./PVerifierGenerated/</OutputDir>
   <Target>PVerifier</Target>

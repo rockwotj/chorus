@@ -109,7 +109,8 @@ pub(crate) struct GcsManifestStore {
 }
 
 /// GCS caps all custom object metadata at roughly 8 KiB. The fixed manifest
-/// fields stay below 500 bytes, leaving this conservative budget for the
+/// fields and bounded archive reference reserve the remaining space, leaving
+/// this conservative budget for the
 /// encoded sealed-segment directory.
 pub(crate) const GCS_MAX_DIRECTORY_BYTES: usize = 6144;
 

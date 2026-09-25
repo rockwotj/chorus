@@ -15,6 +15,8 @@ use chorus_fake_gcs::{FakeGcs, LatencyProfile, Operation, SimulatedLatency};
 use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use tonic::Code;
 
+mod archive;
+
 async fn factory_cluster() -> (
     Vec<chorus_fake_gcs::RunningFake>,
     Vec<Arc<dyn ReplicaFactory>>,

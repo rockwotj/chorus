@@ -27,6 +27,10 @@ use crate::transport::{
     TransportCode, TransportError,
 };
 
+#[path = "grpc_archive.rs"]
+mod archive_transport;
+pub use archive_transport::{GcsArchiveStore, GcsBodyManifestStore};
+
 /// Cached zonal routing token, learned from a bidirectional read or write
 /// redirect and replayed in `x-goog-request-params` to land on the bucket's
 /// location. Shared across every replica produced by one factory.

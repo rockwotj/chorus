@@ -245,7 +245,7 @@ machine HistoricalMaintenanceRepairDriver {
                 sealEnd=2,
                 sealSum=88,
                 trunc=readResponse.rec.trunc,
-                directory=nextDirectory);
+                archive=readResponse.rec.archive, directory=nextDirectory);
             send manifest, eManifestCas, (
                 caller=this, expMetagen=readResponse.metagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {
@@ -888,7 +888,7 @@ machine StaleReplicaRecoveryDriver {
             next = (epoch=1, owner=1, tailBase=0, tailGen=0,
                 pending=-1, sealBase=-1,
                 sealId=-1, sealEnd=0, sealSum=0, trunc=0,
-                directory=default(seq[tDirectoryEntry]));
+                archive=default(tArchiveRecord), directory=default(seq[tDirectoryEntry]));
             send manifest, eManifestCas, (
                 caller=this, expMetagen=readResponse.metagen, rec=next);
             receive { case eManifestCasResponse: (r: tManifestCasResponse) {

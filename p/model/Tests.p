@@ -1,3 +1,9 @@
+test tcArchiveLifecycle [main=ArchiveLifecycle]:
+    (union { ArchiveLifecycle }, { ManifestRegister });
+
+test tcArchiveRecoverySnapshot [main=ArchiveRecoverySnapshot]:
+    (union { ArchiveRecoverySnapshot }, { ManifestRegister });
+
 test tcConcurrentCreators [main=ConcurrentWritersDriver]:
     assert QuorumLinearizability, SingleWriterPerSegment, ManifestSafety,
         PendingRegistrationSafety, DirectoryStructure,
