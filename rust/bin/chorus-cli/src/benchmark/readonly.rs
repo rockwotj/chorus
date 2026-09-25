@@ -235,9 +235,6 @@ pub(crate) async fn run(
             max_active_segment_bytes: active_segment_bytes,
             repair_interval: None,
             shutdown_timeout: WalEngineConfig::default().shutdown_timeout,
-            // The run checks after shutdown that no segment was sealed, so
-            // the active tail must stay unsealed through shutdown too.
-            shutdown_seal_timeout: None,
         })
         .await?;
 
@@ -279,13 +276,14 @@ pub(crate) async fn run(
         .context("timed out waiting for readonly follower")??
         .context("readonly follower task failed")?;
     let total_elapsed = benchmark_started.elapsed();
+    // Check before shutdown, which seals the active segment.
+    let seal_count = metrics.seal_count();
     writer.shutdown().await?;
 
-    if metrics.seal_count() != 0 {
+    if seal_count != 0 {
         bail!(
             "readonly active-tail benchmark unexpectedly rotated away from its active \
-             segment, sealing {} segments",
-            metrics.seal_count()
+             segment, sealing {seal_count} segments"
         );
     }
 

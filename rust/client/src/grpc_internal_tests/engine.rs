@@ -1681,7 +1681,6 @@ async fn graceful_shutdown_seals_the_tail_so_recovery_reads_no_segment_bytes() {
         recovery
             .start(WalEngineConfig {
                 repair_interval: None,
-                shutdown_seal_timeout: None,
                 ..Default::default()
             })
             .await
@@ -1725,28 +1724,6 @@ async fn graceful_shutdown_seals_the_tail_so_recovery_reads_no_segment_bytes() {
             bytes::Bytes::from_static(b"after"),
         ]
     );
-}
-
-#[tokio::test]
-async fn shutdown_without_the_seal_leaves_the_tail_for_recovery_to_read() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let volume = volume(factories, manifest_factory, "shutdown-no-seal-wal");
-    let handle = WalEngine::start(
-        volume.recover_writer().await.unwrap(),
-        WalEngineConfig {
-            repair_interval: None,
-            shutdown_seal_timeout: None,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    append_and_shutdown(handle, 3).await;
-
-    reset_zone_counts(&servers).await;
-    let recovery = volume.recover(WalSeqNo::record(3)).await.unwrap();
-    assert_eq!(recovery.end, WalSeqNo::record(3));
-    assert!(zone_count(&servers, Operation::Read).await > 0);
-    assert!(zone_count(&servers, Operation::BidiFinalize).await > 0);
 }
 
 #[tokio::test]
@@ -1828,87 +1805,4 @@ async fn shutdown_seal_of_a_fenced_writer_leaves_the_new_owner_manifest_alone() 
     let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
     assert_eq!(end, WalSeqNo::record(4));
     assert_eq!(records[3].payload, bytes::Bytes::from_static(b"owner"));
-}
-
-#[tokio::test]
-async fn shutdown_seal_that_exceeds_its_budget_still_shuts_down_cleanly() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let prefix = "shutdown-seal-budget-wal";
-    let volume = volume(factories, manifest_factory.clone(), prefix);
-    let mut handle = WalEngine::start(
-        volume.recover_writer().await.unwrap(),
-        WalEngineConfig {
-            repair_interval: None,
-            shutdown_seal_timeout: Some(Duration::from_millis(100)),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for seqno in 0..3 {
-        handle
-            .enqueue_append(
-                WalSeqNo::record(seqno),
-                bytes::Bytes::from(format!("transaction-{seqno}")),
-            )
-            .await
-            .unwrap()
-            .await
-            .unwrap();
-    }
-    let before = manifest_frontier_ids(&manifest_factory, prefix).await;
-    // Hold every create so refill provisioning cannot finish.
-    for server in &servers[..3] {
-        server.service.inject_open_hold().await;
-    }
-    tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
-        .await
-        .expect("a stuck shutdown seal must not hold shutdown past its budget")
-        .unwrap();
-    for server in &servers[..3] {
-        server.service.release_open_holds().await;
-    }
-    assert_eq!(
-        manifest_frontier_ids(&manifest_factory, prefix).await,
-        before
-    );
-
-    let (end, records) = recover_records(&volume, WalSeqNo::ZERO).await;
-    assert_eq!(end, WalSeqNo::record(3));
-    assert_eq!(records.len(), 3);
-}
-
-#[tokio::test]
-async fn shutdown_seal_budget_counts_the_drain() {
-    let (servers, factories, manifest_factory) = factory_cluster().await;
-    let prefix = "shutdown-seal-drain-wal";
-    let volume = volume(factories, manifest_factory.clone(), prefix);
-    let mut handle = WalEngine::start(
-        volume.recover_writer().await.unwrap(),
-        WalEngineConfig {
-            repair_interval: None,
-            shutdown_seal_timeout: Some(Duration::from_millis(100)),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let before = manifest_frontier_ids(&manifest_factory, prefix).await;
-    reset_zone_counts(&servers).await;
-    // The drain waits for this append past the whole seal budget.
-    for server in &servers[..3] {
-        server
-            .service
-            .inject_delay(Operation::BidiAppendFlush, Duration::from_millis(300))
-            .await;
-    }
-    let completion = handle
-        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"slow"))
-        .await
-        .unwrap();
-    shutdown_engine(handle).await;
-    completion.await.unwrap();
-    assert_eq!(
-        manifest_frontier_ids(&manifest_factory, prefix).await,
-        before
-    );
-    assert_eq!(zone_count(&servers, Operation::BidiCreate).await, 0);
 }

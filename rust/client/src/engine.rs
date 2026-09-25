@@ -22,7 +22,6 @@ use crate::transport::Replica;
 const DEFAULT_PIPELINE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_QUEUE_CAPACITY_BYTES: usize = DEFAULT_PIPELINE_WINDOW_BYTES * 16;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_SHUTDOWN_SEAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 /// Capacity controls for the in-process transactional WAL pipeline.
@@ -97,30 +96,12 @@ pub struct WalEngineConfig {
     /// Maximum time graceful shutdown may spend draining accepted work and
     /// joining owned background tasks before aborting them.
     ///
+    /// Shutdown seals a non-empty active segment after the drain, within the
+    /// first half of this timeout; see [`WalHandle::shutdown`].
+    ///
     /// The default is five minutes, long enough for the default storage retry
     /// budget while still turning a wedged backend or task into a bounded error.
     pub shutdown_timeout: Duration,
-    /// Time after [`WalHandle::shutdown`] is called within which graceful
-    /// shutdown may seal a non-empty active segment.
-    ///
-    /// The seal commits the same manifest fold as a rotation: the active
-    /// segment joins the sealed directory and the empty pending segment
-    /// becomes the tail. The next recovery then finds an empty tail and does
-    /// not download and re-seal the old one. An empty active segment is never
-    /// sealed. The seal is also skipped while an earlier rotation is still
-    /// folding or sealing, or when the directory has no room for the entry.
-    ///
-    /// The budget is measured from the shutdown call, so time spent draining
-    /// accepted work counts against it, and it is capped at half of
-    /// [`shutdown_timeout`](Self::shutdown_timeout). The engine starts each
-    /// step only while budget remains and stops waiting for finalization when
-    /// it runs out. A manifest update already sent completes within its
-    /// retry policy, and a seal already handed to maintenance completes in
-    /// maintenance's shutdown drain, both within `shutdown_timeout`. A seal
-    /// that is fenced, fails, or runs out of budget leaves the state a crash
-    /// would leave, which recovery already handles. `None` disables the seal.
-    /// The default is ten seconds.
-    pub shutdown_seal_timeout: Option<Duration>,
 }
 
 impl Default for WalEngineConfig {
@@ -136,7 +117,6 @@ impl Default for WalEngineConfig {
                 .unwrap_or(usize::MAX),
             repair_interval: Some(Duration::from_secs(300)),
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-            shutdown_seal_timeout: Some(DEFAULT_SHUTDOWN_SEAL_TIMEOUT),
         }
     }
 }
@@ -196,19 +176,7 @@ impl WalEngineConfig {
         if self.shutdown_timeout == Duration::ZERO {
             return Err(Error::InvalidConfig("shutdown_timeout must be nonzero"));
         }
-        if self.shutdown_seal_timeout == Some(Duration::ZERO) {
-            return Err(Error::InvalidConfig(
-                "shutdown_seal_timeout must be nonzero",
-            ));
-        }
         Ok(())
-    }
-
-    /// Time after the shutdown call within which the engine may seal the
-    /// active segment.
-    fn shutdown_seal_budget(&self) -> Option<Duration> {
-        self.shutdown_seal_timeout
-            .map(|timeout| timeout.min(self.shutdown_timeout / 2))
     }
 }
 
@@ -294,7 +262,6 @@ pub struct WalHandle {
     queue_slots: Arc<Semaphore>,
     queued_bytes: Arc<AtomicUsize>,
     shutdown_timeout: Duration,
-    shutdown_seal_budget: Option<Duration>,
 }
 
 struct AdmittedAppend {
@@ -354,8 +321,8 @@ enum Command {
     Append(AdmittedAppend),
     Shutdown {
         response: oneshot::Sender<()>,
-        /// When the shutdown seal budget runs out, if the seal is enabled.
-        seal_deadline: Option<tokio::time::Instant>,
+        /// After this instant the engine starts no new shutdown seal step.
+        seal_deadline: tokio::time::Instant,
     },
 }
 
@@ -488,7 +455,6 @@ impl WalEngine {
         let queue_capacity_bytes = config.queue_capacity_bytes;
         let max_active_segment_bytes = config.max_active_segment_bytes;
         let shutdown_timeout = config.shutdown_timeout;
-        let shutdown_seal_budget = config.shutdown_seal_budget();
         let inflight_bytes = Arc::new(Semaphore::new(max_inflight_bytes));
         let queue_slots = Arc::new(Semaphore::new(config.queue_capacity_bytes));
         // Bytes accepted but not yet dispatched. Tracked separately from the
@@ -566,7 +532,6 @@ impl WalEngine {
             queue_slots,
             queued_bytes,
             shutdown_timeout,
-            shutdown_seal_budget,
         })
     }
 }
@@ -788,10 +753,16 @@ impl WalHandle {
     /// Consume the admission handle, drain accepted work, finish every
     /// committed seal, and wait for all owned tasks to exit.
     ///
-    /// After the drain, a non-empty active segment is sealed within
-    /// [`WalEngineConfig::shutdown_seal_timeout`] so the next recovery starts
-    /// from an empty tail. A seal that cannot complete does not fail
-    /// shutdown; recovery then seals the segment as it would after a crash.
+    /// After the drain, a non-empty active segment is sealed with the same
+    /// manifest fold as a rotation, so the next recovery starts from an empty
+    /// tail and reads no segment bytes. An empty active segment is not
+    /// sealed, and neither is one while an earlier rotation is unfinished or
+    /// the directory is full. The seal starts each step only within the first
+    /// half of [`WalEngineConfig::shutdown_timeout`], counted from this call,
+    /// and stops waiting for finalization after it. A seal already handed to
+    /// maintenance finishes in maintenance's drain. A seal that is fenced or
+    /// cannot complete does not fail shutdown; recovery then seals the
+    /// segment as it would after a crash.
     pub async fn shutdown(self) -> Result<(), Error> {
         let WalHandle {
             sender,
@@ -801,10 +772,12 @@ impl WalHandle {
             maintenance,
             maintenance_task,
             shutdown_timeout,
-            shutdown_seal_budget,
             ..
         } = self;
-        let seal_deadline = shutdown_seal_budget.map(|budget| tokio::time::Instant::now() + budget);
+        // The seal gets the first half of the shutdown budget, which leaves
+        // the rest for a manifest update already sent, maintenance's drain,
+        // and joining the owned tasks.
+        let seal_deadline = tokio::time::Instant::now() + shutdown_timeout / 2;
         let mut engine_task = engine_task;
         let mut provisioner_task = provisioner_task;
         let mut maintenance_task = maintenance_task;
@@ -1124,7 +1097,7 @@ async fn run_engine(
                 }) => {
                     fail_all(&mut state.queue, Error::Closed, &metrics);
                     state.shutdown_response = Some(response);
-                    state.seal_deadline = seal_deadline;
+                    state.seal_deadline = Some(seal_deadline);
                     break;
                 }
                 Some(Command::Append(_)) => unreachable!(),

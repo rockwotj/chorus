@@ -323,8 +323,8 @@ data remains in the zonal buckets.
   application metrics backend; `SegmentedVolume::new` disables metrics.
 - `WalHandle::shutdown` seals a non-empty active segment after draining, so
   the next recovery starts from an empty tail without reading segment bytes.
-  `WalEngineConfig::shutdown_seal_timeout` bounds this step; a seal that is
-  fenced or cannot finish leaves the segment for recovery to seal.
+  The seal may use up to half of `WalEngineConfig::shutdown_timeout`; a seal
+  that is fenced or cannot finish leaves the segment for recovery to seal.
 - A running `WalHandle` is the exclusive writer. Starting another writer
   requires recovery, which fences the previous writer incarnation.
 
