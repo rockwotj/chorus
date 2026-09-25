@@ -102,6 +102,7 @@ fn production_engine_config() -> WalEngineConfig {
         max_active_segment_bytes: WalEngineConfig::default().max_active_segment_bytes,
         repair_interval: None,
         shutdown_timeout: Duration::from_secs(60),
+        shutdown_seal_timeout: WalEngineConfig::default().shutdown_seal_timeout,
     }
 }
 
@@ -650,6 +651,7 @@ async fn run_lane_stall_recheck_scenario(seed: u64, zone: FakeGcs, close_code: C
             max_active_segment_bytes: WalEngineConfig::default().max_active_segment_bytes,
             repair_interval: None,
             shutdown_timeout: Duration::from_secs(60),
+            shutdown_seal_timeout: WalEngineConfig::default().shutdown_seal_timeout,
         })
         .await?;
 

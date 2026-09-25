@@ -225,6 +225,7 @@ pub(crate) async fn run(storage: ConnectedStorage, prefix: String, args: AppendA
             max_active_segment_bytes: WalEngineConfig::default().max_active_segment_bytes,
             repair_interval: Some(Duration::from_secs(300)),
             shutdown_timeout: WalEngineConfig::default().shutdown_timeout,
+            shutdown_seal_timeout: WalEngineConfig::default().shutdown_seal_timeout,
         })
         .await?;
 

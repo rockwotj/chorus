@@ -235,6 +235,9 @@ pub(crate) async fn run(
             max_active_segment_bytes: active_segment_bytes,
             repair_interval: None,
             shutdown_timeout: WalEngineConfig::default().shutdown_timeout,
+            // The run checks after shutdown that no segment was sealed, so
+            // the active tail must stay unsealed through shutdown too.
+            shutdown_seal_timeout: None,
         })
         .await?;
 
