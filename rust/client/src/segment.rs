@@ -364,7 +364,7 @@ impl RecoveredPredecessor {
         let Some(seal) = self.deferred_seal.take() else {
             return Ok(());
         };
-        seal.volume.enforce_seal(seal.tail.canonical()).await?;
+        seal.volume.enforce_seal(&seal.tail).await?;
         #[cfg(any(test, feature = "dst-support"))]
         _metrics.segments_sealed.increment();
         Ok(())
@@ -3035,7 +3035,7 @@ mod maintenance {
                 "segment {base_record_index} recovered CRC32C {actual:08x}, expected {expected_crc32c:08x}"
             )));
         }
-        volume.enforce_seal(recovered.canonical()).await?;
+        volume.enforce_seal(&recovered).await?;
         let quorum = majority(factories.len());
         Ok(SegmentDescriptor {
             id: id.to_string(),
