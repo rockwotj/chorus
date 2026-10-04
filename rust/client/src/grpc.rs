@@ -193,7 +193,7 @@ pub fn pack_append(chunks: Vec<Bytes>) -> PackedAppend {
     if !packed.is_empty() {
         push(&mut messages, &mut relative_offset, packed.freeze());
     }
-    PackedAppend::new(chunks, messages, total_len)
+    PackedAppend::new(messages, total_len)
 }
 
 /// One-shot write requests carrying `data` from `write_offset`: `first` names
@@ -2261,8 +2261,6 @@ mod tests {
                 "piece {piece} was copied"
             );
         }
-        // The chunk list keeps record boundaries for commit accounting.
-        assert_eq!(packed.chunks(), chunks.as_slice());
         assert_eq!(packed.len(), 100 + large.len() + 50);
     }
 

@@ -134,22 +134,16 @@ impl PackedAppendMessage {
 /// [`Replica::lane_send`] signature exposed to the simulation harness.
 #[derive(Clone, Debug)]
 pub struct PackedAppend {
-    chunks: Box<[Bytes]>,
     messages: Box<[PackedAppendMessage]>,
     len: usize,
 }
 
 impl PackedAppend {
-    pub(crate) fn new(chunks: Vec<Bytes>, messages: Vec<PackedAppendMessage>, len: usize) -> Self {
+    pub(crate) fn new(messages: Vec<PackedAppendMessage>, len: usize) -> Self {
         Self {
-            chunks: chunks.into_boxed_slice(),
             messages: messages.into_boxed_slice(),
             len,
         }
-    }
-
-    pub(crate) fn chunks(&self) -> &[Bytes] {
-        &self.chunks
     }
 
     /// Wire messages in send order. The simulation transport sends these so
@@ -162,8 +156,9 @@ impl PackedAppend {
         self.len
     }
 
+    /// Whether the group has no bytes to send, and so no wire messages.
     pub(crate) fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.messages.is_empty()
     }
 }
 

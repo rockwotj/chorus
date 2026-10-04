@@ -2746,7 +2746,7 @@ impl LaneRuntime {
                     tracing::debug!(
                         zone = self.zone(),
                         durable_offset = self.durable,
-                        chunks = packed.chunks().len(),
+                        messages = packed.messages().len(),
                         bytes = resend_bytes,
                         attempt,
                         "resending append lane batch after recovery"
@@ -3608,11 +3608,12 @@ mod tests {
 
         assert!(Arc::ptr_eq(&packed_one, &packed_two));
         assert_eq!(
-            packed_one.chunks(),
-            &[
-                Bytes::from_static(b"oversized"),
-                Bytes::from_static(b"second")
-            ]
+            packed_one
+                .messages()
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>(),
+            vec![Bytes::from_static(b"oversizedsecond")]
         );
         assert!(first_budget.try_reserve(1, false).is_none());
         assert!(first_budget.try_reserve(first_bytes, true).is_none());
