@@ -30,10 +30,11 @@ use chorus_fake_gcs::proto::{
 use chorus_fake_gcs::{FakeGcs, SimSessionOpen};
 use tonic::{Code, Request, Status};
 
-use chorus_client::dst_support::pack_append;
+use chorus_client::dst_support::{gcs_manifest_store_error, gcs_max_directory_bytes, pack_append};
 use chorus_client::{
-    AppendToken, LaneDurableChange, ListedObject, PackedAppend, Replica, ReplicaFactory,
-    ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
+    AppendToken, LaneDurableChange, ListedObject, ManifestStore, ManifestStoreError,
+    ManifestVersion, PackedAppend, Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot,
+    TransportCode, TransportError, VersionedManifest,
 };
 
 fn map_code(status: &Status) -> TransportCode {
@@ -212,6 +213,143 @@ impl ReplicaFactory for InMemoryReplicaFactory {
                 metadata: object.metadata,
             })
             .collect())
+    }
+}
+
+/// Manifest register over one fake regional bucket: object metadata guarded
+/// by a metageneration precondition, mirroring the production GCS register so
+/// the simulation drives the same RPCs, faults and error classification.
+pub struct SimManifestStore {
+    fake: FakeGcs,
+    bucket: String,
+    object: String,
+    zone: usize,
+}
+
+impl SimManifestStore {
+    /// Bind the register to `object` in one fake regional bucket. `bucket` is
+    /// the full v2 resource name, matching [`InMemoryReplicaFactory::new`].
+    pub fn new(
+        fake: FakeGcs,
+        bucket: impl Into<String>,
+        object: impl Into<String>,
+        zone: usize,
+    ) -> Self {
+        Self {
+            fake,
+            bucket: bucket.into(),
+            object: object.into(),
+            zone,
+        }
+    }
+
+    fn versioned(snapshot: ReplicaSnapshot) -> VersionedManifest {
+        VersionedManifest {
+            version: ManifestVersion(snapshot.metageneration as u64),
+            fields: snapshot.metadata,
+        }
+    }
+}
+
+#[async_trait]
+impl ManifestStore for SimManifestStore {
+    fn max_directory_bytes(&self) -> usize {
+        gcs_max_directory_bytes()
+    }
+
+    async fn read(&self) -> Result<Option<VersionedManifest>, ManifestStoreError> {
+        let request = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: self.object.clone(),
+            ..Default::default()
+        };
+        match Storage::get_object(&self.fake, Request::new(request)).await {
+            Ok(object) => Ok(Some(Self::versioned(stat_from_object(
+                self.zone,
+                object.into_inner(),
+            )))),
+            Err(status) => {
+                let error = status_err(self.zone, &status);
+                if error.code == TransportCode::NotFound {
+                    Ok(None)
+                } else {
+                    Err(gcs_manifest_store_error(error))
+                }
+            }
+        }
+    }
+
+    async fn create(
+        &self,
+        fields: HashMap<String, String>,
+    ) -> Result<VersionedManifest, ManifestStoreError> {
+        let object = Object {
+            bucket: self.bucket.clone(),
+            name: self.object.clone(),
+            metadata: fields,
+            content_type: "application/vnd.chorus.manifest".into(),
+            ..Default::default()
+        };
+        let request = WriteObjectRequest {
+            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
+                WriteObjectSpec {
+                    resource: Some(object),
+                    if_generation_match: Some(0),
+                    ..Default::default()
+                },
+            )),
+            write_offset: 0,
+            finish_write: true,
+            ..Default::default()
+        };
+        let response = self
+            .fake
+            .sim_write_object(request)
+            .await
+            .map_err(|status| {
+                let error = status_err(self.zone, &status);
+                // The only precondition is `if_generation_match=0`.
+                let error = if error.code == TransportCode::FailedPrecondition {
+                    TransportError {
+                        code: TransportCode::AlreadyExists,
+                        ..error
+                    }
+                } else {
+                    error
+                };
+                gcs_manifest_store_error(error)
+            })?;
+        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
+        else {
+            return Err(gcs_manifest_store_error(err(
+                self.zone,
+                TransportCode::Internal,
+                "manifest create response omitted the object resource",
+            )));
+        };
+        Ok(Self::versioned(stat_from_object(self.zone, object)))
+    }
+
+    async fn update(
+        &self,
+        version: ManifestVersion,
+        fields: HashMap<String, String>,
+    ) -> Result<VersionedManifest, ManifestStoreError> {
+        let request = UpdateObjectRequest {
+            object: Some(Object {
+                bucket: self.bucket.clone(),
+                name: self.object.clone(),
+                metadata: fields,
+                ..Default::default()
+            }),
+            if_metageneration_match: Some(version.0 as i64),
+            ..Default::default()
+        };
+        let object = Storage::update_object(&self.fake, Request::new(request))
+            .await
+            .map_err(|status| gcs_manifest_store_error(status_err(self.zone, &status)))?
+            .into_inner();
+        Ok(Self::versioned(stat_from_object(self.zone, object)))
     }
 }
 
@@ -555,43 +693,6 @@ impl Replica for InMemoryReplica {
         })
     }
 
-    async fn create_appendable(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata,
-            content_type: "application/vnd.chorus.records".into(),
-            ..Default::default()
-        };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    appendable: Some(true),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
-        if let Err(error) = self.open(request).await {
-            if error.code == TransportCode::FailedPrecondition {
-                return Err(TransportError {
-                    code: TransportCode::AlreadyExists,
-                    ..error
-                });
-            }
-            return Err(error);
-        }
-        self.stat().await
-    }
-
     async fn create_append_session(
         &self,
         metadata: HashMap<String, String>,
@@ -636,77 +737,6 @@ impl Replica for InMemoryReplica {
             persisted_size,
             write_handle,
         })
-    }
-
-    async fn create_register(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata,
-            content_type: "application/vnd.chorus.manifest".into(),
-            ..Default::default()
-        };
-        let request = WriteObjectRequest {
-            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            finish_write: true,
-            ..Default::default()
-        };
-        let response = self
-            .fake
-            .sim_write_object(request)
-            .await
-            .map_err(|status| {
-                let error = status_err(self.zone, &status);
-                if error.code == TransportCode::FailedPrecondition {
-                    TransportError {
-                        code: TransportCode::AlreadyExists,
-                        ..error
-                    }
-                } else {
-                    error
-                }
-            })?;
-        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
-        else {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "manifest create response omitted the object resource",
-            ));
-        };
-        Ok(stat_from_object(self.zone, object))
-    }
-
-    async fn update_register(
-        &self,
-        metageneration: i64,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let request = UpdateObjectRequest {
-            object: Some(Object {
-                bucket: self.bucket.clone(),
-                name: self.object.clone(),
-                metadata,
-                ..Default::default()
-            }),
-            if_metageneration_match: Some(metageneration),
-            ..Default::default()
-        };
-        let object = Storage::update_object(&self.fake, Request::new(request))
-            .await
-            .map_err(|status| status_err(self.zone, &status))?
-            .into_inner();
-        Ok(stat_from_object(self.zone, object))
     }
 
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
@@ -754,7 +784,7 @@ impl Replica for InMemoryReplica {
 
     async fn replace_appendable(
         &self,
-        observed: &ReplicaSnapshot,
+        observed: Option<&ReplicaSnapshot>,
         data: Bytes,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError> {
@@ -765,12 +795,14 @@ impl Replica for InMemoryReplica {
             content_type: "application/vnd.chorus.records".into(),
             ..Default::default()
         };
+        // Generation 0 means "only if absent"; a create carries no
+        // metageneration precondition.
         let request = BidiWriteObjectRequest {
             first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
                 WriteObjectSpec {
                     resource: Some(object),
-                    if_generation_match: Some(observed.generation),
-                    if_metageneration_match: Some(observed.metageneration),
+                    if_generation_match: Some(observed.map_or(0, |observed| observed.generation)),
+                    if_metageneration_match: observed.map(|observed| observed.metageneration),
                     appendable: Some(true),
                     ..Default::default()
                 },
@@ -780,7 +812,18 @@ impl Replica for InMemoryReplica {
             state_lookup: true,
             ..Default::default()
         };
-        let open = self.open_split(request, data).await?;
+        // Both report a lost race: the observed generation changed, or a
+        // create found the object already present.
+        let open = self
+            .open_split(request, data)
+            .await
+            .map_err(|error| match error.code {
+                TransportCode::AlreadyExists => TransportError {
+                    code: TransportCode::FailedPrecondition,
+                    ..error
+                },
+                _ => error,
+            })?;
         let (persisted_size, write_handle) = self.token_from_open(&open, None);
         self.store_session(&open).await;
         Ok(AppendToken {
@@ -792,55 +835,7 @@ impl Replica for InMemoryReplica {
         })
     }
 
-    async fn append(
-        &self,
-        token: &AppendToken,
-        write_offset: i64,
-        data: Vec<u8>,
-    ) -> Result<i64, TransportError> {
-        let Some(generation) = token.generation else {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "one-shot append requires a generation-bound token",
-            ));
-        };
-        let expected = write_offset + data.len() as i64;
-        // An empty append keeps its empty checksummed payload, which the
-        // service answers with a persisted size.
-        let data = Bytes::from(data);
-        let request = self.open_request_append(
-            generation,
-            token.metageneration,
-            token.write_handle.clone(),
-            write_offset,
-            data.is_empty().then(Vec::new),
-            false,
-        );
-        let open = self.open_split(request, data).await?;
-        let persisted = open
-            .response
-            .write_status
-            .as_ref()
-            .and_then(persisted_size_of)
-            .unwrap_or(0);
-        if persisted >= expected {
-            Ok(persisted)
-        } else {
-            Err(err(
-                self.zone,
-                TransportCode::DataLoss,
-                format!("flush persisted {persisted}, expected at least {expected}"),
-            ))
-        }
-    }
-
-    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), true)
-            .await
-    }
-
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
@@ -849,15 +844,6 @@ impl Replica for InMemoryReplica {
     }
 
     async fn lane_send_unflushed(
-        &self,
-        write_offset: i64,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), false)
-            .await
-    }
-
-    async fn lane_send_packed_unflushed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,

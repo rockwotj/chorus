@@ -18,7 +18,7 @@ use tonic::Code;
 async fn factory_cluster() -> (
     Vec<chorus_fake_gcs::RunningFake>,
     Vec<Arc<dyn ReplicaFactory>>,
-    Arc<dyn ReplicaFactory>,
+    Arc<GrpcReplicaFactory>,
 ) {
     factory_cluster_of(3).await
 }
@@ -28,7 +28,7 @@ async fn factory_cluster_of(
 ) -> (
     Vec<chorus_fake_gcs::RunningFake>,
     Vec<Arc<dyn ReplicaFactory>>,
-    Arc<dyn ReplicaFactory>,
+    Arc<GrpcReplicaFactory>,
 ) {
     let mut servers = Vec::new();
     let mut factories: Vec<Arc<dyn ReplicaFactory>> = Vec::new();
@@ -47,7 +47,7 @@ async fn factory_cluster_of(
     }
     // the regional bucket hosting the manifest control register
     let regional = FakeGcs::default().start().await.unwrap();
-    let manifest_factory: Arc<dyn ReplicaFactory> = Arc::new(
+    let manifest_factory = Arc::new(
         GrpcReplicaFactory::connect(
             zones,
             &regional.endpoint,
@@ -104,7 +104,7 @@ fn regional_latency(seed: u64) -> LatencyProfile {
 async fn latency_factory_cluster() -> (
     Vec<chorus_fake_gcs::RunningFake>,
     Vec<Arc<dyn ReplicaFactory>>,
-    Arc<dyn ReplicaFactory>,
+    Arc<GrpcReplicaFactory>,
 ) {
     let mut servers = Vec::new();
     let mut factories: Vec<Arc<dyn ReplicaFactory>> = Vec::new();
@@ -128,7 +128,7 @@ async fn latency_factory_cluster() -> (
         .start()
         .await
         .unwrap();
-    let manifest_factory: Arc<dyn ReplicaFactory> = Arc::new(
+    let manifest_factory = Arc::new(
         GrpcReplicaFactory::connect(
             3,
             &regional.endpoint,
@@ -164,23 +164,23 @@ fn record(payload: &[u8]) -> RecordFrame {
 
 fn volume(
     factories: Vec<Arc<dyn ReplicaFactory>>,
-    manifest_factory: Arc<dyn ReplicaFactory>,
+    manifest_factory: Arc<GrpcReplicaFactory>,
     prefix: &str,
 ) -> SegmentedVolume {
-    SegmentedVolume::new_with_factories(factories, manifest_factory, prefix, test_config())
+    SegmentedVolume::new_with_factories(factories, &manifest_factory, prefix, test_config())
         .expect("test clusters use a supported replica count")
 }
 
 fn volume_with_metrics(
     factories: Vec<Arc<dyn ReplicaFactory>>,
-    manifest_factory: Arc<dyn ReplicaFactory>,
+    manifest_factory: Arc<GrpcReplicaFactory>,
     prefix: &str,
 ) -> (SegmentedVolume, Arc<TestMetricsRecorder>) {
     let recorder = Arc::new(TestMetricsRecorder::default());
     let metrics_recorder: Arc<dyn crate::MetricsRecorder> = recorder.clone();
     let volume = SegmentedVolume::new_with_factories_and_metrics_recorder(
         factories,
-        manifest_factory,
+        &manifest_factory,
         prefix,
         test_config(),
         metrics_recorder,
@@ -211,7 +211,7 @@ async fn recover_records(
 }
 
 async fn manifest_frontier_ids(
-    manifest_factory: &Arc<dyn ReplicaFactory>,
+    manifest_factory: &GrpcReplicaFactory,
     prefix: &str,
 ) -> (String, String) {
     let manifest = manifest_factory
@@ -235,11 +235,25 @@ async fn manifest_frontier_ids(
 async fn append_raw_bytes(factory: &Arc<dyn ReplicaFactory>, object: &str, bytes: Vec<u8>) {
     let replica = factory.replica(object);
     let observed = replica.stat().await.unwrap();
-    let mut token = replica.takeover(&observed).await.unwrap();
+    let token = replica.takeover(&observed).await.unwrap();
     let offset = token.persisted_size;
     let end = offset + bytes.len() as i64;
-    token.persisted_size = replica.append(&token, offset, bytes).await.unwrap();
-    assert_eq!(token.persisted_size, end);
+    replica
+        .lane_send(offset, &crate::grpc::pack_append(vec![bytes.into()]))
+        .await
+        .unwrap();
+    let mut durable = offset;
+    while durable < end {
+        let change = replica.lane_durable_change(durable).await.unwrap();
+        assert!(
+            change.error.is_none(),
+            "raw append failed: {:?}",
+            change.error
+        );
+        durable = change.persisted_size;
+    }
+    assert_eq!(durable, end);
+    replica.shutdown().await;
 }
 
 async fn append_raw_record(factory: &Arc<dyn ReplicaFactory>, object: &str, payload: &[u8]) {
@@ -261,7 +275,7 @@ async fn append_partial_raw_record(
 /// zone's listing for that copy.
 async fn segment_objects_for_base(
     factory: &Arc<dyn ReplicaFactory>,
-    manifest_factory: &Arc<dyn ReplicaFactory>,
+    manifest_factory: &GrpcReplicaFactory,
     prefix: &str,
     base: u64,
 ) -> Vec<String> {
@@ -300,7 +314,7 @@ async fn segment_objects_for_base(
 
 async fn segment_object_for_base(
     factory: &Arc<dyn ReplicaFactory>,
-    manifest_factory: &Arc<dyn ReplicaFactory>,
+    manifest_factory: &GrpcReplicaFactory,
     prefix: &str,
     base: u64,
 ) -> String {
@@ -313,7 +327,7 @@ async fn segment_object_for_base(
 /// manifest), so tests find it through the manifest's tail id.
 async fn active_segment_objects(
     factory: &Arc<dyn ReplicaFactory>,
-    manifest_factory: &Arc<dyn ReplicaFactory>,
+    manifest_factory: &GrpcReplicaFactory,
     prefix: &str,
 ) -> Vec<String> {
     let manifest = manifest_factory
@@ -337,7 +351,7 @@ async fn active_segment_objects(
 
 async fn active_segment_object(
     factory: &Arc<dyn ReplicaFactory>,
-    manifest_factory: &Arc<dyn ReplicaFactory>,
+    manifest_factory: &GrpcReplicaFactory,
     prefix: &str,
 ) -> String {
     let objects = active_segment_objects(factory, manifest_factory, prefix).await;

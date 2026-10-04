@@ -38,7 +38,8 @@ async fn readonly_open_reports_uninitialized_before_the_first_manifest_claim() {
     let manifest_replica = manifest_factory.replica(&format!("{prefix}/manifest"));
     let mut manifest = crate::manifest::Manifest::open(
         Arc::new(crate::manifest_store::GcsManifestStore::new(
-            manifest_replica.clone(),
+            &manifest_factory,
+            &format!("{prefix}/manifest"),
         )),
         test_config(),
         Arc::new(crate::metrics::Metrics::new(
@@ -107,7 +108,11 @@ async fn readonly_active_tail_survives_one_replaced_generation() {
     let mut replacement = original.bytes.to_vec();
     replacement.extend_from_slice(&record(b"minority-only").encode().unwrap());
     let replaced = replica
-        .replace_appendable(&original, replacement.into(), original.metadata.clone())
+        .replace_appendable(
+            Some(&original),
+            replacement.into(),
+            original.metadata.clone(),
+        )
         .await
         .unwrap();
     assert_ne!(replaced.generation.unwrap(), original.generation);

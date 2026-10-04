@@ -219,16 +219,14 @@ async fn finalized_segment_volume(
         servers.push(server);
         factories.push(factory);
     }
-    // The one-shot append splits the segment under the fake's inbound message
+    // The one-shot create splits the segment under the fake's inbound message
     // cap.
     for factory in &factories {
         let replica = factory.replica(object);
-        let created = replica
-            .create_appendable(protocol_metadata())
+        let mut token = replica
+            .replace_appendable(None, data.clone(), protocol_metadata())
             .await
             .unwrap();
-        let mut token = replica.takeover(&created).await.unwrap();
-        token.persisted_size = replica.append(&token, 0, data.to_vec()).await.unwrap();
         let sealed = replica
             .finalize(&mut token, data.len() as i64)
             .await
@@ -257,7 +255,7 @@ async fn replace_finalized(factory: &GrpcReplicaFactory, object: &str, data: byt
     let observed = replica.stat().await.unwrap();
     let mut token = replica
         .replace_appendable(
-            &observed,
+            Some(&observed),
             data.clone(),
             crate::protocol::protocol_metadata(),
         )
@@ -501,7 +499,7 @@ async fn recovery_does_not_reject_a_noncanonical_witness_crc32c() {
     let short = records[0].encode().unwrap();
     let mut token = replica
         .replace_appendable(
-            &observed,
+            Some(&observed),
             short.clone(),
             crate::protocol::protocol_metadata(),
         )
@@ -1404,18 +1402,17 @@ async fn repair_rewrites_sealed_copies_larger_than_the_inbound_cap() {
 
     // One zone holds an unfinalized prefix that ends inside the record, so
     // repair takes the guarded-replace path. The other lost its copy, so repair
-    // creates it and appends the whole segment in one call.
+    // creates it with the whole segment in one conditional write.
     let prefix = factories[torn_zone].replica(&object);
     let generation = prefix.stat().await.unwrap().generation;
     prefix.delete(generation).await.unwrap();
-    let created = prefix
-        .create_appendable(crate::protocol::protocol_metadata())
-        .await
-        .unwrap();
-    let token = prefix.takeover(&created).await.unwrap();
     let torn = 1 << 20;
     prefix
-        .append(&token, 0, canonical[..torn].to_vec())
+        .replace_appendable(
+            None,
+            canonical.slice(..torn),
+            crate::protocol::protocol_metadata(),
+        )
         .await
         .unwrap();
     let missing = factories[missing_zone].replica(&object);

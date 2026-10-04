@@ -131,25 +131,19 @@ impl PackedAppendMessage {
 
 /// An append group whose immutable wire messages were packed once before
 /// replica dispatch, shared across lanes. Public because it appears in the
-/// [`Replica::lane_send_packed`] signature exposed to the simulation harness.
+/// [`Replica::lane_send`] signature exposed to the simulation harness.
 #[derive(Clone, Debug)]
 pub struct PackedAppend {
-    chunks: Box<[Bytes]>,
     messages: Box<[PackedAppendMessage]>,
     len: usize,
 }
 
 impl PackedAppend {
-    pub(crate) fn new(chunks: Vec<Bytes>, messages: Vec<PackedAppendMessage>, len: usize) -> Self {
+    pub(crate) fn new(messages: Vec<PackedAppendMessage>, len: usize) -> Self {
         Self {
-            chunks: chunks.into_boxed_slice(),
             messages: messages.into_boxed_slice(),
             len,
         }
-    }
-
-    pub(crate) fn chunks(&self) -> &[Bytes] {
-        &self.chunks
     }
 
     /// Wire messages in send order. The simulation transport sends these so
@@ -162,8 +156,9 @@ impl PackedAppend {
         self.len
     }
 
+    /// Whether the group has no bytes to send, and so no wire messages.
     pub(crate) fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.messages.is_empty()
     }
 }
 
@@ -294,18 +289,7 @@ pub trait Replica: Send + Sync {
 
     /// Read the currently visible suffix of an appendable object starting at
     /// `offset` through the provider's bidirectional range-read API.
-    ///
-    /// The default keeps non-production test doubles source-compatible. A
-    /// readonly follower requires an implementation and fails with this error
-    /// rather than polling a replica that can never answer. The default cannot
-    /// know its own zone, so the caller attributes the failure.
-    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError> {
-        Err(TransportError {
-            zone: 0,
-            code: TransportCode::Unimplemented,
-            message: format!("bidirectional range reads are unavailable at offset {offset}"),
-        })
-    }
+    async fn read_range(&self, offset: i64) -> Result<ReplicaRangeRead, TransportError>;
 
     /// Read object metadata only, without the content read. Metadata reads are
     /// content-blind: they succeed even when the stored bytes are rotted, so
@@ -314,38 +298,12 @@ pub trait Replica: Send + Sync {
     /// be used to infer a durable tail.
     async fn stat(&self) -> Result<ReplicaSnapshot, TransportError>;
 
-    /// Conditionally create a new appendable object.
-    async fn create_appendable(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError>;
-
     /// Conditionally create a new appendable object and retain that create
     /// RPC as its live append session.
     async fn create_append_session(
         &self,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError>;
-
-    /// Conditionally create a finalized, non-appendable control object with
-    /// an empty body and the supplied metadata. The manifest register lives
-    /// in a regional bucket, where appendable objects do not exist; it is
-    /// created once with this call and afterwards mutated only through
-    /// [`Replica::update_register`].
-    async fn create_register(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError>;
-
-    /// Conditionally replace the register's custom metadata, guarded by its
-    /// metageneration alone. The register is created exactly once and never
-    /// deleted or recreated, so its generation is constant and the
-    /// metageneration by itself names one register state.
-    async fn update_register(
-        &self,
-        metageneration: i64,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError>;
 
     /// Re-learn the durable tail after a lane disturbance by resuming the
     /// append session (with its handle when available, else a guarded fresh
@@ -360,93 +318,50 @@ pub trait Replica: Send + Sync {
     /// returns the authoritative durable tail from `persisted_size`.
     async fn takeover(&self, observed: &ReplicaSnapshot) -> Result<AppendToken, TransportError>;
 
-    /// Fence the current live generation and return its authoritative durable
-    /// tail in the same RPC.
+    /// Conditionally write a new, unfinalized appendable generation holding
+    /// exactly `data` and `metadata`.
     ///
-    /// The latest-generation lookup confirms identity or unambiguous absence;
-    /// its tail-blind size is never used for recovery. A `NotFound` from the
-    /// subsequent exact-generation takeover is ambiguous and must not be
-    /// reclassified as object absence.
-    async fn takeover_current(&self) -> Result<AppendToken, TransportError> {
-        let observed = self.stat().await?;
-        match self.takeover(&observed).await {
-            Err(error) if error.code == TransportCode::NotFound => Err(TransportError {
-                zone: error.zone,
-                code: TransportCode::Ambiguous,
-                message: format!(
-                    "exact-generation takeover returned NOT_FOUND after current object lookup: {}",
-                    error.message
-                ),
-            }),
-            result => result,
-        }
-    }
-
-    /// Replace the current appendable generation with an exact byte prefix.
-    /// Recovery uses this conditional overwrite after takeover to install the
-    /// canonical prefix; the returned token names the replacement generation.
+    /// With `Some(observed)`, the write replaces the object only while it is
+    /// still that exact generation and metageneration. With `None`, it creates
+    /// the object only while no generation exists. Either way a lost race
+    /// fails with `FailedPrecondition`, and the returned token names the new
+    /// generation, ready for [`Replica::finalize`]. Seal enforcement and
+    /// repair use this to install canonical bytes on a wrong, rotted or
+    /// missing copy.
     async fn replace_appendable(
         &self,
-        observed: &ReplicaSnapshot,
+        observed: Option<&ReplicaSnapshot>,
         data: Bytes,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError>;
 
-    /// Append one checksummed chunk at an authoritative persisted offset.
-    async fn append(
-        &self,
-        token: &AppendToken,
-        write_offset: i64,
-        data: Vec<u8>,
-    ) -> Result<i64, TransportError>;
-
-    /// Queue a non-empty ordered group of checksummed chunks on the live
-    /// append session without waiting for acknowledgments. The final wire
-    /// message always flushes everything queued through the end of the group.
+    /// Queue a non-empty ordered group of checksummed chunks, packed into
+    /// immutable wire messages before replica dispatch, on the live append
+    /// session without waiting for acknowledgments. The final wire message
+    /// always flushes everything queued through the end of the group.
     /// Returns an error (without blocking) when no session is live — the lane
     /// then resumes via [`Replica::resume_tail`] and resends its unacknowledged
     /// suffix as another flushed group.
-    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError>;
-
-    /// Queue a group whose immutable wire messages were packed before replica
-    /// dispatch. Backends that do not consume the shared representation can
-    /// retain the chunk-oriented implementation.
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
-    ) -> Result<(), TransportError> {
-        self.lane_send(write_offset, packed.chunks()).await
-    }
+    ) -> Result<(), TransportError>;
 
-    /// Queue a non-empty ordered group on the live append session without a
+    /// Queue a non-empty group on the live append session without a
     /// flush. A later flushed group or [`Replica::lane_flush`] makes these
-    /// bytes durable. Backends that cannot defer a flush keep the default,
-    /// which flushes the group.
+    /// bytes durable. Backends that cannot defer a flush implement this as
+    /// [`Replica::lane_send`].
     async fn lane_send_unflushed(
         &self,
         write_offset: i64,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        self.lane_send(write_offset, chunks).await
-    }
-
-    /// Unflushed counterpart of [`Replica::lane_send_packed`].
-    async fn lane_send_packed_unflushed(
-        &self,
-        write_offset: i64,
         packed: &PackedAppend,
-    ) -> Result<(), TransportError> {
-        self.lane_send_unflushed(write_offset, packed.chunks())
-            .await
-    }
+    ) -> Result<(), TransportError>;
 
     /// Flush every byte queued on the live append session through
     /// `write_offset` with a message that carries no data. Backends whose
-    /// unflushed sends already flush keep the default no-op.
-    async fn lane_flush(&self, _write_offset: i64) -> Result<(), TransportError> {
-        Ok(())
-    }
+    /// unflushed sends already flush may return `Ok(())`.
+    async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError>;
 
     /// Wait until the session's durable tail exceeds `seen` or the session
     /// fails. A response and stream error may be observed together; in that
@@ -511,9 +426,10 @@ impl TransportCode {
 /// factory calls used by manifest storage, repair, and replay are not wrapped.
 /// An operation such as `snapshot` may perform more than one provider RPC.
 ///
-/// The lane methods (`lane_send`, `lane_send_packed`, `lane_durable_change`,
-/// `append`) delegate untimed: they run per chunk on the append hot path,
-/// where their cost is covered by `chorus.wal.append.commit_latency_seconds`.
+/// The lane methods (`lane_send`, `lane_send_unflushed`, `lane_flush`,
+/// `lane_durable_change`) delegate untimed: they run per chunk on the append
+/// hot path, where their cost is covered by
+/// `chorus.wal.append.commit_latency_seconds`.
 pub(crate) struct TimedReplica {
     inner: Arc<dyn Replica>,
     metrics: Arc<crate::metrics::Metrics>,
@@ -562,17 +478,6 @@ impl Replica for TimedReplica {
         timed_rpc!(self, read_range, self.inner.read_range(offset))
     }
 
-    async fn create_appendable(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        timed_rpc!(
-            self,
-            create_appendable,
-            self.inner.create_appendable(metadata)
-        )
-    }
-
     async fn create_append_session(
         &self,
         metadata: HashMap<String, String>,
@@ -582,21 +487,6 @@ impl Replica for TimedReplica {
             create_append_session,
             self.inner.create_append_session(metadata)
         )
-    }
-
-    async fn create_register(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        self.inner.create_register(metadata).await
-    }
-
-    async fn update_register(
-        &self,
-        metageneration: i64,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        self.inner.update_register(metageneration, metadata).await
     }
 
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
@@ -609,7 +499,7 @@ impl Replica for TimedReplica {
 
     async fn replace_appendable(
         &self,
-        observed: &ReplicaSnapshot,
+        observed: Option<&ReplicaSnapshot>,
         data: Bytes,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError> {
@@ -620,43 +510,20 @@ impl Replica for TimedReplica {
         )
     }
 
-    async fn append(
-        &self,
-        token: &AppendToken,
-        write_offset: i64,
-        data: Vec<u8>,
-    ) -> Result<i64, TransportError> {
-        self.inner.append(token, write_offset, data).await
-    }
-
-    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        self.inner.lane_send(write_offset, chunks).await
-    }
-
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
-        self.inner.lane_send_packed(write_offset, packed).await
+        self.inner.lane_send(write_offset, packed).await
     }
 
     async fn lane_send_unflushed(
         &self,
         write_offset: i64,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        self.inner.lane_send_unflushed(write_offset, chunks).await
-    }
-
-    async fn lane_send_packed_unflushed(
-        &self,
-        write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
-        self.inner
-            .lane_send_packed_unflushed(write_offset, packed)
-            .await
+        self.inner.lane_send_unflushed(write_offset, packed).await
     }
 
     async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
