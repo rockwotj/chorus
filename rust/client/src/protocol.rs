@@ -2543,11 +2543,9 @@ async fn stage_group(
         retained.push_back(batch.into_retained());
     }
     let sent = if flush {
-        replica.lane_send_packed(group_start, &packed).await
+        replica.lane_send(group_start, &packed).await
     } else {
-        replica
-            .lane_send_packed_unflushed(group_start, &packed)
-            .await
+        replica.lane_send_unflushed(group_start, &packed).await
     };
     sent.is_err()
 }
@@ -2755,7 +2753,7 @@ impl LaneRuntime {
                     );
                     let sent = tokio::time::timeout_at(
                         self.stall_deadline(),
-                        self.replica.lane_send_packed(self.durable, &packed),
+                        self.replica.lane_send(self.durable, &packed),
                     )
                     .await;
                     let sent = match sent {
@@ -3242,7 +3240,7 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send_packed(
+        async fn lane_send(
             &self,
             write_offset: i64,
             packed: &PackedAppend,
@@ -3256,7 +3254,7 @@ mod tests {
             Ok(())
         }
 
-        async fn lane_send_packed_unflushed(
+        async fn lane_send_unflushed(
             &self,
             write_offset: i64,
             packed: &PackedAppend,
@@ -3371,7 +3369,7 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send_packed(
+        async fn lane_send(
             &self,
             _write_offset: i64,
             _packed: &PackedAppend,
@@ -3380,12 +3378,12 @@ mod tests {
             Ok(())
         }
 
-        async fn lane_send_packed_unflushed(
+        async fn lane_send_unflushed(
             &self,
             write_offset: i64,
             packed: &PackedAppend,
         ) -> Result<(), TransportError> {
-            self.lane_send_packed(write_offset, packed).await
+            self.lane_send(write_offset, packed).await
         }
 
         async fn lane_durable_change(
@@ -3477,7 +3475,7 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send_packed(
+        async fn lane_send(
             &self,
             _write_offset: i64,
             _packed: &PackedAppend,
@@ -3485,7 +3483,7 @@ mod tests {
             Ok(())
         }
 
-        async fn lane_send_packed_unflushed(
+        async fn lane_send_unflushed(
             &self,
             _write_offset: i64,
             _packed: &PackedAppend,

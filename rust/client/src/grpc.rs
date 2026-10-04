@@ -1263,7 +1263,7 @@ pub async fn probe_generation_zero_takeover(
             ));
         }
         present
-            .lane_send_packed(token.persisted_size, &pack_append(vec![payload.clone()]))
+            .lane_send(token.persisted_size, &pack_append(vec![payload.clone()]))
             .await?;
         let change = present.lane_durable_change(token.persisted_size).await?;
         if let Some(error) = change.error {
@@ -1967,7 +1967,7 @@ impl Replica for GrpcReplica {
         }
     }
 
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
@@ -1975,7 +1975,7 @@ impl Replica for GrpcReplica {
         self.lane_send_messages(write_offset, packed, true).await
     }
 
-    async fn lane_send_packed_unflushed(
+    async fn lane_send_unflushed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,

@@ -35,7 +35,7 @@ async fn empty_lane_group_is_rejected_without_a_bare_flush_message() {
     );
 
     let error = replica
-        .lane_send_packed(0, &crate::grpc::pack_append(Vec::new()))
+        .lane_send(0, &crate::grpc::pack_append(Vec::new()))
         .await
         .unwrap_err();
     assert_eq!(error.code, TransportCode::Internal);
@@ -63,7 +63,7 @@ async fn unfinalized_create_resource_is_not_a_finish_response() {
     let data = bytes::Bytes::from_static(b"abc");
 
     replica
-        .lane_send_packed(0, &crate::grpc::pack_append(vec![data.clone()]))
+        .lane_send(0, &crate::grpc::pack_append(vec![data.clone()]))
         .await
         .unwrap();
     let durable = replica.lane_durable_change(0).await.unwrap();

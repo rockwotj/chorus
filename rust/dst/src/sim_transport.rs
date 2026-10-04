@@ -10,7 +10,7 @@
 //! reused verbatim from the fake's gRPC handler path (`apply_bidi`,
 //! `apply_append_continuation`, `before*`, the hold gates), so this transport
 //! and the real gRPC transport agree on behavior. The only difference is the
-//! plumbing: `lane_send_packed` is fire-and-forget — it applies the bytes and records
+//! plumbing: `lane_send` is fire-and-forget — it applies the bytes and records
 //! a virtual-clock `durable_at`, and `lane_durable_change` sleeps to it.
 
 use std::collections::HashMap;
@@ -103,9 +103,9 @@ fn persisted_size_of(response: &bidi_write_object_response::WriteStatus) -> Opti
 
 /// Live append session state for one in-memory lane.
 ///
-/// `lane_send_packed` only enqueues a flush group's wire messages; `lane_durable_change`
+/// `lane_send` only enqueues a flush group's wire messages; `lane_durable_change`
 /// applies them to the fake (charging the per-op latency on the virtual clock)
-/// and advances `durable`. Deferring the apply keeps `lane_send_packed` fire-and-forget
+/// and advances `durable`. Deferring the apply keeps `lane_send` fire-and-forget
 /// even when the fake parks the flush (`inject_flush_hold`): the park then occurs
 /// inside `lane_durable_change` without holding the session lock, so the engine's
 /// stall timer fires on schedule and the lane is shed exactly as on the gRPC
@@ -902,7 +902,7 @@ impl Replica for InMemoryReplica {
         }
     }
 
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
@@ -910,7 +910,7 @@ impl Replica for InMemoryReplica {
         self.enqueue_lane_group(write_offset, packed, true).await
     }
 
-    async fn lane_send_packed_unflushed(
+    async fn lane_send_unflushed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,

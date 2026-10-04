@@ -890,7 +890,7 @@ impl FakeGcs {
     ///
     /// `before` is exactly this followed by [`Self::sleep_charged`]. The
     /// in-process simulation transport uses the split so a fire-and-forget
-    /// `lane_send_packed` can charge the fault/latency immediately and defer the
+    /// `lane_send` can charge the fault/latency immediately and defer the
     /// sleep to the durability observation, with no background reader task.
     async fn before_charge(
         &self,

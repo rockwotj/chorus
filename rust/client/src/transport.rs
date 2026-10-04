@@ -131,7 +131,7 @@ impl PackedAppendMessage {
 
 /// An append group whose immutable wire messages were packed once before
 /// replica dispatch, shared across lanes. Public because it appears in the
-/// [`Replica::lane_send_packed`] signature exposed to the simulation harness.
+/// [`Replica::lane_send`] signature exposed to the simulation harness.
 #[derive(Clone, Debug)]
 pub struct PackedAppend {
     chunks: Box<[Bytes]>,
@@ -387,17 +387,17 @@ pub trait Replica: Send + Sync {
     /// Returns an error (without blocking) when no session is live — the lane
     /// then resumes via [`Replica::resume_tail`] and resends its unacknowledged
     /// suffix as another flushed group.
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError>;
 
-    /// Queue a non-empty packed group on the live append session without a
+    /// Queue a non-empty group on the live append session without a
     /// flush. A later flushed group or [`Replica::lane_flush`] makes these
     /// bytes durable. Backends that cannot defer a flush implement this as
-    /// [`Replica::lane_send_packed`].
-    async fn lane_send_packed_unflushed(
+    /// [`Replica::lane_send`].
+    async fn lane_send_unflushed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
@@ -473,7 +473,7 @@ impl TransportCode {
 /// factory calls used by manifest storage, repair, and replay are not wrapped.
 /// An operation such as `snapshot` may perform more than one provider RPC.
 ///
-/// The lane methods (`lane_send_packed`, `lane_send_packed_unflushed`,
+/// The lane methods (`lane_send`, `lane_send_unflushed`,
 /// `lane_flush`, `lane_durable_change`, `append`) delegate untimed: they run per chunk on the append hot path,
 /// where their cost is covered by `chorus.wal.append.commit_latency_seconds`.
 pub(crate) struct TimedReplica {
@@ -576,22 +576,20 @@ impl Replica for TimedReplica {
         self.inner.append(token, write_offset, data).await
     }
 
-    async fn lane_send_packed(
+    async fn lane_send(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
-        self.inner.lane_send_packed(write_offset, packed).await
+        self.inner.lane_send(write_offset, packed).await
     }
 
-    async fn lane_send_packed_unflushed(
+    async fn lane_send_unflushed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
-        self.inner
-            .lane_send_packed_unflushed(write_offset, packed)
-            .await
+        self.inner.lane_send_unflushed(write_offset, packed).await
     }
 
     async fn lane_flush(&self, write_offset: i64) -> Result<(), TransportError> {
