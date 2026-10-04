@@ -150,4 +150,18 @@ pub mod dst_support {
     pub fn gcs_segment_directory_has_room(encoded_segments: &str, additional: usize) -> bool {
         directory_has_room_for(encoded_segments.len(), additional, GCS_MAX_DIRECTORY_BYTES)
     }
+
+    /// The GCS register's sealed-directory byte budget, so a simulated
+    /// [`crate::ManifestStore`] over object metadata reports the same capacity
+    /// as the production register.
+    pub const fn gcs_max_directory_bytes() -> usize {
+        GCS_MAX_DIRECTORY_BYTES
+    }
+
+    /// Classify a GCS register RPC failure exactly as the production register
+    /// does, so a simulated [`crate::ManifestStore`] surfaces the same
+    /// conflicts and transient failures to the protocol.
+    pub fn gcs_manifest_store_error(error: crate::TransportError) -> crate::ManifestStoreError {
+        crate::manifest_store::store_error(error)
+    }
 }

@@ -3210,21 +3210,6 @@ mod tests {
             panic!("create_append_session is not used in this test")
         }
 
-        async fn create_register(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_register is not used in this test")
-        }
-
-        async fn update_register(
-            &self,
-            _metageneration: i64,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("update_register is not used in this test")
-        }
-
         async fn resume_tail(&self, _token: &mut AppendToken) -> Result<i64, TransportError> {
             Err(self.error(
                 TransportCode::Internal,
@@ -3257,12 +3242,12 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send(
+        async fn lane_send_packed(
             &self,
             write_offset: i64,
-            chunks: &[Bytes],
+            packed: &PackedAppend,
         ) -> Result<(), TransportError> {
-            let end = write_offset + chunks.iter().map(|chunk| chunk.len() as i64).sum::<i64>();
+            let end = write_offset + packed.len() as i64;
             self.stage_durable(end);
             let release = self.send_releases.lock().await.pop_front();
             if let Some(release) = release {
@@ -3271,12 +3256,12 @@ mod tests {
             Ok(())
         }
 
-        async fn lane_send_unflushed(
+        async fn lane_send_packed_unflushed(
             &self,
             write_offset: i64,
-            chunks: &[Bytes],
+            packed: &PackedAppend,
         ) -> Result<(), TransportError> {
-            let end = write_offset + chunks.iter().map(|chunk| chunk.len() as i64).sum::<i64>();
+            let end = write_offset + packed.len() as i64;
             self.unflushed
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3352,21 +3337,6 @@ mod tests {
             })
         }
 
-        async fn create_register(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_register is not used in this test")
-        }
-
-        async fn update_register(
-            &self,
-            _metageneration: i64,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("update_register is not used in this test")
-        }
-
         async fn resume_tail(&self, _token: &mut AppendToken) -> Result<i64, TransportError> {
             self.resume_calls.fetch_add(1, Ordering::SeqCst);
             Err(TransportError {
@@ -3401,13 +3371,21 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send(
+        async fn lane_send_packed(
             &self,
             _write_offset: i64,
-            _chunks: &[Bytes],
+            _packed: &PackedAppend,
         ) -> Result<(), TransportError> {
             self.reader_failed.send_replace(true);
             Ok(())
+        }
+
+        async fn lane_send_packed_unflushed(
+            &self,
+            write_offset: i64,
+            packed: &PackedAppend,
+        ) -> Result<(), TransportError> {
+            self.lane_send_packed(write_offset, packed).await
         }
 
         async fn lane_durable_change(
@@ -3470,21 +3448,6 @@ mod tests {
             })
         }
 
-        async fn create_register(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_register is not used in this test")
-        }
-
-        async fn update_register(
-            &self,
-            _metageneration: i64,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("update_register is not used in this test")
-        }
-
         async fn resume_tail(&self, _token: &mut AppendToken) -> Result<i64, TransportError> {
             panic!("a no-progress timeout must shed instead of recovering the lane")
         }
@@ -3514,10 +3477,18 @@ mod tests {
             panic!("append is not used in this test")
         }
 
-        async fn lane_send(
+        async fn lane_send_packed(
             &self,
             _write_offset: i64,
-            _chunks: &[Bytes],
+            _packed: &PackedAppend,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn lane_send_packed_unflushed(
+            &self,
+            _write_offset: i64,
+            _packed: &PackedAppend,
         ) -> Result<(), TransportError> {
             Ok(())
         }

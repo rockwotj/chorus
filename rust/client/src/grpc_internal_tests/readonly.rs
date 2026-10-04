@@ -38,7 +38,8 @@ async fn readonly_open_reports_uninitialized_before_the_first_manifest_claim() {
     let manifest_replica = manifest_factory.replica(&format!("{prefix}/manifest"));
     let mut manifest = crate::manifest::Manifest::open(
         Arc::new(crate::manifest_store::GcsManifestStore::new(
-            manifest_replica.clone(),
+            &manifest_factory,
+            &format!("{prefix}/manifest"),
         )),
         test_config(),
         Arc::new(crate::metrics::Metrics::new(

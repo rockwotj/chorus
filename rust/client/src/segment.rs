@@ -680,12 +680,17 @@ mod recovery {
             client_config: ClientConfig,
             metrics_recorder: Arc<dyn MetricsRecorder>,
         ) -> Result<Self, Error> {
-            Self::new_with_factories_and_metrics_recorder(
+            let prefix = prefix.into().trim_end_matches('/').to_string();
+            let manifest_store = Arc::new(GcsManifestStore::new(
+                &manifest_factory,
+                &format!("{prefix}/{MANIFEST_OBJECT}"),
+            ));
+            Self::build(
                 factories
                     .into_iter()
                     .map(|factory| Arc::new(factory) as Arc<dyn ReplicaFactory>)
                     .collect(),
-                Arc::new(manifest_factory) as Arc<dyn ReplicaFactory>,
+                manifest_store,
                 prefix,
                 client_config,
                 metrics_recorder,
@@ -695,7 +700,7 @@ mod recovery {
         #[cfg(test)]
         pub(crate) fn new_with_factories(
             factories: Vec<Arc<dyn ReplicaFactory>>,
-            manifest_factory: Arc<dyn ReplicaFactory>,
+            manifest_factory: &crate::GrpcReplicaFactory,
             prefix: impl Into<String>,
             client_config: ClientConfig,
         ) -> Result<Self, Error> {
@@ -708,40 +713,45 @@ mod recovery {
             )
         }
 
-        /// Construct a volume over trait-object factories, for the deterministic
-        /// simulation transport. Available only with the `dst-support` feature;
-        /// production code uses the concrete-factory constructors above.
-        #[cfg(feature = "dst-support")]
-        pub fn new_with_dyn_factories_and_metrics_recorder(
+        #[cfg(test)]
+        pub(crate) fn new_with_factories_and_metrics_recorder(
             factories: Vec<Arc<dyn ReplicaFactory>>,
-            manifest_factory: Arc<dyn ReplicaFactory>,
+            manifest_factory: &crate::GrpcReplicaFactory,
             prefix: impl Into<String>,
             client_config: ClientConfig,
             metrics_recorder: Arc<dyn MetricsRecorder>,
         ) -> Result<Self, Error> {
-            Self::new_with_factories_and_metrics_recorder(
-                factories,
+            let prefix = prefix.into().trim_end_matches('/').to_string();
+            let manifest_store = Arc::new(GcsManifestStore::new(
                 manifest_factory,
+                &format!("{prefix}/{MANIFEST_OBJECT}"),
+            ));
+            Self::build(
+                factories,
+                manifest_store,
                 prefix,
                 client_config,
                 metrics_recorder,
             )
         }
 
-        pub(crate) fn new_with_factories_and_metrics_recorder(
+        /// Construct a volume over trait-object factories and a caller-built
+        /// manifest store, for the deterministic simulation transport. The
+        /// store must be scoped to exactly this WAL prefix. Available only with
+        /// the `dst-support` feature; production code uses the concrete-factory
+        /// constructors above.
+        #[cfg(feature = "dst-support")]
+        pub fn new_with_dyn_factories_and_metrics_recorder(
             factories: Vec<Arc<dyn ReplicaFactory>>,
-            manifest_factory: Arc<dyn ReplicaFactory>,
+            manifest_store: Arc<dyn ManifestStore>,
             prefix: impl Into<String>,
             client_config: ClientConfig,
             metrics_recorder: Arc<dyn MetricsRecorder>,
         ) -> Result<Self, Error> {
-            let prefix = prefix.into().trim_end_matches('/').to_string();
-            let object = format!("{prefix}/{MANIFEST_OBJECT}");
-            let manifest_store = Arc::new(GcsManifestStore::new(manifest_factory.replica(&object)));
             Self::build(
                 factories,
                 manifest_store,
-                prefix,
+                prefix.into().trim_end_matches('/').to_string(),
                 client_config,
                 metrics_recorder,
             )

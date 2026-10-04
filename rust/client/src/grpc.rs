@@ -33,7 +33,7 @@ use crate::transport::{
 type RoutingToken = Arc<ArcSwap<Option<Arc<String>>>>;
 
 #[derive(Clone)]
-struct GrpcReplica {
+pub(crate) struct GrpcReplica {
     zone: usize,
     bucket: String,
     object: String,
@@ -1097,8 +1097,9 @@ impl GrpcReplica {
 }
 
 impl GrpcReplicaFactory {
-    #[cfg(feature = "probe-support")]
-    fn probe_replica(&self, object: &str) -> GrpcReplica {
+    /// Bind the factory's bucket and channel to one object name, returning the
+    /// concrete replica.
+    pub(crate) fn object_replica(&self, object: &str) -> GrpcReplica {
         GrpcReplica {
             zone: self.zone,
             bucket: self.bucket.clone(),
@@ -1249,7 +1250,7 @@ pub async fn probe_generation_zero_takeover(
         });
     }
 
-    let present = factory.probe_replica(present_object);
+    let present = factory.object_replica(present_object);
     let append = async {
         let token = present.create_append_session(HashMap::new()).await?;
         if token.persisted_size != 0 {
@@ -1262,7 +1263,7 @@ pub async fn probe_generation_zero_takeover(
             ));
         }
         present
-            .lane_send(token.persisted_size, std::slice::from_ref(&payload))
+            .lane_send_packed(token.persisted_size, &pack_append(vec![payload.clone()]))
             .await?;
         let change = present.lane_durable_change(token.persisted_size).await?;
         if let Some(error) = change.error {
@@ -1292,7 +1293,7 @@ pub async fn probe_generation_zero_takeover(
         Err(error) => Err(error),
     };
 
-    let absent_replica = factory.probe_replica(absent_object);
+    let absent_replica = factory.object_replica(absent_object);
     let absent =
         absent_replica
             .takeover_current_generation()
@@ -1399,6 +1400,101 @@ impl ReplicaFactory for GrpcReplicaFactory {
 }
 
 impl GrpcReplica {
+    /// Conditionally create the finalized, non-appendable manifest register
+    /// with an empty body and the supplied metadata. The register lives in a
+    /// regional bucket, where appendable objects do not exist; it is created
+    /// once with this call and afterwards mutated only through
+    /// [`GrpcReplica::update_register`].
+    pub(crate) async fn create_register(
+        &self,
+        metadata: HashMap<String, String>,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        let object = Object {
+            bucket: self.bucket.clone(),
+            name: self.object.clone(),
+            metadata,
+            content_type: "application/vnd.chorus.manifest".into(),
+            ..Default::default()
+        };
+        // A plain one-shot WriteObject: regional buckets reject appendable
+        // creates, and the register is never appended to anyway.
+        let request = WriteObjectRequest {
+            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
+                WriteObjectSpec {
+                    resource: Some(object),
+                    if_generation_match: Some(0),
+                    ..Default::default()
+                },
+            )),
+            write_offset: 0,
+            finish_write: true,
+            ..Default::default()
+        };
+        let request = self.request(tokio_stream::iter([request]))?;
+        let response = self
+            .client
+            .clone()
+            .write_object(request)
+            .await
+            .map_err(|status| {
+                let error = self.status(status);
+                // As with segment creates: the only precondition here is
+                // `if_generation_match=0`, reported as FAILED_PRECONDITION.
+                if error.code == TransportCode::FailedPrecondition {
+                    TransportError {
+                        code: TransportCode::AlreadyExists,
+                        ..error
+                    }
+                } else {
+                    error
+                }
+            })?
+            .into_inner();
+        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
+        else {
+            return Err(self.error(
+                TransportCode::Internal,
+                "manifest create response omitted the object resource",
+            ));
+        };
+        Ok(self.stat_from_object(object))
+    }
+
+    /// Conditionally replace the register's custom metadata, guarded by its
+    /// metageneration alone. The register is created exactly once and never
+    /// deleted or recreated, so its generation is constant and the
+    /// metageneration by itself names one register state.
+    pub(crate) async fn update_register(
+        &self,
+        metageneration: i64,
+        metadata: HashMap<String, String>,
+    ) -> Result<ReplicaSnapshot, TransportError> {
+        // Generation 0 addresses the live object; the register is never
+        // deleted or recreated, so the metageneration precondition alone is
+        // the CAS guard.
+        let request = UpdateObjectRequest {
+            object: Some(Object {
+                bucket: self.bucket.clone(),
+                name: self.object.clone(),
+                metadata,
+                ..Default::default()
+            }),
+            if_metageneration_match: Some(metageneration),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["metadata".into()],
+            }),
+            ..Default::default()
+        };
+        let object = self
+            .client
+            .clone()
+            .update_object(self.request(request)?)
+            .await
+            .map_err(|status| self.status(status))?
+            .into_inner();
+        Ok(self.stat_from_object(object))
+    }
+
     /// Send a packed group's wire messages in order. When `flush` is set, the
     /// final message carries flush and state_lookup.
     async fn lane_send_messages(
@@ -1697,61 +1793,6 @@ impl Replica for GrpcReplica {
         })
     }
 
-    async fn create_register(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata,
-            content_type: "application/vnd.chorus.manifest".into(),
-            ..Default::default()
-        };
-        // A plain one-shot WriteObject: regional buckets reject appendable
-        // creates, and the register is never appended to anyway.
-        let request = WriteObjectRequest {
-            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            finish_write: true,
-            ..Default::default()
-        };
-        let request = self.request(tokio_stream::iter([request]))?;
-        let response = self
-            .client
-            .clone()
-            .write_object(request)
-            .await
-            .map_err(|status| {
-                let error = self.status(status);
-                // As with segment creates: the only precondition here is
-                // `if_generation_match=0`, reported as FAILED_PRECONDITION.
-                if error.code == TransportCode::FailedPrecondition {
-                    TransportError {
-                        code: TransportCode::AlreadyExists,
-                        ..error
-                    }
-                } else {
-                    error
-                }
-            })?
-            .into_inner();
-        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
-        else {
-            return Err(self.error(
-                TransportCode::Internal,
-                "manifest create response omitted the object resource",
-            ));
-        };
-        Ok(self.stat_from_object(object))
-    }
-
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
         let (generation, metageneration) = self.resolve_token_identity(token).await?;
         let mut owned = self.session.owned.lock().await;
@@ -1805,37 +1846,6 @@ impl Replica for GrpcReplica {
             persisted_size,
             write_handle,
         })
-    }
-
-    async fn update_register(
-        &self,
-        metageneration: i64,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        // Generation 0 addresses the live object; the register is never
-        // deleted or recreated, so the metageneration precondition alone is
-        // the CAS guard.
-        let request = UpdateObjectRequest {
-            object: Some(Object {
-                bucket: self.bucket.clone(),
-                name: self.object.clone(),
-                metadata,
-                ..Default::default()
-            }),
-            if_metageneration_match: Some(metageneration),
-            update_mask: Some(prost_types::FieldMask {
-                paths: vec!["metadata".into()],
-            }),
-            ..Default::default()
-        };
-        let object = self
-            .client
-            .clone()
-            .update_object(self.request(request)?)
-            .await
-            .map_err(|status| self.status(status))?
-            .into_inner();
-        Ok(self.stat_from_object(object))
     }
 
     async fn replace_appendable(
@@ -1955,20 +1965,6 @@ impl Replica for GrpcReplica {
             )),
             None => Err(self.error(TransportCode::Internal, "missing persisted-size response")),
         }
-    }
-
-    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        let packed = pack_append(chunks.to_vec());
-        self.lane_send_packed(write_offset, &packed).await
-    }
-
-    async fn lane_send_unflushed(
-        &self,
-        write_offset: i64,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        let packed = pack_append(chunks.to_vec());
-        self.lane_send_packed_unflushed(write_offset, &packed).await
     }
 
     async fn lane_send_packed(

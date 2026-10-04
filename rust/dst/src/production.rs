@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chorus_client::{
-    AppendCompletion, AppendReceipt, ClientConfig, CounterFn, GaugeFn, HistogramFn,
+    AppendCompletion, AppendReceipt, ClientConfig, CounterFn, GaugeFn, HistogramFn, ManifestStore,
     MetricsRecorder, NoopMetricsRecorder, Recovery, ReplicaFactory, SegmentedVolume,
     UpDownCounterFn, WalEngineConfig, WalHandle, WalRecord, WalSeqNo,
 };
@@ -20,7 +20,7 @@ use chorus_client::{
 use chorus_client::GrpcReplicaFactory;
 use chorus_fake_gcs::{FakeGcs, LatencyProfile, ObjectObservation, Operation, SimulatedLatency};
 
-use crate::sim_transport::InMemoryReplicaFactory;
+use crate::sim_transport::{InMemoryReplicaFactory, SimManifestStore};
 use futures::future::join_all;
 use futures::TryStreamExt;
 use rand::prelude::IndexedRandom;
@@ -904,7 +904,6 @@ struct ProductionHarness {
     crashed: [bool; 3],
     factories: Vec<Arc<dyn ReplicaFactory>>,
     manifest_server: FakeGcs,
-    manifest_factory: Arc<dyn ReplicaFactory>,
     prefix: String,
     client_config: ClientConfig,
     engine_config: WalEngineConfig,
@@ -970,14 +969,6 @@ impl ProductionHarness {
                 zone,
             )));
         }
-        // the regional bucket hosting the manifest control register; its
-        // availability is the provider's regional replication, so DST keeps
-        // it reachable while zones crash and recover around it
-        let manifest_factory: Arc<dyn ReplicaFactory> = Arc::new(InMemoryReplicaFactory::new(
-            manifest_server.clone(),
-            format!("{BUCKET_PREFIX}regional"),
-            3,
-        ));
         let mut harness = Self {
             seed,
             rng,
@@ -987,7 +978,6 @@ impl ProductionHarness {
             crashed: [false; 3],
             factories,
             manifest_server,
-            manifest_factory,
             prefix: format!("dst/{seed}"),
             client_config: ClientConfig {
                 max_retries: 3,
@@ -1460,10 +1450,22 @@ impl ProductionHarness {
         })
     }
 
+    /// The manifest register for the WAL at `prefix`, in the regional bucket.
+    /// Its availability is the provider's regional replication, so DST keeps
+    /// it reachable while zones crash and recover around it.
+    fn manifest_store(&self, prefix: &str) -> Arc<dyn ManifestStore> {
+        Arc::new(SimManifestStore::new(
+            self.manifest_server.clone(),
+            format!("{BUCKET_PREFIX}regional"),
+            format!("{prefix}/manifest"),
+            3,
+        ))
+    }
+
     fn volume(&self, metrics_recorder: Arc<dyn MetricsRecorder>) -> SegmentedVolume {
         SegmentedVolume::new_with_dyn_factories_and_metrics_recorder(
             self.factories.to_vec(),
-            self.manifest_factory.clone(),
+            self.manifest_store(&self.prefix),
             &self.prefix,
             self.client_config.clone(),
             metrics_recorder,
@@ -1474,7 +1476,7 @@ impl ProductionHarness {
     fn volume_at(&self, prefix: &str) -> SegmentedVolume {
         SegmentedVolume::new_with_dyn_factories_and_metrics_recorder(
             self.factories.to_vec(),
-            self.manifest_factory.clone(),
+            self.manifest_store(prefix),
             prefix,
             self.client_config.clone(),
             Arc::new(NoopMetricsRecorder),
@@ -3665,7 +3667,7 @@ impl ProductionHarness {
         let prefix = format!("{}/corruption/{}", self.prefix, self.logical_time);
         let volume = SegmentedVolume::new_with_dyn_factories_and_metrics_recorder(
             self.factories.to_vec(),
-            self.manifest_factory.clone(),
+            self.manifest_store(&prefix),
             &prefix,
             self.client_config.clone(),
             Arc::new(NoopMetricsRecorder),

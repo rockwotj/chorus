@@ -10,11 +10,11 @@
 //! in through [`ManifestStore`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::transport::{Replica, ReplicaSnapshot, TransportCode};
+use crate::grpc::{GrpcReplica, GrpcReplicaFactory};
+use crate::transport::{Replica, ReplicaSnapshot, TransportCode, TransportError};
 
 /// Opaque optimistic-concurrency token for one observed register state.
 ///
@@ -105,7 +105,7 @@ pub trait ManifestStore: Send + Sync {
 /// The default register backend: object metadata on one regional GCS
 /// object, guarded by a metageneration precondition.
 pub(crate) struct GcsManifestStore {
-    replica: Arc<dyn Replica>,
+    replica: GrpcReplica,
 }
 
 /// GCS caps all custom object metadata at roughly 8 KiB. The fixed manifest
@@ -114,8 +114,11 @@ pub(crate) struct GcsManifestStore {
 pub(crate) const GCS_MAX_DIRECTORY_BYTES: usize = 6144;
 
 impl GcsManifestStore {
-    pub(crate) fn new(replica: Arc<dyn Replica>) -> Self {
-        Self { replica }
+    /// Bind the register to `object` in the factory's regional bucket.
+    pub(crate) fn new(factory: &GrpcReplicaFactory, object: &str) -> Self {
+        Self {
+            replica: factory.object_replica(object),
+        }
     }
 
     fn versioned(snapshot: ReplicaSnapshot) -> VersionedManifest {
@@ -126,7 +129,8 @@ impl GcsManifestStore {
     }
 }
 
-fn store_error(error: crate::transport::TransportError) -> ManifestStoreError {
+/// Classify a GCS register RPC failure for the protocol.
+pub(crate) fn store_error(error: TransportError) -> ManifestStoreError {
     match error.code {
         TransportCode::FailedPrecondition => ManifestStoreError::Conflict,
         TransportCode::AlreadyExists => ManifestStoreError::AlreadyExists,

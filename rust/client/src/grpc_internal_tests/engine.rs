@@ -1290,7 +1290,7 @@ async fn transient_seal_enforcement_failure_retries_without_gating_rotation() {
     // A small test-only delay leaves the retry in flight while quorum returns.
     let volume = SegmentedVolume::new_with_factories_and_metrics_recorder(
         factories,
-        manifest_factory,
+        &manifest_factory,
         "retry-seal-enforcement-wal",
         ClientConfig {
             retry_base: Duration::from_millis(100),

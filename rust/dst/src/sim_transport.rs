@@ -10,7 +10,7 @@
 //! reused verbatim from the fake's gRPC handler path (`apply_bidi`,
 //! `apply_append_continuation`, `before*`, the hold gates), so this transport
 //! and the real gRPC transport agree on behavior. The only difference is the
-//! plumbing: `lane_send` is fire-and-forget — it applies the bytes and records
+//! plumbing: `lane_send_packed` is fire-and-forget — it applies the bytes and records
 //! a virtual-clock `durable_at`, and `lane_durable_change` sleeps to it.
 
 use std::collections::HashMap;
@@ -30,10 +30,11 @@ use chorus_fake_gcs::proto::{
 use chorus_fake_gcs::{FakeGcs, SimSessionOpen};
 use tonic::{Code, Request, Status};
 
-use chorus_client::dst_support::pack_append;
+use chorus_client::dst_support::{gcs_manifest_store_error, gcs_max_directory_bytes, pack_append};
 use chorus_client::{
-    AppendToken, LaneDurableChange, ListedObject, PackedAppend, Replica, ReplicaFactory,
-    ReplicaRangeRead, ReplicaSnapshot, TransportCode, TransportError,
+    AppendToken, LaneDurableChange, ListedObject, ManifestStore, ManifestStoreError,
+    ManifestVersion, PackedAppend, Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot,
+    TransportCode, TransportError, VersionedManifest,
 };
 
 fn map_code(status: &Status) -> TransportCode {
@@ -102,9 +103,9 @@ fn persisted_size_of(response: &bidi_write_object_response::WriteStatus) -> Opti
 
 /// Live append session state for one in-memory lane.
 ///
-/// `lane_send` only enqueues a flush group's wire messages; `lane_durable_change`
+/// `lane_send_packed` only enqueues a flush group's wire messages; `lane_durable_change`
 /// applies them to the fake (charging the per-op latency on the virtual clock)
-/// and advances `durable`. Deferring the apply keeps `lane_send` fire-and-forget
+/// and advances `durable`. Deferring the apply keeps `lane_send_packed` fire-and-forget
 /// even when the fake parks the flush (`inject_flush_hold`): the park then occurs
 /// inside `lane_durable_change` without holding the session lock, so the engine's
 /// stall timer fires on schedule and the lane is shed exactly as on the gRPC
@@ -212,6 +213,143 @@ impl ReplicaFactory for InMemoryReplicaFactory {
                 metadata: object.metadata,
             })
             .collect())
+    }
+}
+
+/// Manifest register over one fake regional bucket: object metadata guarded
+/// by a metageneration precondition, mirroring the production GCS register so
+/// the simulation drives the same RPCs, faults and error classification.
+pub struct SimManifestStore {
+    fake: FakeGcs,
+    bucket: String,
+    object: String,
+    zone: usize,
+}
+
+impl SimManifestStore {
+    /// Bind the register to `object` in one fake regional bucket. `bucket` is
+    /// the full v2 resource name, matching [`InMemoryReplicaFactory::new`].
+    pub fn new(
+        fake: FakeGcs,
+        bucket: impl Into<String>,
+        object: impl Into<String>,
+        zone: usize,
+    ) -> Self {
+        Self {
+            fake,
+            bucket: bucket.into(),
+            object: object.into(),
+            zone,
+        }
+    }
+
+    fn versioned(snapshot: ReplicaSnapshot) -> VersionedManifest {
+        VersionedManifest {
+            version: ManifestVersion(snapshot.metageneration as u64),
+            fields: snapshot.metadata,
+        }
+    }
+}
+
+#[async_trait]
+impl ManifestStore for SimManifestStore {
+    fn max_directory_bytes(&self) -> usize {
+        gcs_max_directory_bytes()
+    }
+
+    async fn read(&self) -> Result<Option<VersionedManifest>, ManifestStoreError> {
+        let request = GetObjectRequest {
+            bucket: self.bucket.clone(),
+            object: self.object.clone(),
+            ..Default::default()
+        };
+        match Storage::get_object(&self.fake, Request::new(request)).await {
+            Ok(object) => Ok(Some(Self::versioned(stat_from_object(
+                self.zone,
+                object.into_inner(),
+            )))),
+            Err(status) => {
+                let error = status_err(self.zone, &status);
+                if error.code == TransportCode::NotFound {
+                    Ok(None)
+                } else {
+                    Err(gcs_manifest_store_error(error))
+                }
+            }
+        }
+    }
+
+    async fn create(
+        &self,
+        fields: HashMap<String, String>,
+    ) -> Result<VersionedManifest, ManifestStoreError> {
+        let object = Object {
+            bucket: self.bucket.clone(),
+            name: self.object.clone(),
+            metadata: fields,
+            content_type: "application/vnd.chorus.manifest".into(),
+            ..Default::default()
+        };
+        let request = WriteObjectRequest {
+            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
+                WriteObjectSpec {
+                    resource: Some(object),
+                    if_generation_match: Some(0),
+                    ..Default::default()
+                },
+            )),
+            write_offset: 0,
+            finish_write: true,
+            ..Default::default()
+        };
+        let response = self
+            .fake
+            .sim_write_object(request)
+            .await
+            .map_err(|status| {
+                let error = status_err(self.zone, &status);
+                // The only precondition is `if_generation_match=0`.
+                let error = if error.code == TransportCode::FailedPrecondition {
+                    TransportError {
+                        code: TransportCode::AlreadyExists,
+                        ..error
+                    }
+                } else {
+                    error
+                };
+                gcs_manifest_store_error(error)
+            })?;
+        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
+        else {
+            return Err(gcs_manifest_store_error(err(
+                self.zone,
+                TransportCode::Internal,
+                "manifest create response omitted the object resource",
+            )));
+        };
+        Ok(Self::versioned(stat_from_object(self.zone, object)))
+    }
+
+    async fn update(
+        &self,
+        version: ManifestVersion,
+        fields: HashMap<String, String>,
+    ) -> Result<VersionedManifest, ManifestStoreError> {
+        let request = UpdateObjectRequest {
+            object: Some(Object {
+                bucket: self.bucket.clone(),
+                name: self.object.clone(),
+                metadata: fields,
+                ..Default::default()
+            }),
+            if_metageneration_match: Some(version.0 as i64),
+            ..Default::default()
+        };
+        let object = Storage::update_object(&self.fake, Request::new(request))
+            .await
+            .map_err(|status| gcs_manifest_store_error(status_err(self.zone, &status)))?
+            .into_inner();
+        Ok(Self::versioned(stat_from_object(self.zone, object)))
     }
 }
 
@@ -638,77 +776,6 @@ impl Replica for InMemoryReplica {
         })
     }
 
-    async fn create_register(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata,
-            content_type: "application/vnd.chorus.manifest".into(),
-            ..Default::default()
-        };
-        let request = WriteObjectRequest {
-            first_message: Some(write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            finish_write: true,
-            ..Default::default()
-        };
-        let response = self
-            .fake
-            .sim_write_object(request)
-            .await
-            .map_err(|status| {
-                let error = status_err(self.zone, &status);
-                if error.code == TransportCode::FailedPrecondition {
-                    TransportError {
-                        code: TransportCode::AlreadyExists,
-                        ..error
-                    }
-                } else {
-                    error
-                }
-            })?;
-        let Some(write_object_response::WriteStatus::Resource(object)) = response.write_status
-        else {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "manifest create response omitted the object resource",
-            ));
-        };
-        Ok(stat_from_object(self.zone, object))
-    }
-
-    async fn update_register(
-        &self,
-        metageneration: i64,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let request = UpdateObjectRequest {
-            object: Some(Object {
-                bucket: self.bucket.clone(),
-                name: self.object.clone(),
-                metadata,
-                ..Default::default()
-            }),
-            if_metageneration_match: Some(metageneration),
-            ..Default::default()
-        };
-        let object = Storage::update_object(&self.fake, Request::new(request))
-            .await
-            .map_err(|status| status_err(self.zone, &status))?
-            .into_inner();
-        Ok(stat_from_object(self.zone, object))
-    }
-
     async fn resume_tail(&self, token: &mut AppendToken) -> Result<i64, TransportError> {
         let observed = self.stat().await?;
         let request = self.open_request_append(
@@ -835,26 +902,12 @@ impl Replica for InMemoryReplica {
         }
     }
 
-    async fn lane_send(&self, write_offset: i64, chunks: &[Bytes]) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), true)
-            .await
-    }
-
     async fn lane_send_packed(
         &self,
         write_offset: i64,
         packed: &PackedAppend,
     ) -> Result<(), TransportError> {
         self.enqueue_lane_group(write_offset, packed, true).await
-    }
-
-    async fn lane_send_unflushed(
-        &self,
-        write_offset: i64,
-        chunks: &[Bytes],
-    ) -> Result<(), TransportError> {
-        self.enqueue_lane_group(write_offset, &pack_append(chunks.to_vec()), false)
-            .await
     }
 
     async fn lane_send_packed_unflushed(
