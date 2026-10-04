@@ -1001,7 +1001,7 @@ impl QuorumVolume {
             let replica = Arc::clone(replica);
             let config = self.config.clone();
             async move {
-                match takeover_current_with_retry(&replica, &config).await {
+                match with_retry(&config, || takeover_current(&*replica)).await {
                     Ok(token) => Ok::<_, ProtocolError>(Observation::Live(token)),
                     Err(error) if error.code == TransportCode::FailedPrecondition => {
                         let snapshot = snapshot_with_retry(&replica, &config).await?;
@@ -1351,20 +1351,17 @@ impl QuorumVolume {
                 + shared
         });
         for snapshot in witnesses {
-            match self.enforce_witness(snapshot, &data).await {
+            match self
+                .enforce_witness(snapshot.zone, Some(snapshot), &data)
+                .await
+            {
                 Ok(true) => finalized += 1,
                 Ok(false) => {}
                 Err(error) => return Err(error),
             }
         }
         for zone in missing {
-            let replica = Arc::clone(&self.replicas[zone]);
-            let Ok(created) =
-                create_with_retry(&replica, self.metadata.clone(), &self.config).await
-            else {
-                continue;
-            };
-            match self.enforce_witness(created, &data).await {
+            match self.enforce_witness(zone, None, &data).await {
                 Ok(true) => finalized += 1,
                 Ok(false) => {}
                 Err(error) => return Err(error),
@@ -1377,23 +1374,27 @@ impl QuorumVolume {
         }
     }
 
+    /// Install and finalize the canonical bytes on one zone's copy, starting
+    /// from `observed` (`None` when the object is absent). Returns whether the
+    /// zone now holds the sealed canonical copy.
     async fn enforce_witness(
         &self,
-        mut snapshot: ReplicaSnapshot,
+        zone: usize,
+        mut observed: Option<ReplicaSnapshot>,
         data: &Bytes,
     ) -> Result<bool, ProtocolError> {
-        let zone = snapshot.zone;
         let replica = Arc::clone(&self.replicas[zone]);
         for _ in 0..=self.config.max_retries {
-            if snapshot.finalized {
-                if snapshot.bytes == data[..] {
+            if let Some(snapshot) = observed
+                .as_ref()
+                .filter(|snapshot| snapshot.bytes == data[..])
+            {
+                if snapshot.finalized {
                     return Ok(true);
                 }
-                // wrong finalized content: replace with a fresh generation
-            } else if snapshot.bytes == data[..] {
-                let Ok(mut token) = takeover_with_retry(&replica, &snapshot, &self.config).await
+                let Ok(mut token) = with_retry(&self.config, || replica.takeover(snapshot)).await
                 else {
-                    snapshot = snapshot_with_retry(&replica, &self.config).await?;
+                    observed = observe_with_retry(&replica, &self.config).await?;
                     continue;
                 };
                 match finalize_with_retry(&replica, &mut token, data.len() as i64, &self.config)
@@ -1401,16 +1402,17 @@ impl QuorumVolume {
                 {
                     Ok(_) => return Ok(true),
                     Err(error) if error.code == TransportCode::FailedPrecondition => {
-                        snapshot = snapshot_with_retry(&replica, &self.config).await?;
+                        observed = observe_with_retry(&replica, &self.config).await?;
                         continue;
                     }
                     Err(error) if error.code.transient() => return Ok(false),
                     Err(error) => return Err(error.into()),
                 }
             }
+            // missing, wrong, or rotted copy: write a fresh generation
             let mut token = match replace_with_retry(
                 &replica,
-                snapshot.clone(),
+                observed.clone(),
                 data.clone(),
                 self.metadata.clone(),
                 &self.config,
@@ -1419,7 +1421,7 @@ impl QuorumVolume {
             {
                 Ok(token) => token,
                 Err(error) if error.code == TransportCode::FailedPrecondition => {
-                    snapshot = snapshot_with_retry(&replica, &self.config).await?;
+                    observed = observe_with_retry(&replica, &self.config).await?;
                     continue;
                 }
                 Err(error) if error.code.transient() => return Ok(false),
@@ -1428,7 +1430,7 @@ impl QuorumVolume {
             match finalize_with_retry(&replica, &mut token, data.len() as i64, &self.config).await {
                 Ok(_) => return Ok(true),
                 Err(error) if error.code == TransportCode::FailedPrecondition => {
-                    snapshot = snapshot_with_retry(&replica, &self.config).await?;
+                    observed = observe_with_retry(&replica, &self.config).await?;
                 }
                 Err(error) if error.code.transient() => return Ok(false),
                 Err(error) => return Err(error.into()),
@@ -1837,20 +1839,42 @@ fn prefer_lower_zone(current: &mut Option<TransportError>, candidate: TransportE
     }
 }
 
-async fn snapshot_with_retry(
-    replica: &Arc<dyn Replica>,
-    config: &ClientConfig,
-) -> Result<ReplicaSnapshot, TransportError> {
+/// Run `op` again after each transient failure, up to `config.max_retries`
+/// retries with backoff. Any other failure, or the last transient one, is
+/// returned to the caller.
+async fn with_retry<T, F, Fut>(config: &ClientConfig, mut op: F) -> Result<T, TransportError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
     let mut attempt = 0usize;
     loop {
-        match replica.snapshot().await {
-            Ok(snapshot) => return Ok(snapshot),
+        match op().await {
             Err(error) if error.code.transient() && attempt < config.max_retries => {
                 retry_sleep(config, attempt).await;
                 attempt += 1;
             }
-            Err(error) => return Err(error),
+            result => return result,
         }
+    }
+}
+
+async fn snapshot_with_retry(
+    replica: &Arc<dyn Replica>,
+    config: &ClientConfig,
+) -> Result<ReplicaSnapshot, TransportError> {
+    with_retry(config, || replica.snapshot()).await
+}
+
+/// [`snapshot_with_retry`] that reports an absent object as `None`.
+async fn observe_with_retry(
+    replica: &Arc<dyn Replica>,
+    config: &ClientConfig,
+) -> Result<Option<ReplicaSnapshot>, TransportError> {
+    match snapshot_with_retry(replica, config).await {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if error.code == TransportCode::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -1858,35 +1882,7 @@ async fn stat_with_retry(
     replica: &Arc<dyn Replica>,
     config: &ClientConfig,
 ) -> Result<ReplicaSnapshot, TransportError> {
-    let mut attempt = 0usize;
-    loop {
-        match replica.stat().await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(error) if error.code.transient() && attempt < config.max_retries => {
-                retry_sleep(config, attempt).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn create_with_retry(
-    replica: &Arc<dyn Replica>,
-    metadata: HashMap<String, String>,
-    config: &ClientConfig,
-) -> Result<ReplicaSnapshot, TransportError> {
-    let mut attempt = 0usize;
-    loop {
-        match replica.create_appendable(metadata.clone()).await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(error) if error.code.transient() && attempt < config.max_retries => {
-                retry_sleep(config, attempt).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    with_retry(config, || replica.stat()).await
 }
 
 async fn create_session_with_retry(
@@ -1894,57 +1890,38 @@ async fn create_session_with_retry(
     metadata: HashMap<String, String>,
     config: &ClientConfig,
 ) -> Result<AppendToken, TransportError> {
-    let mut attempt = 0usize;
-    loop {
-        match replica.create_append_session(metadata.clone()).await {
-            Ok(token) => return Ok(token),
-            Err(error) if error.code.transient() && attempt < config.max_retries => {
-                retry_sleep(config, attempt).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
+    with_retry(config, || replica.create_append_session(metadata.clone())).await
+}
+
+/// Fence the current live generation and return its authoritative durable
+/// tail in the same RPC.
+///
+/// The latest-generation lookup confirms identity or unambiguous absence;
+/// its tail-blind size is never used for recovery. A `NotFound` from the
+/// subsequent exact-generation takeover is ambiguous and must not be
+/// reclassified as object absence.
+pub(crate) async fn takeover_current(replica: &dyn Replica) -> Result<AppendToken, TransportError> {
+    let observed = replica.stat().await?;
+    match replica.takeover(&observed).await {
+        Err(error) if error.code == TransportCode::NotFound => Err(TransportError {
+            zone: error.zone,
+            code: TransportCode::Ambiguous,
+            message: format!(
+                "exact-generation takeover returned NOT_FOUND after current object lookup: {}",
+                error.message
+            ),
+        }),
+        result => result,
     }
 }
 
-async fn takeover_with_retry(
-    replica: &Arc<dyn Replica>,
-    observed: &ReplicaSnapshot,
-    config: &ClientConfig,
-) -> Result<AppendToken, TransportError> {
-    let mut attempt = 0usize;
-    loop {
-        match replica.takeover(observed).await {
-            Ok(token) => return Ok(token),
-            Err(error) if error.code.transient() && attempt < config.max_retries => {
-                retry_sleep(config, attempt).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn takeover_current_with_retry(
-    replica: &Arc<dyn Replica>,
-    config: &ClientConfig,
-) -> Result<AppendToken, TransportError> {
-    let mut attempt = 0usize;
-    loop {
-        match replica.takeover_current().await {
-            Ok(token) => return Ok(token),
-            Err(error) if error.code.transient() && attempt < config.max_retries => {
-                retry_sleep(config, attempt).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
+/// Write `data` as a new appendable generation over `observed`, or as a new
+/// object when `observed` is `None`. After a transient failure the write may
+/// have applied, so the object is read again: a matching unfinalized copy is
+/// the write's own result, and anything else is the next precondition.
 async fn replace_with_retry(
     replica: &Arc<dyn Replica>,
-    mut observed: ReplicaSnapshot,
+    mut observed: Option<ReplicaSnapshot>,
     data: Bytes,
     metadata: HashMap<String, String>,
     config: &ClientConfig,
@@ -1952,22 +1929,21 @@ async fn replace_with_retry(
     let mut attempt = 0usize;
     loop {
         match replica
-            .replace_appendable(&observed, data.clone(), metadata.clone())
+            .replace_appendable(observed.as_ref(), data.clone(), metadata.clone())
             .await
         {
             Ok(token) => return Ok(token),
             Err(error) if error.code.transient() && attempt < config.max_retries => {
                 retry_sleep(config, attempt).await;
                 attempt += 1;
-                observed = snapshot_with_retry(replica, config).await?;
-                if observed.bytes == data[..]
-                    && observed.metadata == metadata
-                    && !observed.finalized
-                {
+                observed = observe_with_retry(replica, config).await?;
+                if let Some(current) = observed.as_ref().filter(|current| {
+                    current.bytes == data[..] && current.metadata == metadata && !current.finalized
+                }) {
                     return Ok(AppendToken {
-                        zone: observed.zone,
-                        generation: Some(observed.generation),
-                        metageneration: Some(observed.metageneration),
+                        zone: current.zone,
+                        generation: Some(current.generation),
+                        metageneration: Some(current.metageneration),
                         persisted_size: data.len() as i64,
                         write_handle: None,
                     });
@@ -3186,19 +3162,19 @@ mod tests {
 
     #[async_trait]
     impl Replica for ScriptedLaneReplica {
+        async fn read_range(
+            &self,
+            _offset: i64,
+        ) -> Result<crate::transport::ReplicaRangeRead, TransportError> {
+            panic!("read_range is not used in this test")
+        }
+
         async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("snapshot is not used in this test")
         }
 
         async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("stat is not used in this test")
-        }
-
-        async fn create_appendable(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_appendable is not used in this test")
         }
 
         async fn create_append_session(
@@ -3224,20 +3200,11 @@ mod tests {
 
         async fn replace_appendable(
             &self,
-            _observed: &ReplicaSnapshot,
+            _observed: Option<&ReplicaSnapshot>,
             _data: Bytes,
             _metadata: HashMap<String, String>,
         ) -> Result<AppendToken, TransportError> {
             panic!("replace_appendable is not used in this test")
-        }
-
-        async fn append(
-            &self,
-            _token: &AppendToken,
-            _write_offset: i64,
-            _data: Vec<u8>,
-        ) -> Result<i64, TransportError> {
-            panic!("append is not used in this test")
         }
 
         async fn lane_send(
@@ -3307,19 +3274,23 @@ mod tests {
 
     #[async_trait]
     impl Replica for ReaderTerminalReplica {
+        async fn read_range(
+            &self,
+            _offset: i64,
+        ) -> Result<crate::transport::ReplicaRangeRead, TransportError> {
+            panic!("read_range is not used in this test")
+        }
+
+        async fn lane_flush(&self, _write_offset: i64) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("snapshot is not used in this test")
         }
 
         async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("stat is not used in this test")
-        }
-
-        async fn create_appendable(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_appendable is not used in this test")
         }
 
         async fn create_append_session(
@@ -3353,20 +3324,11 @@ mod tests {
 
         async fn replace_appendable(
             &self,
-            _observed: &ReplicaSnapshot,
+            _observed: Option<&ReplicaSnapshot>,
             _data: Bytes,
             _metadata: HashMap<String, String>,
         ) -> Result<AppendToken, TransportError> {
             panic!("replace_appendable is not used in this test")
-        }
-
-        async fn append(
-            &self,
-            _token: &AppendToken,
-            _write_offset: i64,
-            _data: Vec<u8>,
-        ) -> Result<i64, TransportError> {
-            panic!("append is not used in this test")
         }
 
         async fn lane_send(
@@ -3418,19 +3380,23 @@ mod tests {
 
     #[async_trait]
     impl Replica for StalledReplica {
+        async fn read_range(
+            &self,
+            _offset: i64,
+        ) -> Result<crate::transport::ReplicaRangeRead, TransportError> {
+            panic!("read_range is not used in this test")
+        }
+
+        async fn lane_flush(&self, _write_offset: i64) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         async fn snapshot(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("snapshot is not used in this test")
         }
 
         async fn stat(&self) -> Result<ReplicaSnapshot, TransportError> {
             panic!("stat is not used in this test")
-        }
-
-        async fn create_appendable(
-            &self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<ReplicaSnapshot, TransportError> {
-            panic!("create_appendable is not used in this test")
         }
 
         async fn create_append_session(
@@ -3459,20 +3425,11 @@ mod tests {
 
         async fn replace_appendable(
             &self,
-            _observed: &ReplicaSnapshot,
+            _observed: Option<&ReplicaSnapshot>,
             _data: Bytes,
             _metadata: HashMap<String, String>,
         ) -> Result<AppendToken, TransportError> {
             panic!("replace_appendable is not used in this test")
-        }
-
-        async fn append(
-            &self,
-            _token: &AppendToken,
-            _write_offset: i64,
-            _data: Vec<u8>,
-        ) -> Result<i64, TransportError> {
-            panic!("append is not used in this test")
         }
 
         async fn lane_send(

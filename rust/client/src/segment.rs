@@ -3158,9 +3158,6 @@ mod maintenance {
         Stat,
         Delete,
         ReplaceAppendable,
-        CreateAppendable,
-        Takeover,
-        Append,
         Finalize,
     }
 
@@ -3171,9 +3168,6 @@ mod maintenance {
                 Self::Stat => "stat",
                 Self::Delete => "delete",
                 Self::ReplaceAppendable => "replace_appendable",
-                Self::CreateAppendable => "create_appendable",
-                Self::Takeover => "takeover",
-                Self::Append => "append",
                 Self::Finalize => "finalize",
             }
         }
@@ -3645,28 +3639,14 @@ mod maintenance {
             return Ok(false);
         }
 
-        let mut token = match current {
-            Some(snapshot) => at_step(
-                RepairStep::ReplaceAppendable,
-                replica
-                    .replace_appendable(&snapshot, bytes.clone(), metadata)
-                    .await,
-            )?,
-            None => {
-                let created = at_step(
-                    RepairStep::CreateAppendable,
-                    replica.create_appendable(metadata).await,
-                )?;
-                let mut token = at_step(RepairStep::Takeover, replica.takeover(&created).await)?;
-                if !bytes.is_empty() {
-                    token.persisted_size = at_step(
-                        RepairStep::Append,
-                        replica.append(&token, 0, bytes.to_vec()).await,
-                    )?;
-                }
-                token
-            }
-        };
+        // One conditional write replaces the observed copy, or creates the
+        // object when it is absent.
+        let mut token = at_step(
+            RepairStep::ReplaceAppendable,
+            replica
+                .replace_appendable(current.as_ref(), bytes.clone(), metadata)
+                .await,
+        )?;
         token.persisted_size = bytes.len() as i64;
         let finalized = at_step(
             RepairStep::Finalize,

@@ -693,43 +693,6 @@ impl Replica for InMemoryReplica {
         })
     }
 
-    async fn create_appendable(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata,
-            content_type: "application/vnd.chorus.records".into(),
-            ..Default::default()
-        };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    appendable: Some(true),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
-        if let Err(error) = self.open(request).await {
-            if error.code == TransportCode::FailedPrecondition {
-                return Err(TransportError {
-                    code: TransportCode::AlreadyExists,
-                    ..error
-                });
-            }
-            return Err(error);
-        }
-        self.stat().await
-    }
-
     async fn create_append_session(
         &self,
         metadata: HashMap<String, String>,
@@ -821,7 +784,7 @@ impl Replica for InMemoryReplica {
 
     async fn replace_appendable(
         &self,
-        observed: &ReplicaSnapshot,
+        observed: Option<&ReplicaSnapshot>,
         data: Bytes,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError> {
@@ -832,12 +795,14 @@ impl Replica for InMemoryReplica {
             content_type: "application/vnd.chorus.records".into(),
             ..Default::default()
         };
+        // Generation 0 means "only if absent"; a create carries no
+        // metageneration precondition.
         let request = BidiWriteObjectRequest {
             first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
                 WriteObjectSpec {
                     resource: Some(object),
-                    if_generation_match: Some(observed.generation),
-                    if_metageneration_match: Some(observed.metageneration),
+                    if_generation_match: Some(observed.map_or(0, |observed| observed.generation)),
+                    if_metageneration_match: observed.map(|observed| observed.metageneration),
                     appendable: Some(true),
                     ..Default::default()
                 },
@@ -847,7 +812,18 @@ impl Replica for InMemoryReplica {
             state_lookup: true,
             ..Default::default()
         };
-        let open = self.open_split(request, data).await?;
+        // Both report a lost race: the observed generation changed, or a
+        // create found the object already present.
+        let open = self
+            .open_split(request, data)
+            .await
+            .map_err(|error| match error.code {
+                TransportCode::AlreadyExists => TransportError {
+                    code: TransportCode::FailedPrecondition,
+                    ..error
+                },
+                _ => error,
+            })?;
         let (persisted_size, write_handle) = self.token_from_open(&open, None);
         self.store_session(&open).await;
         Ok(AppendToken {
@@ -857,49 +833,6 @@ impl Replica for InMemoryReplica {
             persisted_size,
             write_handle,
         })
-    }
-
-    async fn append(
-        &self,
-        token: &AppendToken,
-        write_offset: i64,
-        data: Vec<u8>,
-    ) -> Result<i64, TransportError> {
-        let Some(generation) = token.generation else {
-            return Err(err(
-                self.zone,
-                TransportCode::Internal,
-                "one-shot append requires a generation-bound token",
-            ));
-        };
-        let expected = write_offset + data.len() as i64;
-        // An empty append keeps its empty checksummed payload, which the
-        // service answers with a persisted size.
-        let data = Bytes::from(data);
-        let request = self.open_request_append(
-            generation,
-            token.metageneration,
-            token.write_handle.clone(),
-            write_offset,
-            data.is_empty().then(Vec::new),
-            false,
-        );
-        let open = self.open_split(request, data).await?;
-        let persisted = open
-            .response
-            .write_status
-            .as_ref()
-            .and_then(persisted_size_of)
-            .unwrap_or(0);
-        if persisted >= expected {
-            Ok(persisted)
-        } else {
-            Err(err(
-                self.zone,
-                TransportCode::DataLoss,
-                format!("flush persisted {persisted}, expected at least {expected}"),
-            ))
-        }
     }
 
     async fn lane_send(

@@ -139,7 +139,7 @@ pub mod dst_support {
     use crate::manifest_store::GCS_MAX_DIRECTORY_BYTES;
 
     /// The gRPC transport's wire-message packing, so the simulation transport
-    /// splits lane groups, replacements and one-shot appends identically.
+    /// splits lane groups, and replacements identically.
     pub use crate::grpc::pack_append;
 
     /// Whether the GCS-backed segment directory whose entries are currently

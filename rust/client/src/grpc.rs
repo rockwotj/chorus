@@ -1695,58 +1695,6 @@ impl Replica for GrpcReplica {
         ))
     }
 
-    async fn create_appendable(
-        &self,
-        metadata: HashMap<String, String>,
-    ) -> Result<ReplicaSnapshot, TransportError> {
-        let object = Object {
-            bucket: self.bucket.clone(),
-            name: self.object.clone(),
-            metadata: metadata.clone(),
-            content_type: "application/vnd.chorus.records".into(),
-            ..Default::default()
-        };
-        let request = BidiWriteObjectRequest {
-            first_message: Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(
-                WriteObjectSpec {
-                    resource: Some(object),
-                    if_generation_match: Some(0),
-                    appendable: Some(true),
-                    ..Default::default()
-                },
-            )),
-            write_offset: 0,
-            flush: true,
-            state_lookup: true,
-            ..Default::default()
-        };
-        let (_, error) = self
-            .drive_redirect_aware_stream(
-                vec![request],
-                || false,
-                |seen, _| *seen = true,
-                |seen| *seen,
-            )
-            .await;
-        if let Some(error) = error {
-            // The only precondition this request carries is
-            // `if_generation_match=0`; the live service reports the conflict
-            // as FAILED_PRECONDITION where the protocol expects AlreadyExists.
-            if error.code == TransportCode::FailedPrecondition {
-                return Err(TransportError {
-                    code: TransportCode::AlreadyExists,
-                    ..error
-                });
-            }
-            return Err(error);
-        }
-        // Appendable create responses report only persisted size, not the
-        // generation and metageneration required to guard the takeover open.
-        // A metadata-only read supplies those fields without reading the
-        // empty object body.
-        self.stat().await
-    }
-
     async fn create_append_session(
         &self,
         metadata: HashMap<String, String>,
@@ -1850,7 +1798,7 @@ impl Replica for GrpcReplica {
 
     async fn replace_appendable(
         &self,
-        observed: &ReplicaSnapshot,
+        observed: Option<&ReplicaSnapshot>,
         data: Bytes,
         metadata: HashMap<String, String>,
     ) -> Result<AppendToken, TransportError> {
@@ -1861,11 +1809,13 @@ impl Replica for GrpcReplica {
             content_type: "application/vnd.chorus.records".into(),
             ..Default::default()
         };
+        // Generation 0 means "only if absent"; a create carries no
+        // metageneration precondition.
         let requests = one_shot_write_requests(
             bidi_write_object_request::FirstMessage::WriteObjectSpec(WriteObjectSpec {
                 resource: Some(object),
-                if_generation_match: Some(observed.generation),
-                if_metageneration_match: Some(observed.metageneration),
+                if_generation_match: Some(observed.map_or(0, |observed| observed.generation)),
+                if_metageneration_match: observed.map(|observed| observed.metageneration),
                 appendable: Some(true),
                 ..Default::default()
             }),
@@ -1878,16 +1828,30 @@ impl Replica for GrpcReplica {
                 requests,
                 || None,
                 |persisted_size, response| {
-                    if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =
-                        response.write_status
-                    {
-                        *persisted_size = Some(size);
-                    }
+                    // A create answers its opening message with the new,
+                    // unfinalized object resource; later flushes report a
+                    // persisted size.
+                    let size = match response.write_status {
+                        Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) => size,
+                        Some(bidi_write_object_response::WriteStatus::Resource(object)) => {
+                            object.size
+                        }
+                        None => return,
+                    };
+                    *persisted_size = Some(persisted_size.map_or(size, |seen: i64| seen.max(size)));
                 },
                 |persisted_size| persisted_size.is_some_and(|size| size >= expected),
             )
             .await;
         if let Some(error) = error {
+            // Both report a lost race: the observed generation changed, or a
+            // create found the object already present.
+            if error.code == TransportCode::AlreadyExists {
+                return Err(TransportError {
+                    code: TransportCode::FailedPrecondition,
+                    ..error
+                });
+            }
             return Err(error);
         }
         if persisted_size != Some(expected) {
@@ -1910,61 +1874,6 @@ impl Replica for GrpcReplica {
             persisted_size: expected,
             write_handle: None,
         })
-    }
-
-    async fn append(
-        &self,
-        token: &AppendToken,
-        write_offset: i64,
-        data: Vec<u8>,
-    ) -> Result<i64, TransportError> {
-        let Some(generation) = token.generation else {
-            return Err(self.error(
-                TransportCode::Internal,
-                "one-shot append requires a generation-bound token",
-            ));
-        };
-        let expected = write_offset + data.len() as i64;
-        let requests = one_shot_write_requests(
-            bidi_write_object_request::FirstMessage::AppendObjectSpec(AppendObjectSpec {
-                bucket: self.bucket.clone(),
-                object: self.object.clone(),
-                generation,
-                if_metageneration_match: token.metageneration,
-                write_handle: token
-                    .write_handle
-                    .clone()
-                    .map(|handle| BidiWriteHandle { handle }),
-                ..Default::default()
-            }),
-            write_offset,
-            Bytes::from(data),
-        );
-        let (persisted_size, error) = self
-            .drive_redirect_aware_stream(
-                requests,
-                || None,
-                |persisted_size, response| {
-                    if let Some(bidi_write_object_response::WriteStatus::PersistedSize(size)) =
-                        response.write_status
-                    {
-                        *persisted_size = Some(size);
-                    }
-                },
-                |persisted_size| persisted_size.is_some_and(|size| size >= expected),
-            )
-            .await;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        match persisted_size {
-            Some(size) if size >= expected => Ok(size),
-            Some(size) => Err(self.error(
-                TransportCode::DataLoss,
-                format!("flush persisted {size}, expected at least {expected}"),
-            )),
-            None => Err(self.error(TransportCode::Internal, "missing persisted-size response")),
-        }
     }
 
     async fn lane_send(

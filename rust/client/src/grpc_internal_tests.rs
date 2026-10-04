@@ -235,11 +235,25 @@ async fn manifest_frontier_ids(
 async fn append_raw_bytes(factory: &Arc<dyn ReplicaFactory>, object: &str, bytes: Vec<u8>) {
     let replica = factory.replica(object);
     let observed = replica.stat().await.unwrap();
-    let mut token = replica.takeover(&observed).await.unwrap();
+    let token = replica.takeover(&observed).await.unwrap();
     let offset = token.persisted_size;
     let end = offset + bytes.len() as i64;
-    token.persisted_size = replica.append(&token, offset, bytes).await.unwrap();
-    assert_eq!(token.persisted_size, end);
+    replica
+        .lane_send(offset, &crate::grpc::pack_append(vec![bytes.into()]))
+        .await
+        .unwrap();
+    let mut durable = offset;
+    while durable < end {
+        let change = replica.lane_durable_change(durable).await.unwrap();
+        assert!(
+            change.error.is_none(),
+            "raw append failed: {:?}",
+            change.error
+        );
+        durable = change.persisted_size;
+    }
+    assert_eq!(durable, end);
+    replica.shutdown().await;
 }
 
 async fn append_raw_record(factory: &Arc<dyn ReplicaFactory>, object: &str, payload: &[u8]) {

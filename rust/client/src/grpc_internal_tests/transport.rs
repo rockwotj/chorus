@@ -136,22 +136,20 @@ async fn one_shot_writes_larger_than_the_inbound_cap_round_trip() {
             .unwrap();
     let replica = factory.replica("one-shot-over-cap");
     let cap = chorus_fake_gcs::INBOUND_MESSAGE_CAP_BYTES;
-    let appended: Vec<u8> = (0..2 * cap + 11).map(|index| index as u8).collect();
+    let created: bytes::Bytes = (0..2 * cap + 11).map(|index| index as u8).collect();
 
-    let created = replica.create_appendable(HashMap::new()).await.unwrap();
-    let token = replica.takeover(&created).await.unwrap();
-    let persisted = replica.append(&token, 0, appended.clone()).await.unwrap();
-    assert_eq!(persisted, appended.len() as i64);
+    let token = replica
+        .replace_appendable(None, created.clone(), HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(token.persisted_size, created.len() as i64);
     let observed = replica.snapshot().await.unwrap();
-    assert_eq!(observed.bytes, appended);
+    assert_eq!(observed.bytes, created);
 
-    // A fresh handle, as repair uses: `takeover` left a live session on the
-    // first one, and `finalize` would finish that session.
-    let replica = factory.replica("one-shot-over-cap");
     let replacement = bytes::Bytes::from(vec![0x5a; cap + 7]);
     let metadata = HashMap::from([("chorus.format".to_string(), "1".to_string())]);
     let mut token = replica
-        .replace_appendable(&observed, replacement.clone(), metadata.clone())
+        .replace_appendable(Some(&observed), replacement.clone(), metadata.clone())
         .await
         .unwrap();
     assert_eq!(token.persisted_size, replacement.len() as i64);
@@ -164,4 +162,30 @@ async fn one_shot_writes_larger_than_the_inbound_cap_round_trip() {
     assert!(replaced.finalized);
     assert_eq!(replaced.bytes, replacement);
     assert_eq!(replaced.metadata, metadata);
+}
+
+#[tokio::test]
+async fn replace_appendable_without_an_observation_creates_only_when_absent() {
+    let server = FakeGcs::default().start().await.unwrap();
+    let factory =
+        GrpcReplicaFactory::connect(0, &server.endpoint, "projects/_/buckets/zone-0", None)
+            .await
+            .unwrap();
+    let replica = factory.replica("create-if-absent");
+    let first = bytes::Bytes::from_static(b"first");
+    let token = replica
+        .replace_appendable(None, first.clone(), HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(token.persisted_size, first.len() as i64);
+
+    // A second create loses the race the same way a stale replace does.
+    let error = replica
+        .replace_appendable(None, bytes::Bytes::from_static(b"second"), HashMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+    let observed = replica.snapshot().await.unwrap();
+    assert_eq!(observed.bytes, first);
+    assert!(!observed.finalized);
 }

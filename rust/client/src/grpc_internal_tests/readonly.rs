@@ -108,7 +108,11 @@ async fn readonly_active_tail_survives_one_replaced_generation() {
     let mut replacement = original.bytes.to_vec();
     replacement.extend_from_slice(&record(b"minority-only").encode().unwrap());
     let replaced = replica
-        .replace_appendable(&original, replacement.into(), original.metadata.clone())
+        .replace_appendable(
+            Some(&original),
+            replacement.into(),
+            original.metadata.clone(),
+        )
         .await
         .unwrap();
     assert_ne!(replaced.generation.unwrap(), original.generation);

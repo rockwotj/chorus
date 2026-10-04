@@ -948,7 +948,9 @@ async fn recovery_accepts_a_live_and_finalized_empty_quorum() {
     // Model a prior recovery that finalized B at the empty boundary before
     // crashing. A remains a live empty witness and C is unavailable.
     let replica_b = factories[1].replica(&tail_object);
-    let mut token_b = replica_b.takeover_current().await.unwrap();
+    let mut token_b = crate::protocol::takeover_current(&*replica_b)
+        .await
+        .unwrap();
     assert_eq!(token_b.persisted_size, 0);
     let finalized_b = replica_b.finalize(&mut token_b, 0).await.unwrap();
     assert!(finalized_b.finalized);
@@ -996,7 +998,9 @@ async fn recovery_retains_a_finalized_size_when_its_redundant_read_fails() {
     // that finalized snapshot successfully, then its old redundant size read
     // fails after all three takeover observations have been counted.
     let replica_b = factories[1].replica(&tail_object);
-    let mut token_b = replica_b.takeover_current().await.unwrap();
+    let mut token_b = crate::protocol::takeover_current(&*replica_b)
+        .await
+        .unwrap();
     let size_b = token_b.persisted_size;
     replica_b.finalize(&mut token_b, size_b).await.unwrap();
     for server in &servers[..3] {
