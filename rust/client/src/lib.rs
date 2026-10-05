@@ -85,6 +85,8 @@ mod record;
 mod segment;
 #[cfg(feature = "slatedb")]
 pub mod slatedb;
+#[cfg(feature = "tcp")]
+mod tcp;
 mod transport;
 
 #[cfg(test)]
@@ -103,6 +105,8 @@ pub use segment::{
     ReadOnlyConfig, ReadOnlyFollower, Recovery, RecoveryTimings, RepairReport, SegmentedVolume,
     TruncationReport, WalRecord, WalSeqNo,
 };
+#[cfg(feature = "tcp")]
+pub use tcp::TcpReplicaFactory;
 pub use transport::TransportCode;
 
 /// Transport seam exposed only to the deterministic-simulation harness, which

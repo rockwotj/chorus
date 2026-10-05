@@ -20,12 +20,15 @@ probe-support = []
 dst-support = []
 # Chorus as a pluggable write-ahead log backend for SlateDB.
 slatedb = ["dep:slatedb"]
+# Transport for self-hosted Chorus storage nodes over TCP (`TcpReplicaFactory`).
+tcp = ["dep:chorus-wire", "tokio/io-util"]
 
 [dependencies]
 arc-swap.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+chorus-wire = { workspace = true, optional = true }
 crc32c.workspace = true
 futures.workspace = true
 googleapis-tonic-google-storage-v2.workspace = true

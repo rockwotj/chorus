@@ -801,6 +801,51 @@ mod recovery {
             )
         }
 
+        /// Bind a WAL namespace over self-hosted Chorus storage nodes reached
+        /// through [`crate::TcpReplicaFactory`], with the manifest register in a
+        /// caller-supplied [`ManifestStore`].
+        ///
+        /// Replica-count, ordering, and bucket-binding rules are those of
+        /// [`Self::new_with_manifest_store`]: list position is replica identity,
+        /// and each factory's bucket name is bound into `chorus.buckets`.
+        /// Available with the `tcp` feature.
+        #[cfg(feature = "tcp")]
+        pub fn new_tcp(
+            factories: Vec<crate::TcpReplicaFactory>,
+            manifest_store: Arc<dyn ManifestStore>,
+            prefix: impl Into<String>,
+            client_config: ClientConfig,
+        ) -> Result<Self, Error> {
+            Self::new_tcp_with_metrics_recorder(
+                factories,
+                manifest_store,
+                prefix,
+                client_config,
+                Arc::new(NoopMetricsRecorder),
+            )
+        }
+
+        /// [`Self::new_tcp`] with a metrics recorder.
+        #[cfg(feature = "tcp")]
+        pub fn new_tcp_with_metrics_recorder(
+            factories: Vec<crate::TcpReplicaFactory>,
+            manifest_store: Arc<dyn ManifestStore>,
+            prefix: impl Into<String>,
+            client_config: ClientConfig,
+            metrics_recorder: Arc<dyn MetricsRecorder>,
+        ) -> Result<Self, Error> {
+            Self::build(
+                factories
+                    .into_iter()
+                    .map(|factory| Arc::new(factory) as Arc<dyn ReplicaFactory>)
+                    .collect(),
+                manifest_store,
+                prefix.into().trim_end_matches('/').to_string(),
+                client_config,
+                metrics_recorder,
+            )
+        }
+
         #[cfg(test)]
         pub(crate) fn new_with_factories_and_manifest_store(
             factories: Vec<Arc<dyn ReplicaFactory>>,

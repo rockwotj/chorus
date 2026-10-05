@@ -452,6 +452,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chorus-fake-gcs",
+ "chorus-wire",
  "crc32c",
  "futures",
  "google-cloud-auth",
