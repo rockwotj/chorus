@@ -42,11 +42,17 @@ ServerFrame::Event(Event)
   flight, and each gets exactly one `Response` with the same `request_id`.
   The client chooses `request_id`, which must be unique among its in-flight
   requests (a counter works).
-- Requests that name the same session are applied in the order they arrive.
-  Requests on different sessions or objects may complete in any order.
-  Responses may come back out of order.
+- Requests from one connection are applied in the order they arrive. This
+  covers requests that name a session (`Append`, `Flush`) and requests that
+  name an object (`Finalize`, `Read`, ...) alike: a `Finalize` sent after a
+  run of `Append`s on that object's session sees every one of them. Requests
+  from different connections may be applied in any order relative to each
+  other. Responses may come back out of order.
 - `Event`s are unsolicited pushes about sessions opened on this connection.
-  They can arrive between any two responses.
+  They can arrive between any two responses, with one guarantee: the
+  `SessionOpened` response that creates a session is sent before any event
+  for that session. Clients ignore events for sessions they do not know (for
+  example ones they already closed).
 
 ## 3. Handshake
 
@@ -55,7 +61,10 @@ The first request on a connection must be
 
 - If `protocol_version == PROTOCOL_VERSION`, the server answers
   `HelloOk { node_id, protocol_version }`. `node_id` is stable across
-  restarts of the node.
+  restarts of the node. A client treats any other answer (including a
+  `HelloOk` with a different version) as a failed connect.
+- `client_name` is free-form (the Rust client sends `chorus-client/<version>`)
+  and only used for server logs.
 - Otherwise the server answers `Unimplemented` and closes the connection.
 - Any other request sent before a successful `Hello` fails with
   `InvalidArgument`.
@@ -91,6 +100,21 @@ one object generation. Opening a session returns:
 ```
 SessionOpened { session_id, generation, metageneration, persisted_size, write_handle }
 ```
+
+`generation` and `metageneration` are the object's exact current values, and
+`persisted_size` is its durable tail, which is also its accepted size: see
+the next paragraph.
+
+**An opened session starts with nothing in flight.** `Takeover` and `Resume`
+(and `CreateAppendable` / `ReplaceAppendable`, trivially) answer only after
+the object's accepted size equals its durable size: the server either makes
+every accepted byte durable first or truncates back to the durable tail.
+So `persisted_size` in `SessionOpened` is exactly the next append offset. This
+matters after a dropped connection: the writer resends its unacknowledged
+suffix from `persisted_size`, repacked into messages with different
+boundaries, and a resend that partly overlapped accepted-but-not-durable
+bytes would be a non-idempotent overlap (`FailedPrecondition`) that wrongly
+fences the writer. The reference server makes the bytes durable.
 
 - `session_id` is unique for the lifetime of the server process. It is
   **scoped to its connection**: only requests on the connection that opened
@@ -137,8 +161,14 @@ Returns metadata only. Stat is content-blind: it succeeds even when the
 stored bytes are corrupt. `NotFound` if the object is absent.
 
 ### `Read { bucket, object, offset }` -> `ReadData { info, bytes }`
-Atomically reads `info` and the durable bytes `[offset, info.persisted_size)`
-from the same generation. Offset `0` is a full snapshot.
+Atomically reads `info` and durable bytes starting at `offset` from the same
+generation. Offset `0` is a full snapshot.
+- `bytes` may be a **prefix** of `[offset, info.persisted_size)`: a server
+  caps one response (the reference server at 16 MiB, well under the 64 MiB
+  frame limit; segments are typically 256 MiB). A client keeps reading from
+  `offset + bytes.len()` until it reaches the `persisted_size` of the first
+  response, and fails the read if the generation changes in between.
+- `bytes` is empty only when `offset == persisted_size`.
 - `NotFound` if the object is absent.
 - `InvalidArgument` if `offset < 0`.
 - `OutOfRange` if `offset > persisted_size`. An offset equal to
@@ -175,6 +205,10 @@ Writes a new **unfinalized** generation that holds exactly `data` and
 - With `None`, the write applies only if no generation exists.
 - The answer is sent once the data and metadata are durable,
   `persisted_size == data.len()`.
+- Clients bound frame sizes by sending at most 8 MiB inline and the rest as
+  ordinary `Append`s on the new session (4 MiB each, `flush` on the last),
+  then waiting for `Durable` to reach the full length. The session stays
+  live afterwards and is later finalized with its handle.
 - The old generation's bytes are discarded, and its sessions are fenced with
   `FailedPrecondition`.
 - A lost race fails with `FailedPrecondition` in **both** modes. This is not
@@ -197,10 +231,14 @@ The `Accepted` answer means the request has been ordered into the object. It
 says nothing about durability. If `flush` is set, the server makes everything
 through `offset + data.len()` durable and then sends `Event::Durable`.
 
-An `Append` that fails (steps 2 to 5) also kills the session: the server sends
-`SessionFailed` with the same error. A pipelining client therefore sees the
-failure on the event channel it already waits on. Clients do not wait for
-`Accepted` on the hot path. They wait only for `Durable` / `SessionFailed`.
+An `Append` that fails (steps 2 to 6, including an `Internal` I/O failure)
+also kills the session: the server sends `SessionFailed` with the same error.
+A pipelining client therefore sees the failure on the event channel it
+already waits on. Clients do not wait for `Accepted` on the hot path, and
+never read `Append` / `Flush` responses at all: they wait only for `Durable` /
+`SessionFailed`. A request on a session that is already dead (step 1) sends no
+new event, since the session already got its one `SessionFailed` (or was
+closed quietly, in which case the client forgot it).
 
 The `data` payload is the only large field. A server may skip the
 deserialize copy by validating with `rkyv::access` and writing the archived
@@ -210,7 +248,8 @@ slice directly.
 Makes every accepted byte through `offset` durable, then sends
 `Event::Durable` (also when nothing new had to be synced, so a waiter always
 wakes). Session errors are the same as for `Append`. `offset > size` is
-`OutOfRange`.
+`OutOfRange`. As for `Append`, a failure also kills the session with
+`SessionFailed`.
 
 ### `Finalize { bucket, object, generation, write_offset, write_handle }` -> `Object(ObjectInfo)`
 Finalizes `generation` at exactly `write_offset` bytes. The answer is sent
@@ -232,6 +271,16 @@ performed the finalize, which is closed silently.
 - Before finalizing, the server makes accepted bytes durable. It then requires
   `write_offset == persisted_size`; otherwise `OutOfRange` if
   `write_offset > persisted_size`, else `FailedPrecondition`.
+- The answer's `ObjectInfo` has `finalized`, the requested `generation`, and
+  `size == persisted_size == write_offset`; a client treats anything else as
+  `DataLoss`.
+- The finishing session is the live session at the handle's epoch on the
+  requesting connection. The client does not send `CloseSession` for it.
+
+Clients send `generation` = the session's generation and
+`write_handle = Some(handle)` while their session is live, on the connection
+that carried its appends (so the finalize is ordered after them). Without a
+live session they send the saved handle, or `None` when they have none.
 
 ### `Delete { bucket, object, generation }` -> `Deleted`
 Deletes exactly that generation, finalized or not. All of the object's
@@ -243,8 +292,10 @@ sessions are fenced with `FailedPrecondition`.
 
 ### `CloseSession { session_id }` -> `SessionClosed`
 Detaches the session. It does not change the object or the epoch. The call is
-idempotent, and an unknown session also returns `SessionClosed`. The write
-handle still allows a later `Resume`.
+idempotent: an unknown, dead, or already closed session also returns
+`SessionClosed`, and no event is sent. The write handle still allows a later
+`Resume`. Clients close their old session this way before a `Resume`, so the
+resume does not have to fence it.
 
 ## 7. Events
 
@@ -260,7 +311,10 @@ connection is gone, the event is dropped.
 
 `WireError { code: WireCode, message }`. `message` is diagnostic text only;
 logic must not match on it. `WireCode` maps one to one, by variant name, onto
-`chorus_client::TransportCode`. The client attaches the replica's zone.
+`chorus_client::TransportCode`. The client attaches the replica's zone. As a
+defensive measure the Rust client maps a `FailedPrecondition` answer to
+`CreateAppendable` to `AlreadyExists`, and an `AlreadyExists` answer to
+`ReplaceAppendable` to `FailedPrecondition`.
 
 | code | used for |
 |---|---|

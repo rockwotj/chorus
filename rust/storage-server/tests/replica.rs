@@ -1,0 +1,351 @@
+//! The real TCP client (`TcpReplicaFactory`) against a real storage node.
+
+mod common;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use chorus_client::dst_support::pack_append;
+use chorus_client::{AppendToken, Replica, ReplicaFactory, TcpReplicaFactory, TransportCode};
+use common::TestNode;
+
+const BUCKET: &str = "zone-a";
+const STEP: Duration = Duration::from_secs(20);
+
+async fn connect(node: &TestNode) -> TcpReplicaFactory {
+    TcpReplicaFactory::connect(node.addr(), BUCKET, 0)
+        .await
+        .expect("connect")
+}
+
+fn metadata() -> HashMap<String, String> {
+    HashMap::from([("chorus.format".to_string(), "1".to_string())])
+}
+
+/// Wait until the lane's durable tail reaches `target`.
+async fn wait_durable(replica: &Arc<dyn Replica>, target: i64) {
+    let mut seen = -1;
+    while seen < target {
+        let change = tokio::time::timeout(STEP, replica.lane_durable_change(seen))
+            .await
+            .expect("durable progress")
+            .expect("lane healthy");
+        assert!(change.error.is_none(), "{:?}", change.error);
+        seen = change.persisted_size;
+    }
+    assert_eq!(seen, target);
+}
+
+/// The error the lane reports next (after any durable progress).
+async fn lane_error(replica: &Arc<dyn Replica>, seen: i64) -> TransportCode {
+    loop {
+        match tokio::time::timeout(STEP, replica.lane_durable_change(seen))
+            .await
+            .expect("lane outcome")
+        {
+            Ok(change) => {
+                if let Some(error) = change.error {
+                    return error.code;
+                }
+            }
+            Err(error) => return error.code,
+        }
+    }
+}
+
+async fn send(replica: &Arc<dyn Replica>, offset: i64, chunks: &[&[u8]]) {
+    let packed = pack_append(chunks.iter().map(|c| Bytes::copy_from_slice(c)).collect());
+    replica.lane_send(offset, &packed).await.expect("lane send");
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn append_lifecycle() {
+    let node = TestNode::start("lifecycle");
+    let factory = connect(&node).await;
+    assert_eq!(factory.node_id().as_deref(), Some("lifecycle"));
+    let replica = factory.replica("wal/seg-1");
+
+    let mut token = replica.create_append_session(metadata()).await.unwrap();
+    assert_eq!(token.persisted_size, 0);
+    send(&replica, 0, &[b"hello ", b"world"]).await;
+    wait_durable(&replica, 11).await;
+    send(&replica, 11, &[b"!"]).await;
+    wait_durable(&replica, 12).await;
+
+    let snapshot = replica.snapshot().await.unwrap();
+    assert_eq!(snapshot.bytes, b"hello world!");
+    assert_eq!(snapshot.persisted_size, 12);
+    assert!(!snapshot.finalized);
+    assert_eq!(snapshot.generation, token.generation.unwrap());
+    assert_eq!(snapshot.metadata["chorus.format"], "1");
+    let range = replica.read_range(6).await.unwrap();
+    assert_eq!(range.bytes, b"world!");
+    assert_eq!(range.generation, snapshot.generation);
+
+    // Stat is tail-blind while open.
+    let stat = replica.stat().await.unwrap();
+    assert!(!stat.finalized);
+    assert_eq!(stat.persisted_size, 0);
+
+    let finalized = replica.finalize(&mut token, 12).await.unwrap();
+    assert!(finalized.finalized);
+    assert_eq!(finalized.persisted_size, 12);
+    assert_eq!(finalized.crc32c, Some(crc32c::crc32c(b"hello world!")));
+
+    let stat = replica.stat().await.unwrap();
+    assert!(stat.finalized);
+    assert_eq!(stat.persisted_size, 12);
+    assert_eq!(stat.metageneration, 2);
+
+    let listed = factory.list("wal/").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "wal/seg-1");
+    assert_eq!(listed[0].size, 12);
+    assert!(listed[0].finalized);
+    assert_eq!(listed[0].crc32c, finalized.crc32c);
+    assert!(listed[0].last_modified.is_some());
+    assert!(factory.list("other/").await.unwrap().is_empty());
+
+    let wrong = replica.delete(stat.generation + 1).await.unwrap_err();
+    assert_eq!(wrong.code, TransportCode::FailedPrecondition);
+    replica.delete(stat.generation).await.unwrap();
+    assert_eq!(
+        replica.stat().await.unwrap_err().code,
+        TransportCode::NotFound
+    );
+    assert_eq!(
+        replica.snapshot().await.unwrap_err().code,
+        TransportCode::NotFound
+    );
+    assert_eq!(
+        replica.delete(stat.generation).await.unwrap_err().code,
+        TransportCode::NotFound
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_conflict() {
+    let node = TestNode::start("conflict");
+    let factory = connect(&node).await;
+    factory
+        .replica("seg")
+        .create_append_session(metadata())
+        .await
+        .unwrap();
+    let error = factory
+        .replica("seg")
+        .create_append_session(metadata())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, TransportCode::AlreadyExists);
+    assert_eq!(error.zone, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takeover_fences_the_old_writer() {
+    let node = TestNode::start("takeover");
+    let old_factory = connect(&node).await;
+    let new_factory = connect(&node).await;
+    let old = old_factory.replica("seg");
+    old.create_append_session(metadata()).await.unwrap();
+    send(&old, 0, &[b"abc"]).await;
+    wait_durable(&old, 3).await;
+
+    let new = new_factory.replica("seg");
+    let observed = new.snapshot().await.unwrap();
+    let mut token = new.takeover(&observed).await.unwrap();
+    assert_eq!(token.persisted_size, 3);
+
+    // The old lane learns it was fenced.
+    assert_eq!(lane_error(&old, 3).await, TransportCode::FailedPrecondition);
+
+    // The new writer continues and finalizes.
+    send(&new, 3, &[b"def"]).await;
+    wait_durable(&new, 6).await;
+    let finalized = new.finalize(&mut token, 6).await.unwrap();
+    assert!(finalized.finalized);
+    assert_eq!(new.snapshot().await.unwrap().bytes, b"abcdef");
+
+    // A takeover against a stale observation fails.
+    let error = new.takeover(&observed).await.unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_after_a_dropped_connection() {
+    let node = TestNode::start("resume");
+    let factory = connect(&node).await;
+    let replica = factory.replica("seg");
+    let mut token = replica.create_append_session(metadata()).await.unwrap();
+    send(&replica, 0, &[b"durable"]).await;
+    wait_durable(&replica, 7).await;
+    // Accepted but never flushed by the client.
+    let packed = pack_append(vec![Bytes::from_static(b"+unflushed")]);
+    replica.lane_send_unflushed(7, &packed).await.unwrap();
+    // The node applies one connection's requests in order, so once this
+    // answer arrives the append has been accepted.
+    replica.stat().await.unwrap();
+
+    // The node drops every connection; the lane sees its session end.
+    node.disconnect_all();
+    assert_eq!(lane_error(&replica, 7).await, TransportCode::Unavailable);
+
+    // Resume reconnects and reattaches; the answer covers every accepted
+    // byte, so the lane resends nothing twice.
+    let tail = replica.resume_tail(&mut token).await.unwrap();
+    assert_eq!(tail, 17);
+    send(&replica, 17, &[b"!"]).await;
+    wait_durable(&replica, 18).await;
+
+    // A second client resumes with the same token on its own connection;
+    // the first lane is displaced.
+    let other_factory = connect(&node).await;
+    let other = other_factory.replica("seg");
+    let mut other_token = token.clone();
+    assert_eq!(other.resume_tail(&mut other_token).await.unwrap(), 18);
+    assert_eq!(
+        lane_error(&replica, 18).await,
+        TransportCode::FailedPrecondition
+    );
+    send(&other, 18, &[b"?"]).await;
+    wait_durable(&other, 19).await;
+    other.finalize(&mut other_token, 19).await.unwrap();
+    assert_eq!(
+        other.snapshot().await.unwrap().bytes,
+        b"durable+unflushed!?"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_appendable() {
+    let node = TestNode::start("replace");
+    let factory = connect(&node).await;
+    let replica = factory.replica("seg");
+
+    let small = Bytes::from_static(b"first version");
+    let token = replica
+        .replace_appendable(None, small.clone(), metadata())
+        .await
+        .unwrap();
+    assert_eq!(token.persisted_size, small.len() as i64);
+    let observed = replica.snapshot().await.unwrap();
+    assert_eq!(observed.bytes, small);
+
+    // Create-if-absent loses once the object exists.
+    let error = replica
+        .replace_appendable(None, small.clone(), metadata())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+
+    // Larger than the inline limit: the rest streams through the session.
+    let large = Bytes::from(pattern(10 * 1024 * 1024 + 123, 7));
+    let mut token = replica
+        .replace_appendable(Some(&observed), large.clone(), metadata())
+        .await
+        .unwrap();
+    assert_eq!(token.persisted_size, large.len() as i64);
+    let snapshot = replica.snapshot().await.unwrap();
+    assert!(snapshot.generation > observed.generation);
+    assert_eq!(snapshot.bytes.len(), large.len());
+    assert!(snapshot.bytes == large);
+
+    // The stale observation no longer matches.
+    let error = replica
+        .replace_appendable(Some(&observed), small, metadata())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+
+    // The replacement session stays live and finalizes.
+    let finalized = replica
+        .finalize(&mut token, large.len() as i64)
+        .await
+        .unwrap();
+    assert_eq!(finalized.crc32c, Some(crc32c::crc32c(&large)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_object_reads_in_parts() {
+    let node = TestNode::start("large");
+    let factory = connect(&node).await;
+    let replica = factory.replica("seg");
+    let mut token = replica.create_append_session(metadata()).await.unwrap();
+    let data = pattern(20 * 1024 * 1024 + 17, 3);
+    for (index, chunk) in data.chunks(4 * 1024 * 1024).enumerate() {
+        send(&replica, (index * 4 * 1024 * 1024) as i64, &[chunk]).await;
+    }
+    wait_durable(&replica, data.len() as i64).await;
+
+    let snapshot = replica.snapshot().await.unwrap();
+    assert_eq!(snapshot.persisted_size, data.len() as i64);
+    assert!(snapshot.bytes == data);
+    let range = replica.read_range(1000).await.unwrap();
+    assert!(range.bytes == data[1000..]);
+
+    replica
+        .finalize(&mut token, data.len() as i64)
+        .await
+        .unwrap();
+    assert!(replica.snapshot().await.unwrap().bytes == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finalize_retries_are_idempotent() {
+    let node = TestNode::start("finalize");
+    let factory = connect(&node).await;
+    let replica = factory.replica("seg");
+    let mut token = replica.create_append_session(metadata()).await.unwrap();
+    send(&replica, 0, &[b"payload"]).await;
+    wait_durable(&replica, 7).await;
+    let first = replica.finalize(&mut token, 7).await.unwrap();
+
+    // Retry on the same replica (no live session any more: by handle).
+    let again = replica.finalize(&mut token, 7).await.unwrap();
+    assert_eq!(again, first);
+
+    // Retry from a fresh client with the saved token.
+    let other_factory = connect(&node).await;
+    let mut saved: AppendToken = token.clone();
+    let other = other_factory.replica("seg");
+    assert_eq!(other.finalize(&mut saved, 7).await.unwrap(), first);
+
+    // A different length is not a retry.
+    let error = other.finalize(&mut saved, 6).await.unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_free_finalize_after_takeover() {
+    let node = TestNode::start("handle-free");
+    let factory = connect(&node).await;
+    let replica = factory.replica("seg");
+    replica.create_append_session(metadata()).await.unwrap();
+    send(&replica, 0, &[b"xyz"]).await;
+    wait_durable(&replica, 3).await;
+    // A recovering writer without a handle finalizes as a takeover.
+    let observed = replica.snapshot().await.unwrap();
+    let mut token = AppendToken {
+        zone: 0,
+        generation: Some(observed.generation),
+        metageneration: Some(observed.metageneration),
+        persisted_size: 3,
+        write_handle: None,
+    };
+    let other_factory = connect(&node).await;
+    let other = other_factory.replica("seg");
+    let finalized = other.finalize(&mut token, 3).await.unwrap();
+    assert!(finalized.finalized);
+    assert_eq!(
+        lane_error(&replica, 3).await,
+        TransportCode::FailedPrecondition
+    );
+}
