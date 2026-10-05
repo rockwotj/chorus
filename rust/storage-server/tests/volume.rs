@@ -1,6 +1,7 @@
 //! End to end: a `SegmentedVolume` replicated over three storage nodes, with
 //! an in-memory manifest register.
 
+#[macro_use]
 mod common;
 
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use chorus_client::{
     ClientConfig, ManifestStore, ManifestStoreError, ManifestVersion, SegmentedVolume,
     TcpReplicaFactory, VersionedManifest, WalEngineConfig, WalHandle, WalSeqNo,
 };
-use common::TestNode;
+use common::{Backing, TestNode};
 use futures::TryStreamExt;
 
 const PREFIX: &str = "db/wal";
@@ -78,13 +79,22 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn start() -> Self {
+    fn start(backing: Backing) -> Self {
         Self {
             nodes: (0..3)
-                .map(|i| TestNode::start(&format!("node-{i}")))
+                .map(|i| TestNode::start_with(&format!("node-{i}"), backing))
                 .collect(),
             manifest: Arc::default(),
         }
+    }
+
+    /// Stop all three (disk) nodes and start them again on their data
+    /// directories. The manifest register lives on in this process.
+    fn restart(&mut self) {
+        self.nodes = std::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(TestNode::restart)
+            .collect();
     }
 
     /// A fresh client process: new connections, same nodes and register.
@@ -149,9 +159,8 @@ fn records(range: std::ops::Range<usize>) -> Vec<Bytes> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn wal_over_three_storage_nodes() {
-    let cluster = Cluster::start();
+async fn wal_over_three_storage_nodes(backing: Backing) {
+    let cluster = Cluster::start(backing);
 
     // First writer: an empty log.
     let (replayed, end, mut wal) = cluster.recover().await;
@@ -174,5 +183,43 @@ async fn wal_over_three_storage_nodes() {
     let (replayed, end, wal) = cluster.recover().await;
     assert_eq!(replayed, [first, second].concat());
     assert_eq!(end, WalSeqNo::record(9));
+    wal.shutdown().await.expect("clean shutdown");
+}
+
+for_each_backing!(wal_over_three_storage_nodes);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wal_survives_restarting_every_node() {
+    let mut cluster = Cluster::start(Backing::Disk);
+
+    // A sealed history plus an open segment left by a crashed writer.
+    let (_, end, mut wal) = cluster.recover().await;
+    let first = records(0..6);
+    let next = append_all(&mut wal, end, &first).await;
+    wal.shutdown().await.expect("clean shutdown");
+    let (replayed, end, mut wal) = cluster.recover().await;
+    assert_eq!(replayed, first);
+    assert_eq!(end, next);
+    let second = records(6..11);
+    append_all(&mut wal, end, &second).await;
+    drop(wal);
+
+    // Every node restarts from its data directory.
+    cluster.restart();
+
+    // Every acknowledged record is still there; the log goes on.
+    let (replayed, end, mut wal) = cluster.recover().await;
+    let acknowledged = [first, second].concat();
+    assert_eq!(replayed, acknowledged);
+    assert_eq!(end, WalSeqNo::record(11));
+    let third = records(11..14);
+    append_all(&mut wal, end, &third).await;
+    wal.shutdown().await.expect("clean shutdown");
+
+    // And once more, after a clean shutdown.
+    cluster.restart();
+    let (replayed, end, wal) = cluster.recover().await;
+    assert_eq!(replayed, [acknowledged, third].concat());
+    assert_eq!(end, WalSeqNo::record(14));
     wal.shutdown().await.expect("clean shutdown");
 }

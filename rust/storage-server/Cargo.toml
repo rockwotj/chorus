@@ -20,6 +20,8 @@ clap.workspace = true
 compio.workspace = true
 crc32c.workspace = true
 futures.workspace = true
+rkyv.workspace = true
+sha2.workspace = true
 socket2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,4 +29,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 chorus-client = { path = "../client", features = ["tcp", "dst-support"] }
+tempfile.workspace = true
 tokio.workspace = true

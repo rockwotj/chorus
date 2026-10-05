@@ -84,6 +84,12 @@ pub struct Recovered {
 ///
 /// Every method is awaited by the store while it holds the object's lock, so
 /// calls for one key are strictly sequential and arrive in request order.
+/// The one exception is [`Self::sync`] under group commit
+/// ([`crate::Store::enable_group_commit`]): it runs without the lock and may
+/// overlap any other call for the same key, including a `write` (the sync
+/// must cover at least every write that completed before it was called),
+/// a `commit_meta`, or a `create`/`delete` that discards its generation (it
+/// may then fail, which only affects sessions the store already fenced).
 /// A method returns only once its effect is in place; methods documented as
 /// durable must not return before an fsync/fdatasync covers the change.
 /// Errors surface to the client as `Internal`.

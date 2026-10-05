@@ -525,7 +525,10 @@ dependencies = [
  "compio",
  "crc32c",
  "futures",
+ "rkyv 0.8.18",
+ "sha2 0.10.9",
  "socket2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -634,6 +637,7 @@ checksum = "c19d81c636b0f47aa50041d25b02d9d8289a3319727a8051209f71bea10e89d6"
 dependencies = [
  "compio-buf",
  "compio-driver",
+ "compio-fs",
  "compio-io",
  "compio-log",
  "compio-macros",
@@ -692,6 +696,25 @@ dependencies = [
  "crossbeam-queue",
  "loom",
  "slotmap",
+]
+
+[[package]]
+name = "compio-fs"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a374c5a03bdf7ecb42894a49c3a40c22f743f8d7dc39cc21a5dd3258d8219c7"
+dependencies = [
+ "cfg_aliases",
+ "compio-buf",
+ "compio-driver",
+ "compio-io",
+ "compio-runtime",
+ "futures-util",
+ "libc",
+ "pin-project-lite",
+ "rustix",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 //! The real TCP client (`TcpReplicaFactory`) against a real storage node.
 
+#[macro_use]
 mod common;
 
 use std::collections::HashMap;
@@ -8,8 +9,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chorus_client::dst_support::pack_append;
-use chorus_client::{AppendToken, Replica, ReplicaFactory, TcpReplicaFactory, TransportCode};
-use common::TestNode;
+use chorus_client::{
+    AppendToken, ListedObject, Replica, ReplicaFactory, TcpReplicaFactory, TransportCode,
+};
+use common::{Backing, TestNode};
 
 const BUCKET: &str = "zone-a";
 const STEP: Duration = Duration::from_secs(20);
@@ -66,9 +69,8 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn append_lifecycle() {
-    let node = TestNode::start("lifecycle");
+async fn append_lifecycle(backing: Backing) {
+    let node = TestNode::start_with("lifecycle", backing);
     let factory = connect(&node).await;
     assert_eq!(factory.node_id().as_deref(), Some("lifecycle"));
     let replica = factory.replica("wal/seg-1");
@@ -131,9 +133,8 @@ async fn append_lifecycle() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn create_conflict() {
-    let node = TestNode::start("conflict");
+async fn create_conflict(backing: Backing) {
+    let node = TestNode::start_with("conflict", backing);
     let factory = connect(&node).await;
     factory
         .replica("seg")
@@ -149,9 +150,8 @@ async fn create_conflict() {
     assert_eq!(error.zone, 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn takeover_fences_the_old_writer() {
-    let node = TestNode::start("takeover");
+async fn takeover_fences_the_old_writer(backing: Backing) {
+    let node = TestNode::start_with("takeover", backing);
     let old_factory = connect(&node).await;
     let new_factory = connect(&node).await;
     let old = old_factory.replica("seg");
@@ -179,9 +179,8 @@ async fn takeover_fences_the_old_writer() {
     assert_eq!(error.code, TransportCode::FailedPrecondition);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn resume_after_a_dropped_connection() {
-    let node = TestNode::start("resume");
+async fn resume_after_a_dropped_connection(backing: Backing) {
+    let node = TestNode::start_with("resume", backing);
     let factory = connect(&node).await;
     let replica = factory.replica("seg");
     let mut token = replica.create_append_session(metadata()).await.unwrap();
@@ -224,9 +223,8 @@ async fn resume_after_a_dropped_connection() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn replace_appendable() {
-    let node = TestNode::start("replace");
+async fn replace_appendable(backing: Backing) {
+    let node = TestNode::start_with("replace", backing);
     let factory = connect(&node).await;
     let replica = factory.replica("seg");
 
@@ -273,9 +271,8 @@ async fn replace_appendable() {
     assert_eq!(finalized.crc32c, Some(crc32c::crc32c(&large)));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn large_object_reads_in_parts() {
-    let node = TestNode::start("large");
+async fn large_object_reads_in_parts(backing: Backing) {
+    let node = TestNode::start_with("large", backing);
     let factory = connect(&node).await;
     let replica = factory.replica("seg");
     let mut token = replica.create_append_session(metadata()).await.unwrap();
@@ -298,9 +295,8 @@ async fn large_object_reads_in_parts() {
     assert!(replica.snapshot().await.unwrap().bytes == data);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn finalize_retries_are_idempotent() {
-    let node = TestNode::start("finalize");
+async fn finalize_retries_are_idempotent(backing: Backing) {
+    let node = TestNode::start_with("finalize", backing);
     let factory = connect(&node).await;
     let replica = factory.replica("seg");
     let mut token = replica.create_append_session(metadata()).await.unwrap();
@@ -323,9 +319,8 @@ async fn finalize_retries_are_idempotent() {
     assert_eq!(error.code, TransportCode::FailedPrecondition);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn handle_free_finalize_after_takeover() {
-    let node = TestNode::start("handle-free");
+async fn handle_free_finalize_after_takeover(backing: Backing) {
+    let node = TestNode::start_with("handle-free", backing);
     let factory = connect(&node).await;
     let replica = factory.replica("seg");
     replica.create_append_session(metadata()).await.unwrap();
@@ -348,4 +343,106 @@ async fn handle_free_finalize_after_takeover() {
         lane_error(&replica, 3).await,
         TransportCode::FailedPrecondition
     );
+}
+
+for_each_backing!(
+    append_lifecycle,
+    create_conflict,
+    takeover_fences_the_old_writer,
+    resume_after_a_dropped_connection,
+    replace_appendable,
+    large_object_reads_in_parts,
+    finalize_retries_are_idempotent,
+    handle_free_finalize_after_takeover,
+);
+
+/// The comparable part of a listing (`last_modified` of an open object moves
+/// with every sync and is only persisted with metadata changes).
+fn listing(objects: &[ListedObject]) -> Vec<(String, i64, bool, i64, Option<u32>)> {
+    objects
+        .iter()
+        .map(|o| (o.name.clone(), o.generation, o.finalized, o.size, o.crc32c))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disk_node_survives_a_restart() {
+    let node = TestNode::start_with("restart", Backing::Disk);
+    let factory = connect(&node).await;
+
+    // An open object with a durable tail.
+    let open = factory.replica("wal/open");
+    let mut open_token = open.create_append_session(metadata()).await.unwrap();
+    send(&open, 0, &[b"abc", b"def"]).await;
+    wait_durable(&open, 6).await;
+
+    // A finalized object.
+    let done = factory.replica("wal/done");
+    let mut done_token = done.create_append_session(metadata()).await.unwrap();
+    send(&done, 0, &[b"xyz"]).await;
+    wait_durable(&done, 3).await;
+    let done_info = done.finalize(&mut done_token, 3).await.unwrap();
+
+    // An object taken over by a second writer.
+    let taken = factory.replica("wal/taken");
+    let mut taken_token = taken.create_append_session(metadata()).await.unwrap();
+    send(&taken, 0, &[b"12"]).await;
+    wait_durable(&taken, 2).await;
+    let other_factory = connect(&node).await;
+    let observed = other_factory.replica("wal/taken").snapshot().await.unwrap();
+    let mut takeover_token = other_factory
+        .replica("wal/taken")
+        .takeover(&observed)
+        .await
+        .unwrap();
+
+    // A deleted object.
+    let gone = factory.replica("wal/gone");
+    gone.create_append_session(metadata()).await.unwrap();
+    let gone_generation = gone.stat().await.unwrap().generation;
+    gone.delete(gone_generation).await.unwrap();
+
+    let before = factory.list("wal/").await.unwrap();
+    assert_eq!(before.len(), 3);
+    drop((factory, other_factory, open, done, taken, gone));
+
+    let node = node.restart();
+    let factory = connect(&node).await;
+    assert_eq!(factory.node_id().as_deref(), Some("restart"));
+    let after = factory.list("wal/").await.unwrap();
+    assert_eq!(listing(&after), listing(&before));
+
+    // The open object: same bytes, and the pre-restart handle resumes.
+    let open = factory.replica("wal/open");
+    let snapshot = open.snapshot().await.unwrap();
+    assert_eq!(snapshot.bytes, b"abcdef");
+    assert_eq!(snapshot.persisted_size, 6);
+    assert!(!snapshot.finalized);
+    assert_eq!(open.resume_tail(&mut open_token).await.unwrap(), 6);
+    send(&open, 6, &[b"ghi"]).await;
+    wait_durable(&open, 9).await;
+    let finalized = open.finalize(&mut open_token, 9).await.unwrap();
+    assert_eq!(finalized.crc32c, Some(crc32c::crc32c(b"abcdefghi")));
+
+    // The finalized object: same bytes, finalize retries still succeed.
+    let done = factory.replica("wal/done");
+    assert_eq!(done.snapshot().await.unwrap().bytes, b"xyz");
+    assert_eq!(done.finalize(&mut done_token, 3).await.unwrap(), done_info);
+
+    // The taken-over object: only the takeover's handle resumes.
+    let taken = factory.replica("wal/taken");
+    let error = taken.resume_tail(&mut taken_token).await.unwrap_err();
+    assert_eq!(error.code, TransportCode::FailedPrecondition);
+    let taken = factory.replica("wal/taken");
+    assert_eq!(taken.resume_tail(&mut takeover_token).await.unwrap(), 2);
+    send(&taken, 2, &[b"3"]).await;
+    wait_durable(&taken, 3).await;
+    assert_eq!(taken.snapshot().await.unwrap().bytes, b"123");
+
+    // The deleted object stays deleted; a new one gets a newer generation.
+    let gone = factory.replica("wal/gone");
+    assert_eq!(gone.stat().await.unwrap_err().code, TransportCode::NotFound);
+    let token = gone.create_append_session(metadata()).await.unwrap();
+    assert!(token.generation.unwrap() > gone_generation);
+    assert!(token.generation.unwrap() > takeover_token.generation.unwrap());
 }

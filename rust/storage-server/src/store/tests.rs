@@ -882,3 +882,235 @@ fn hello_is_not_a_store_request() {
     );
     assert_eq!(code(reply), WireCode::InvalidArgument);
 }
+
+/// Group commit: flushes run in a background task per object, off the
+/// request path, and coalesce.
+mod group_commit {
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::io;
+    use std::rc::Rc;
+    use std::task::Poll;
+
+    use futures::channel::oneshot;
+
+    use super::*;
+    use crate::backend::{Backend, ObjectKey, ObjectMeta, Recovered};
+
+    /// A memory backend whose next sync waits for a gate, and which counts
+    /// syncs.
+    #[derive(Default)]
+    struct GatedBackend {
+        inner: MemoryBackend,
+        syncs: Cell<usize>,
+        gate: RefCell<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl Backend for GatedBackend {
+        async fn recover(&self) -> io::Result<Recovered> {
+            self.inner.recover().await
+        }
+        async fn create(
+            &self,
+            key: &ObjectKey,
+            meta: &ObjectMeta,
+            data: Vec<u8>,
+        ) -> io::Result<()> {
+            self.inner.create(key, meta, data).await
+        }
+        async fn commit_meta(&self, key: &ObjectKey, meta: &ObjectMeta) -> io::Result<()> {
+            self.inner.commit_meta(key, meta).await
+        }
+        async fn write(
+            &self,
+            key: &ObjectKey,
+            generation: i64,
+            offset: u64,
+            data: Vec<u8>,
+        ) -> io::Result<()> {
+            self.inner.write(key, generation, offset, data).await
+        }
+        async fn sync(&self, key: &ObjectKey, generation: i64) -> io::Result<()> {
+            let gate = self.gate.borrow_mut().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.syncs.set(self.syncs.get() + 1);
+            self.inner.sync(key, generation).await
+        }
+        async fn read(
+            &self,
+            key: &ObjectKey,
+            generation: i64,
+            offset: u64,
+            len: usize,
+        ) -> io::Result<Vec<u8>> {
+            self.inner.read(key, generation, offset, len).await
+        }
+        async fn delete(&self, key: &ObjectKey, generation: i64) -> io::Result<()> {
+            self.inner.delete(key, generation).await
+        }
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    /// Let spawned tasks run.
+    async fn settle() {
+        for _ in 0..20 {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
+    fn conn(store: &Store<GatedBackend>) -> Conn {
+        let (outbox, frames) = mpsc::unbounded();
+        Conn {
+            ctx: ConnCtx {
+                id: store.new_connection_id(),
+                outbox,
+            },
+            frames: RefCell::new(frames),
+        }
+    }
+
+    fn append(session_id: u64, offset: i64, data: &[u8]) -> Request {
+        Request::Append {
+            session_id,
+            offset,
+            data: data.to_vec(),
+            crc32c: crc32c::crc32c(data),
+            flush: true,
+        }
+    }
+
+    async fn gated_store() -> (Rc<Store<GatedBackend>>, oneshot::Sender<()>) {
+        let store = Rc::new(Store::open("n", GatedBackend::default()).await.unwrap());
+        store.enable_group_commit();
+        let (open, gate) = oneshot::channel();
+        *store.backend().gate.borrow_mut() = Some(gate);
+        (store, open)
+    }
+
+    async fn create(store: &Store<GatedBackend>, conn: &Conn) -> SessionOpened {
+        match store
+            .handle(
+                &conn.ctx,
+                Request::CreateAppendable {
+                    bucket: BUCKET.into(),
+                    object: "seg".into(),
+                    metadata: HashMap::new(),
+                },
+            )
+            .await
+        {
+            Ok(Response::SessionOpened(opened)) => opened,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn flushes_do_not_block_requests_and_coalesce() {
+        run(async {
+            let (store, open) = gated_store().await;
+            let c = conn(&store);
+            let s = create(&store, &c).await.session_id;
+            store.handle(&c.ctx, append(s, 0, b"a")).await.unwrap();
+            settle().await;
+            // The first sync is stuck at the gate; appends still complete.
+            store.handle(&c.ctx, append(s, 1, b"b")).await.unwrap();
+            store.handle(&c.ctx, append(s, 2, b"c")).await.unwrap();
+            store
+                .handle(
+                    &c.ctx,
+                    Request::Flush {
+                        session_id: s,
+                        offset: 3,
+                    },
+                )
+                .await
+                .unwrap();
+            settle().await;
+            assert_events(c.events(), vec![]);
+            assert_eq!(store.backend().syncs.get(), 0);
+            open.send(()).unwrap();
+            settle().await;
+            // One sync for "a", one for everything queued behind it.
+            assert_eq!(store.backend().syncs.get(), 2);
+            assert_events(c.events(), vec![durable(s, 1), durable(s, 3)]);
+            // A flush with nothing new still reports.
+            store
+                .handle(
+                    &c.ctx,
+                    Request::Flush {
+                        session_id: s,
+                        offset: 3,
+                    },
+                )
+                .await
+                .unwrap();
+            settle().await;
+            assert_eq!(store.backend().syncs.get(), 2);
+            assert_events(c.events(), vec![durable(s, 3)]);
+        });
+    }
+
+    #[test]
+    fn a_fenced_session_gets_no_durable_after_its_failure() {
+        run(async {
+            let (store, open) = gated_store().await;
+            let c = conn(&store);
+            let opened = create(&store, &c).await;
+            let s = opened.session_id;
+            store.handle(&c.ctx, append(s, 0, b"abc")).await.unwrap();
+            settle().await;
+            // A takeover syncs inline (the gate is taken) and fences s while
+            // the background sync is still waiting.
+            let other = conn(&store);
+            let reply = store
+                .handle(
+                    &other.ctx,
+                    Request::Takeover {
+                        bucket: BUCKET.into(),
+                        object: "seg".into(),
+                        if_match: ObjectVersion {
+                            generation: opened.generation,
+                            metageneration: opened.metageneration,
+                        },
+                    },
+                )
+                .await;
+            let Ok(Response::SessionOpened(taken)) = reply else {
+                panic!("{reply:?}");
+            };
+            assert_eq!(taken.persisted_size, 3);
+            open.send(()).unwrap();
+            settle().await;
+            assert_events(c.events(), vec![failed(s, WireCode::FailedPrecondition)]);
+            // The durable size never went backwards.
+            let Ok(Response::Object(info)) = store
+                .handle(
+                    &other.ctx,
+                    Request::Stat {
+                        bucket: BUCKET.into(),
+                        object: "seg".into(),
+                    },
+                )
+                .await
+            else {
+                panic!("stat");
+            };
+            assert_eq!(info.persisted_size, 3);
+        });
+    }
+}

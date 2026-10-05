@@ -22,6 +22,7 @@ use compio::buf::BufResult;
 use compio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream, ToSocketAddrsAsync};
 use futures::channel::mpsc;
+use futures::future::Either;
 use futures::StreamExt;
 
 use crate::backend::Backend;
@@ -35,6 +36,7 @@ const WRITE_BATCH_BYTES: usize = 256 * 1024;
 /// Commands from a [`ServerControl`].
 enum Command {
     DisconnectAll,
+    Shutdown,
 }
 
 /// Thread-safe handle for poking a running [`Server`] from outside its
@@ -49,6 +51,13 @@ impl ServerControl {
     /// network failure would. Their sessions close; objects are unaffected.
     pub fn disconnect_all(&self) {
         let _ = self.commands.unbounded_send(Command::DisconnectAll);
+    }
+
+    /// Stop accepting, close every connection, and make [`Server::run`]
+    /// return. Tasks still running on the runtime (connection teardown,
+    /// background syncs) end when the runtime is dropped.
+    pub fn shutdown(&self) {
+        let _ = self.commands.unbounded_send(Command::Shutdown);
     }
 }
 
@@ -87,7 +96,7 @@ impl<B: Backend + 'static> Server<B> {
         self.control.clone()
     }
 
-    /// Accept and serve connections forever.
+    /// Accept and serve connections until [`ServerControl::shutdown`].
     pub async fn run(self) -> io::Result<()> {
         let Server {
             listener,
@@ -98,12 +107,21 @@ impl<B: Backend + 'static> Server<B> {
         } = self;
         drop(control);
         let registry = Rc::clone(&connections);
+        let (stop_tx, stop) = futures::channel::oneshot::channel::<()>();
         compio::runtime::spawn(async move {
+            let mut stop_tx = Some(stop_tx);
             while let Some(command) = commands.next().await {
+                let close_all = || {
+                    for stream in registry.borrow().values() {
+                        shutdown(stream);
+                    }
+                };
                 match command {
-                    Command::DisconnectAll => {
-                        for stream in registry.borrow().values() {
-                            shutdown(stream);
+                    Command::DisconnectAll => close_all(),
+                    Command::Shutdown => {
+                        close_all();
+                        if let Some(stop_tx) = stop_tx.take() {
+                            let _ = stop_tx.send(());
                         }
                     }
                 }
@@ -111,8 +129,25 @@ impl<B: Backend + 'static> Server<B> {
         })
         .detach();
         tracing::info!(addr = %listener.local_addr()?, node_id = store.node_id(), "listening");
+        // `None` once every control handle is gone: nobody can stop us.
+        let mut stop = Some(stop);
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let accept = std::pin::pin!(listener.accept());
+            let accepted = match stop.as_mut() {
+                None => accept.await,
+                Some(stop_rx) => match futures::future::select(accept, stop_rx).await {
+                    Either::Left((accepted, _)) => accepted,
+                    Either::Right((Ok(()), _)) => {
+                        tracing::info!("shutting down");
+                        return Ok(());
+                    }
+                    Either::Right((Err(_canceled), accept)) => {
+                        stop = None;
+                        accept.await
+                    }
+                },
+            };
+            let (stream, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     tracing::warn!(%error, "accept failed");
@@ -132,7 +167,7 @@ fn shutdown(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).shutdown(Shutdown::Both);
 }
 
-async fn serve_connection<B: Backend>(
+async fn serve_connection<B: Backend + 'static>(
     store: Rc<Store<B>>,
     connections: Registry,
     stream: TcpStream,
@@ -156,7 +191,7 @@ async fn serve_connection<B: Backend>(
     tracing::debug!(%peer, "connection closed");
 }
 
-async fn read_loop<B: Backend>(store: &Store<B>, conn: &ConnCtx, mut stream: TcpStream) {
+async fn read_loop<B: Backend + 'static>(store: &Store<B>, conn: &ConnCtx, mut stream: TcpStream) {
     let mut buf = BytesMut::with_capacity(READ_BUF_BYTES);
     let mut greeted = false;
     loop {
@@ -193,7 +228,7 @@ async fn read_loop<B: Backend>(store: &Store<B>, conn: &ConnCtx, mut stream: Tcp
 }
 
 /// Apply one frame. Returns `false` when the connection must close.
-async fn handle_frame<B: Backend>(
+async fn handle_frame<B: Backend + 'static>(
     store: &Store<B>,
     conn: &ConnCtx,
     greeted: &mut bool,

@@ -16,6 +16,26 @@
 //! The connection layer awaits each request before decoding the next one, so
 //! requests from one connection are applied in arrival order.
 //!
+//! # Group commit
+//!
+//! By default a flush (`Flush`, or `Append` with `flush`) syncs inline while
+//! holding the object lock, so the connection's next request waits for the
+//! fdatasync. After [`Store::enable_group_commit`], a flush only records the
+//! session as a waiter on its object and returns. One background task per
+//! object (started on demand, exiting when idle) repeatedly snapshots the
+//! accepted size, calls [`Backend::sync`] *without* the object lock, raises
+//! the durable size to the snapshot, and sends `Durable` to every waiter that
+//! is still live. Flushes that arrive during a sync are coalesced into the
+//! next one. Appends keep being written (and ordered) under the lock while a
+//! sync runs; a sync covers every write that completed before it started,
+//! which is exactly the snapshot. The durable size only ever grows (to the
+//! larger of concurrent sync results), and every `Durable` carries the
+//! object's durable size at emission time, so events stay monotonic per
+//! session. `Takeover`, `Resume` and `Finalize` still sync inline before they
+//! answer. A session that died meanwhile gets no `Durable` (its
+//! `SessionFailed` stays its last event), and a waiter only exists after its
+//! session's `SessionOpened` was queued.
+//!
 //! A newly opened session is registered after the last `.await` of the
 //! opening request, so no event for it can be queued before the caller
 //! queues the `SessionOpened` response.
@@ -25,6 +45,7 @@ mod tests;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,6 +125,15 @@ fn decode_handle(bytes: &[u8]) -> Result<WriteHandle, WireError> {
         .ok_or_else(|| error(WireCode::InvalidArgument, "malformed write handle"))
 }
 
+/// Pending group-commit flushes of one object generation.
+#[derive(Debug, Default)]
+struct FlushQueue {
+    /// Sessions owed a `Durable` once the next sync completes.
+    waiters: Vec<SessionId>,
+    /// Whether a group-commit task is running for this generation.
+    running: bool,
+}
+
 /// One live object generation.
 #[derive(Debug)]
 struct Object {
@@ -114,9 +144,22 @@ struct Object {
     /// Bytes durable.
     durable: u64,
     durable_crc: u32,
+    flush: FlushQueue,
 }
 
 impl Object {
+    /// An object whose `size` bytes (with checksum `crc`) are all durable.
+    fn new(meta: ObjectMeta, size: u64, crc: u32) -> Self {
+        Self {
+            meta,
+            accepted: size,
+            accepted_crc: crc,
+            durable: size,
+            durable_crc: crc,
+            flush: FlushQueue::default(),
+        }
+    }
+
     fn info(&self, name: &str) -> ObjectInfo {
         ObjectInfo {
             name: name.to_string(),
@@ -295,9 +338,12 @@ pub struct Store<B> {
     /// Per-object operation locks; an entry exists while someone holds or
     /// waits for it.
     locks: RefCell<HashMap<ObjectKey, Arc<Mutex<()>>>>,
+    /// Set by [`Store::enable_group_commit`]: the store itself, for spawning
+    /// background sync tasks.
+    group_commit: RefCell<Option<Weak<Self>>>,
 }
 
-impl<B: Backend> Store<B> {
+impl<B: Backend + 'static> Store<B> {
     /// Open the store, loading whatever the backend recovers.
     pub async fn open(node_id: impl Into<String>, backend: B) -> std::io::Result<Self> {
         let recovered = backend.recover().await?;
@@ -309,13 +355,7 @@ impl<B: Backend> Store<B> {
             state.last_generation = state.last_generation.max(object.meta.generation);
             state.objects.insert(
                 object.key,
-                Object {
-                    meta: object.meta,
-                    accepted: object.durable_size,
-                    accepted_crc: object.durable_crc32c,
-                    durable: object.durable_size,
-                    durable_crc: object.durable_crc32c,
-                },
+                Object::new(object.meta, object.durable_size, object.durable_crc32c),
             );
         }
         Ok(Self {
@@ -323,7 +363,21 @@ impl<B: Backend> Store<B> {
             backend,
             state: RefCell::new(state),
             locks: RefCell::new(HashMap::new()),
+            group_commit: RefCell::new(None),
         })
+    }
+
+    /// Run flushes in background per-object tasks that coalesce concurrent
+    /// flushes (see the module docs), so a flush does not hold up the
+    /// connection's next request. Call within the compio runtime that serves
+    /// the store; the tasks are spawned on it.
+    pub fn enable_group_commit(self: &Rc<Self>) {
+        *self.group_commit.borrow_mut() = Some(Rc::downgrade(self));
+    }
+
+    /// Number of objects in the table (for diagnostics).
+    pub fn object_count(&self) -> usize {
+        self.state.borrow().objects.len()
     }
 
     /// Stable identity reported in `HelloOk`.
@@ -555,16 +609,7 @@ impl<B: Backend> Store<B> {
             .map_err(|io| internal("create", io))?;
         let mut state = self.state.borrow_mut();
         let (generation, epoch) = (meta.generation, meta.writer_epoch);
-        state.objects.insert(
-            key.clone(),
-            Object {
-                meta,
-                accepted: 0,
-                accepted_crc: 0,
-                durable: 0,
-                durable_crc: 0,
-            },
-        );
+        state.objects.insert(key.clone(), Object::new(meta, 0, 0));
         let session_id = state.open_session(conn, key, generation, epoch);
         Ok(Response::SessionOpened(state.opened(session_id, key)))
     }
@@ -589,12 +634,109 @@ impl<B: Backend> Store<B> {
             .sync(key, generation)
             .await
             .map_err(|io| internal("sync", io))?;
+        self.advance_durable(key, generation, accepted, accepted_crc);
+        Ok(self.state.borrow().object(key)?.durable)
+    }
+
+    /// Record that the first `size` bytes (checksum `crc`) of `generation`
+    /// are durable. A concurrent group-commit sync may already have recorded
+    /// more; the durable size never goes back.
+    fn advance_durable(&self, key: &ObjectKey, generation: i64, size: u64, crc: u32) {
         let mut state = self.state.borrow_mut();
-        let object = state.object_mut(key)?;
-        object.durable = accepted;
-        object.durable_crc = accepted_crc;
-        object.meta.last_modified_unix_nanos = now_nanos();
-        Ok(accepted)
+        if let Some(object) = state.objects.get_mut(key) {
+            if object.meta.generation == generation && size > object.durable {
+                object.durable = size;
+                object.durable_crc = crc;
+                object.meta.last_modified_unix_nanos = now_nanos();
+            }
+        }
+    }
+
+    /// Make the session's object durable through its accepted size and send
+    /// the session `Durable`: inline, or (with group commit) by queueing the
+    /// session for the object's background sync task. The caller holds the
+    /// object lock.
+    async fn request_flush(&self, key: &ObjectKey, session_id: SessionId) -> Result<(), WireError> {
+        let store = self.group_commit.borrow().as_ref().and_then(Weak::upgrade);
+        let Some(store) = store else {
+            return self.flush_session(key, session_id).await;
+        };
+        let generation = {
+            let mut state = self.state.borrow_mut();
+            let object = state.object_mut(key)?;
+            object.flush.waiters.push(session_id);
+            if object.flush.running {
+                return Ok(());
+            }
+            object.flush.running = true;
+            object.meta.generation
+        };
+        let key = key.clone();
+        compio::runtime::spawn(async move { store.group_commit_loop(key, generation).await })
+            .detach();
+        Ok(())
+    }
+
+    /// The background sync task of one object generation: sync, report to
+    /// the waiters, repeat while there are waiters.
+    async fn group_commit_loop(&self, key: ObjectKey, generation: i64) {
+        loop {
+            let (target, target_crc, durable, waiters) = {
+                let mut state = self.state.borrow_mut();
+                let Some(object) = state
+                    .objects
+                    .get_mut(&key)
+                    .filter(|object| object.meta.generation == generation)
+                else {
+                    // Deleted or replaced; its sessions were fenced.
+                    return;
+                };
+                if object.flush.waiters.is_empty() {
+                    object.flush.running = false;
+                    return;
+                }
+                (
+                    object.accepted,
+                    object.accepted_crc,
+                    object.durable,
+                    std::mem::take(&mut object.flush.waiters),
+                )
+            };
+            if target > durable {
+                if let Err(io) = self.backend.sync(&key, generation).await {
+                    let error = internal("sync", io);
+                    let mut state = self.state.borrow_mut();
+                    for session_id in waiters {
+                        state.fail_session(session_id, &error);
+                    }
+                    continue;
+                }
+                self.advance_durable(&key, generation, target, target_crc);
+            }
+            let state = self.state.borrow();
+            let Some(object) = state
+                .objects
+                .get(&key)
+                .filter(|object| object.meta.generation == generation)
+            else {
+                return;
+            };
+            let mut notified = Vec::with_capacity(waiters.len());
+            for session_id in waiters {
+                if notified.contains(&session_id) {
+                    continue;
+                }
+                notified.push(session_id);
+                if let Some(session) = state.sessions.get(&session_id) {
+                    if session.dead.is_none() {
+                        session.emit(Event::Durable {
+                            session_id,
+                            persisted_size: object.durable as i64,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Bump the writer epoch of an unfinalized object durably, after making
@@ -701,16 +843,9 @@ impl<B: Backend> Store<B> {
         let mut state = self.state.borrow_mut();
         state.fence_sessions(key, None, &precondition("object replaced"));
         let (generation, epoch) = (meta.generation, meta.writer_epoch);
-        state.objects.insert(
-            key.clone(),
-            Object {
-                meta,
-                accepted: len,
-                accepted_crc: crc,
-                durable: len,
-                durable_crc: crc,
-            },
-        );
+        state
+            .objects
+            .insert(key.clone(), Object::new(meta, len, crc));
         let session_id = state.open_session(conn, key, generation, epoch);
         Ok(Response::SessionOpened(state.opened(session_id, key)))
     }
@@ -826,7 +961,7 @@ impl<B: Backend> Store<B> {
             object.accepted_crc = new_crc;
         }
         if flush {
-            self.flush_session(&key, session_id)
+            self.request_flush(&key, session_id)
                 .await
                 .map_err(|error| self.fail(session_id, error))?;
         }
@@ -846,7 +981,7 @@ impl<B: Backend> Store<B> {
                 ),
             ));
         }
-        self.flush_session(&key, session_id)
+        self.request_flush(&key, session_id)
             .await
             .map_err(|error| self.fail(session_id, error))?;
         Ok(Response::Accepted {
