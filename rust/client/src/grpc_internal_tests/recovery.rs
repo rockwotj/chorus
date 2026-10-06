@@ -820,14 +820,26 @@ async fn repair_skips_failed_listings_without_blocking_other_zones() {
             replica.delete(generation).await.unwrap();
         }
         servers[1].service.reset_operation_counts().await;
-        servers[1].service.inject(Operation::List, code).await;
+        // A transient failure must exhaust the page retry budget before this
+        // zone becomes Unknown; a permanent failure still stops immediately.
+        let attempts = if code == Code::Unavailable {
+            ClientConfig::default().max_retries + 1
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            servers[1].service.inject(Operation::List, code).await;
+        }
 
         let report = writer.repair_sealed_segments().await.unwrap();
         assert_eq!(report.objects_repaired, 1);
         assert_eq!(report.objects_already_healthy, 1);
         assert_eq!(report.transient_failures, 1);
         assert_eq!(report.segments_without_source, 0);
-        assert_eq!(servers[1].service.operation_count(Operation::List).await, 1);
+        assert_eq!(
+            servers[1].service.operation_count(Operation::List).await,
+            attempts as u64
+        );
         assert_eq!(servers[1].service.operation_count(Operation::Get).await, 0);
         assert_eq!(servers[1].service.operation_count(Operation::Read).await, 0);
         assert_eq!(
