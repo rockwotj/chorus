@@ -44,7 +44,7 @@ fn select_recovery_size(sizes: &mut [i64], replica_count: usize) -> Option<i64> 
 }
 
 #[derive(Clone, Debug)]
-/// Retry policy for transport operations used by recovery and writes.
+/// Retry policy for transport operations used by recovery, writes, and listing.
 ///
 /// Only transient transport codes are retried. `FAILED_PRECONDITION` and
 /// append-open `ABORTED` are terminal fencing signals and stop the writer.
@@ -1842,7 +1842,10 @@ fn prefer_lower_zone(current: &mut Option<TransportError>, candidate: TransportE
 /// Run `op` again after each transient failure, up to `config.max_retries`
 /// retries with backoff. Any other failure, or the last transient one, is
 /// returned to the caller.
-async fn with_retry<T, F, Fut>(config: &ClientConfig, mut op: F) -> Result<T, TransportError>
+pub(crate) async fn with_retry<T, F, Fut>(
+    config: &ClientConfig,
+    mut op: F,
+) -> Result<T, TransportError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, TransportError>>,

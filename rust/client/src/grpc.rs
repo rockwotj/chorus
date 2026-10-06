@@ -21,6 +21,7 @@ use tonic::{Code, Request, Status, Streaming};
 
 use crate::auth::BearerAuth;
 use crate::error::Error;
+use crate::protocol::{with_retry, ClientConfig};
 use crate::transport::{
     AppendSessionId, AppendToken, LaneDurableChange, LaneSessionDiagnostics, ListedObject,
     PackedAppend, PackedAppendMessage, Replica, ReplicaFactory, ReplicaRangeRead, ReplicaSnapshot,
@@ -1343,24 +1344,32 @@ impl ReplicaFactory for GrpcReplicaFactory {
             read_session: Arc::new(SessionMutex::new(None)),
             session: Arc::new(SessionSlot::new()),
         };
+        let config = ClientConfig::default();
         let mut page_token = String::new();
         let mut seen_page_tokens = HashSet::new();
         let mut listed = Vec::new();
         for _ in 0..MAX_LIST_PAGES {
-            let request = replica.request(ListObjectsRequest {
-                parent: self.bucket.clone(),
-                page_size: 1000,
-                page_token,
-                prefix: prefix.to_string(),
-                ..Default::default()
-            })?;
-            let response = self
-                .client
-                .clone()
-                .list_objects(request)
-                .await
-                .map_err(|status| replica.status(status))?
-                .into_inner();
+            // Retry the same read-only page, rebuilding auth and the RPC
+            // deadline each time. Advance pagination and append objects only
+            // after success; a failed page must discard the entire listing so
+            // repair keeps this zone Unknown instead of inferring absent copies.
+            let response = with_retry(&config, || async {
+                let request = replica.request(ListObjectsRequest {
+                    parent: self.bucket.clone(),
+                    page_size: 1000,
+                    page_token: page_token.clone(),
+                    prefix: prefix.to_string(),
+                    ..Default::default()
+                })?;
+                tokio::time::timeout(RPC_TIMEOUT, self.client.clone().list_objects(request))
+                    .await
+                    .map_err(|_| {
+                        replica.error(TransportCode::DeadlineExceeded, "ListObjects timed out")
+                    })?
+                    .map_err(|status| replica.status(status))
+                    .map(|response| response.into_inner())
+            })
+            .await?;
             listed.extend(response.objects.into_iter().map(|object| {
                 ListedObject {
                     zone: self.zone,
