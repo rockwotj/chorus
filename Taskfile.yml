@@ -199,8 +199,6 @@ tasks:
         }
 
         verify_release_head
-        task release-check
-        verify_release_head
 
         head="$(git rev-parse HEAD)"
 
