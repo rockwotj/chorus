@@ -5,7 +5,8 @@
 //! other (repair must never recreate history a deletion pass is removing) and
 //! concurrent with the append engine — none blocks recovery or a single append.
 //! The task owns an epoch-free manifest handle: only an application command
-//! raises `chorus.trunc`, while startup and periodic ticks merely retry
+//! raises `chorus.trunc`, and that CAS is conditional on the writer claim the
+//! task was started with. Startup and periodic ticks merely retry
 //! generation-matched deletes already authorized by a committed floor or
 //! recovery epoch. Sealed-catalog snapshots arrive from the engine through a
 //! watch channel after every rotation.
@@ -18,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use crate::error::Error;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, WriterClaim};
 use crate::manifest_store::ManifestStore;
 use crate::metrics::Metrics;
 use crate::protocol::{retry_sleep, ClientConfig};
@@ -126,6 +127,9 @@ impl MaintenanceHandle {
 pub(crate) struct MaintenanceConfig {
     pub factories: Vec<Arc<dyn ReplicaFactory>>,
     pub manifest_store: Arc<dyn ManifestStore>,
+    /// The engine writer's claim. Truncation raises the floor only while it
+    /// still owns the register.
+    pub claim: WriterClaim,
     pub bucket_names: Vec<String>,
     pub prefix: String,
     pub client_config: ClientConfig,
@@ -156,6 +160,7 @@ pub(crate) fn start(
 struct MaintenanceState {
     factories: Vec<Arc<dyn ReplicaFactory>>,
     manifest_store: Arc<dyn ManifestStore>,
+    claim: WriterClaim,
     bucket_names: Vec<String>,
     prefix: String,
     client_config: ClientConfig,
@@ -189,6 +194,7 @@ async fn run(
     let mut task = MaintenanceState {
         factories: config.factories,
         manifest_store: config.manifest_store,
+        claim: config.claim,
         bucket_names: config.bucket_names,
         prefix: config.prefix,
         client_config: config.client_config,
@@ -878,6 +884,7 @@ impl MaintenanceState {
             &mut self.catalog,
             &mut self.checkpoint_floor,
             &mut manifest,
+            &self.claim,
             floor,
         )
         .await;

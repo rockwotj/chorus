@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::manifest::{
-    Manifest, ManifestAccess, ManifestRecord, ManifestUpdate, PendingFold, MANIFEST_OBJECT,
+    Manifest, ManifestAccess, ManifestRecord, ManifestUpdate, PendingFold, WriterClaim,
+    MANIFEST_OBJECT,
 };
 use crate::manifest_store::{GcsManifestStore, ManifestStore};
 use crate::metrics::{Metrics, MetricsRecorder, NoopMetricsRecorder};
@@ -2493,12 +2494,14 @@ mod writer {
             &mut self,
             floor: WalSeqNo,
         ) -> Result<TruncationReport, Error> {
+            let claim = self.manifest.writer_claim().map_err(Error::from)?;
             truncate_pass(
                 &self.factories,
                 &self.prefix,
                 &mut self.sealed_segments,
                 &mut self.checkpoint_floor,
                 &mut self.manifest,
+                &claim,
                 floor,
             )
             .await
@@ -2509,17 +2512,18 @@ mod writer {
         pub(crate) fn maintenance_config(
             &self,
             repair_interval: Option<std::time::Duration>,
-        ) -> crate::maintenance::MaintenanceConfig {
-            crate::maintenance::MaintenanceConfig {
+        ) -> Result<crate::maintenance::MaintenanceConfig, Error> {
+            Ok(crate::maintenance::MaintenanceConfig {
                 factories: self.factories.clone(),
                 manifest_store: self.manifest.store(),
+                claim: self.manifest.writer_claim().map_err(Error::from)?,
                 bucket_names: self.manifest.bucket_names().to_vec(),
                 prefix: self.prefix.clone(),
                 client_config: self.client_config.clone(),
                 checkpoint_floor: self.checkpoint_floor,
                 dead_segment_sweep: self.dead_segment_sweep.clone(),
                 repair_interval,
-            }
+            })
         }
 
         /// Snapshot of the sealed catalog for the maintenance watch channel.
@@ -3333,9 +3337,10 @@ mod maintenance {
 
     /// One floor-committed truncation pass, free of writer state so the
     /// background maintenance task can run it (serialized with repair on the
-    /// same task) concurrently with appends. The truncator discipline is
-    /// epoch-free: the manifest CAS raises `chorus.trunc` monotonically while
-    /// preserving every other field.
+    /// same task) concurrently with appends. The manifest CAS raises
+    /// `chorus.trunc` monotonically while preserving every other field, and
+    /// fails with [`Error::Fenced`] without raising it once a claim newer
+    /// than `claim` owns the register.
     ///
     /// The work list is the register's segment directory, not this process's
     /// chain snapshot: an entry leaves the directory only once its copy is
@@ -3351,6 +3356,7 @@ mod maintenance {
         sealed_segments: &mut Vec<SegmentDescriptor>,
         checkpoint_floor: &mut u64,
         manifest: &mut Manifest,
+        claim: &WriterClaim,
         floor: WalSeqNo,
     ) -> Result<TruncationReport, Error> {
         let floor = floor.record_index;
@@ -3364,7 +3370,10 @@ mod maintenance {
         // anything: recovery and repair ignore objects below it, so a stale
         // zone cannot resurrect deleted history even if the database loses
         // its own checkpoint
-        manifest.raise_trunc(floor).await.map_err(Error::from)?;
+        manifest
+            .raise_trunc(claim, floor)
+            .await
+            .map_err(Error::from)?;
         let report =
             delete_segments_below_committed_floor(factories, prefix, sealed_segments, manifest)
                 .await?;
