@@ -6,32 +6,32 @@ members = ["client", "fake-gcs", "dst", "bin/disk-wal-bench", "bin/chorus-cli", 
 authors = ["Tyler Rockwood <rockwotj@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [workspace.dependencies]
 anyhow = "1.0"
 arc-swap = "1.9"
 async-stream = "0.3"
 async-trait = "0.1"
-bytes = "1.10"
-clap = { version = "4.5", features = ["derive", "env"] }
+bytes = "1.12"
+clap = { version = "4.6", features = ["derive", "env"] }
 crc32c = "0.6"
 futures = "0.3"
-googleapis-tonic-google-storage-v2 = { version = "0.42", default-features = false, features = ["bytes", "hash-map"] }
-google-cloud-auth = { version = "1.12", default-features = false, features = ["default-rustls-provider"] }
+googleapis-tonic-google-storage-v2 = { version = "0.43", default-features = false, features = ["bytes", "hash-map"] }
+google-cloud-auth = { version = "1.17", default-features = false, features = ["default-rustls-provider"] }
 hex = "0.4"
 hdrhistogram = "7"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
 prost-types = "0.14"
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["transport", "tls-webpki-roots"] }
 tonic-prost = "0.14"

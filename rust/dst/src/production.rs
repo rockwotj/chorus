@@ -25,7 +25,7 @@ use futures::future::join_all;
 use futures::TryStreamExt;
 use rand::prelude::IndexedRandom;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};
 use tonic::Code;

@@ -112,9 +112,12 @@ pub fn validate_trace_structure(events: &[TraceEvent]) -> Result<()> {
 
 pub fn trace_digest(events: &[TraceEvent]) -> Result<String> {
     let mut hasher = Sha256::new();
+    let mut line = Vec::new();
     for event in events {
-        serde_json::to_writer(&mut hasher, event)?;
-        hasher.update(b"\n");
+        line.clear();
+        serde_json::to_writer(&mut line, event)?;
+        line.push(b'\n');
+        hasher.update(&line);
     }
     Ok(hex::encode(hasher.finalize()))
 }
