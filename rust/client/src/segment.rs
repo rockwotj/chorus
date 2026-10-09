@@ -782,6 +782,29 @@ mod recovery {
             )
         }
 
+        /// Bind a single-replica WAL namespace stored under the local directory
+        /// `dir`, for development and testing. Segment objects and the manifest
+        /// register are plain files; reopening the same `dir` and `prefix`
+        /// recovers the WAL. Not for production: there is no fsync and no
+        /// coordination between processes. Requires the `local` feature.
+        #[cfg(feature = "local")]
+        pub fn new_local(
+            dir: impl Into<std::path::PathBuf>,
+            prefix: impl Into<String>,
+            client_config: ClientConfig,
+        ) -> Result<Self, Error> {
+            let dir = dir.into();
+            let prefix = prefix.into().trim_end_matches('/').to_string();
+            let manifest_store = Arc::new(crate::local::LocalManifestStore::new(&dir, &prefix));
+            Self::build(
+                vec![Arc::new(crate::local::LocalReplicaFactory::new(dir))],
+                manifest_store,
+                prefix,
+                client_config,
+                Arc::new(NoopMetricsRecorder),
+            )
+        }
+
         /// [`Self::new_with_manifest_store`] with a metrics recorder.
         pub fn new_with_manifest_store_and_metrics_recorder(
             factories: Vec<crate::GrpcReplicaFactory>,
