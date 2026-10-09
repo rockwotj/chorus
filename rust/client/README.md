@@ -102,7 +102,10 @@ completely before calling `Recovery::start`; starting early is rejected. A live
 
 The database remains responsible for its checkpoint. Call
 `WalHandle::truncate_before` only after the database has durably incorporated
-all records below that boundary.
+all records below that boundary. The floor is raised only while the calling
+writer's epoch still owns the manifest: a truncation that is delayed until
+after another process claims the WAL returns `Error::Fenced` and leaves the
+floor unchanged. Treat that error the same as a fenced append.
 
 ## Readonly followers
 

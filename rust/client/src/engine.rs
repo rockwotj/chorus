@@ -466,14 +466,12 @@ impl WalEngine {
         // Maintenance (sealed-segment repair, floor-committed truncation)
         // runs on its own task, serialized internally, concurrent with the
         // engine: it shares no mutable writer state — only catalog snapshots
-        // published through the watch channel and an epoch-free manifest
-        // handle of its own.
+        // published through the watch channel, a manifest handle of its own,
+        // and a copy of this writer's claim that guards floor raises.
+        let maintenance_config = writer.maintenance_config(config.repair_interval)?;
         let (catalog_tx, catalog_rx) = watch::channel(writer.sealed_segments_snapshot());
-        let (maintenance, maintenance_task) = crate::maintenance::start(
-            writer.maintenance_config(config.repair_interval),
-            catalog_rx,
-            Arc::clone(&metrics),
-        );
+        let (maintenance, maintenance_task) =
+            crate::maintenance::start(maintenance_config, catalog_rx, Arc::clone(&metrics));
         let (active_capacity_tx, active_capacity) = watch::channel(ActiveSegmentCapacity {
             admission_start_bytes: 0,
             existing_bytes: active_segment_bytes,
@@ -670,6 +668,14 @@ impl WalHandle {
     /// every record before that boundary and no retained reader needs it.
     /// The WAL deletes only whole sealed segments; it never truncates the active
     /// segment or deletes a segment containing `floor`.
+    ///
+    /// The floor CAS commits only while this writer's epoch still owns the
+    /// manifest, so this writer cannot raise the floor after a newer writer
+    /// claims it. If the newer claim lands first, including while this call
+    /// is in flight, the call returns [`Error::Fenced`] and leaves the floor
+    /// unchanged. A call that overlaps a handoff can also return `Fenced`
+    /// after its own raise committed, when the CAS response was lost, or
+    /// return success when the claim landed after the raise.
     ///
     /// Deletion is best effort across zones. The returned report contains only
     /// deletion statistics; the database remains the authority for the durable

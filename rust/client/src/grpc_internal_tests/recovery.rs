@@ -429,6 +429,164 @@ async fn manifest_takeover_fences_background_pending_fold() {
     assert_eq!(append_one(&mut replacement, b"new-owner").await, 1);
 }
 
+/// An in-memory register that holds every update setting `chorus.trunc` to
+/// one value until the test releases it. The held update keeps the version
+/// it was issued against, the same as a slow manifest CAS request does.
+struct HeldTruncationStore {
+    inner: crate::manifest_store::test_support::InMemoryManifestStore,
+    held_trunc: String,
+    arrived: tokio::sync::Notify,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+impl HeldTruncationStore {
+    fn new(floor: u64) -> Self {
+        Self {
+            inner: Default::default(),
+            held_trunc: floor.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            released: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    async fn committed_trunc(&self) -> String {
+        use crate::ManifestStore;
+        self.inner.read().await.unwrap().unwrap().fields["chorus.trunc"].clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ManifestStore for HeldTruncationStore {
+    fn max_directory_bytes(&self) -> usize {
+        self.inner.max_directory_bytes()
+    }
+
+    async fn read(&self) -> Result<Option<crate::VersionedManifest>, crate::ManifestStoreError> {
+        self.inner.read().await
+    }
+
+    async fn create(
+        &self,
+        fields: HashMap<String, String>,
+    ) -> Result<crate::VersionedManifest, crate::ManifestStoreError> {
+        self.inner.create(fields).await
+    }
+
+    async fn update(
+        &self,
+        version: crate::ManifestVersion,
+        fields: HashMap<String, String>,
+    ) -> Result<crate::VersionedManifest, crate::ManifestStoreError> {
+        if fields.get("chorus.trunc") == Some(&self.held_trunc) {
+            self.arrived.notify_one();
+            let mut released = self.released.subscribe();
+            released.wait_for(|released| *released).await.unwrap();
+        }
+        self.inner.update(version, fields).await
+    }
+}
+
+#[tokio::test]
+async fn truncation_delayed_past_a_newer_claim_is_fenced() {
+    let (_servers, factories, _manifest_factory) = factory_cluster().await;
+    let store = Arc::new(HeldTruncationStore::new(1));
+    let volume = SegmentedVolume::new_with_factories_and_manifest_store(
+        factories,
+        store.clone(),
+        "stale-truncation-wal",
+        test_config(),
+    )
+    .unwrap();
+
+    // Writer A (epoch 1) seals record 0 and keeps record 1 in its active
+    // segment, so a floor of 1 would delete the sealed segment.
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"zero").await;
+    writer.rotate().await.unwrap();
+    append_one(&mut writer, b"one").await;
+    let stale = WalEngine::start(
+        writer,
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A's floor CAS is issued against the epoch-1 register and then held.
+    let truncation = tokio::spawn(stale.truncate_before(WalSeqNo::record(1)));
+    tokio::time::timeout(Duration::from_secs(10), store.arrived.notified())
+        .await
+        .expect("writer A never issued its floor CAS");
+
+    // Writer B claims epoch 2 and replays from the floor it reads.
+    let mut recovery = volume.recover_from_committed_floor().await.unwrap();
+    assert_eq!(recovery.from, WalSeqNo::ZERO);
+    let replayed: Vec<WalRecord> = (&mut recovery).try_collect().await.unwrap();
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|record| record.payload.as_ref())
+            .collect::<Vec<_>>(),
+        [b"zero".as_slice(), b"one".as_slice()]
+    );
+    let replacement = recovery
+        .start(WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // A's held CAS now lands after B's claim.
+    store.released.send_replace(true);
+    let error = tokio::time::timeout(Duration::from_secs(10), truncation)
+        .await
+        .expect("writer A's truncation never finished")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, Error::Fenced(_)), "{error}");
+    assert_eq!(store.committed_trunc().await, "0");
+
+    // B's next recovery still replays record 0.
+    shutdown_engine(replacement).await;
+    stale.abort().await;
+    let (_, records) = recover_records(&volume, WalSeqNo::ZERO).await;
+    assert_eq!(records[0].payload, b"zero".as_slice());
+}
+
+#[tokio::test]
+async fn truncation_to_an_already_committed_floor_after_a_newer_claim_is_fenced() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(factories, manifest_factory, "covered-truncation-wal");
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"zero").await;
+    writer.rotate().await.unwrap();
+    append_one(&mut writer, b"one").await;
+    // No periodic pass, so the maintenance task's cached register is the one
+    // its first truncation left behind.
+    let stale = WalEngine::start(
+        writer,
+        WalEngineConfig {
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    stale.truncate_before(WalSeqNo::record(1)).await.unwrap();
+
+    let recovery = volume.recover_from_committed_floor().await.unwrap();
+    assert_eq!(recovery.from, WalSeqNo::record(1));
+
+    // The cached register already covers floor 1 and still names writer A.
+    let error = stale
+        .truncate_before(WalSeqNo::record(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Fenced(_)), "{error}");
+    stale.abort().await;
+}
+
 #[tokio::test]
 async fn recovery_derives_the_end_of_a_finalized_highest_segment() {
     let (_servers, factories, manifest_factory) = factory_cluster().await;

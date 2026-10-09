@@ -475,6 +475,18 @@ pub(crate) struct Manifest {
     metrics: Arc<Metrics>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// The `(epoch, owner)` pair one writer incarnation was granted by
+/// [`Manifest::claim`].
+///
+/// Raising the truncation floor requires one. The floor is chosen from the
+/// application state of the process that holds the claim, so a floor computed
+/// by a deposed writer may be above what the new writer has replayed.
+pub(crate) struct WriterClaim {
+    epoch: u64,
+    owner: String,
+}
+
 #[derive(Clone)]
 /// Claim-bound capability used by background provisioning and fold work.
 ///
@@ -691,6 +703,15 @@ impl Manifest {
             max_directory_bytes: self.max_directory_bytes,
             cache: self.cache.clone(),
             metrics: Arc::clone(&self.metrics),
+        })
+    }
+
+    /// This process's claim, for truncation run on another manifest handle.
+    pub(crate) fn writer_claim(&self) -> Result<WriterClaim, ProtocolError> {
+        self.require_claim()?;
+        Ok(WriterClaim {
+            epoch: self.epoch,
+            owner: self.owner.clone(),
         })
     }
 
@@ -1044,10 +1065,30 @@ impl Manifest {
         Ok(())
     }
 
-    /// Raise the truncation floor monotonically. Any role may do this; the
-    /// CAS preserves every other field.
-    pub async fn raise_trunc(&mut self, floor: u64) -> Result<(), ProtocolError> {
+    /// Raise the truncation floor monotonically, conditional on `claim` still
+    /// owning the register. The CAS preserves every other field.
+    ///
+    /// The caller picks `floor` from its own application state. After a
+    /// handoff, the new writer replays from the floor it read during
+    /// recovery, so a deposed writer's floor may remove records the new
+    /// writer has not applied yet. Every CAS attempt rechecks `claim` against
+    /// the record it replaces, so no raise commits after a newer claim. A
+    /// raise delayed past a newer claim fails with [`ProtocolError::Fenced`]
+    /// and leaves the floor unchanged. A raise whose CAS committed but whose
+    /// response was lost also reports `Fenced` if a newer claim lands before
+    /// the retry. No role raises the floor without a claim: recovery and
+    /// readonly followers only read it.
+    pub async fn raise_trunc(
+        &mut self,
+        claim: &WriterClaim,
+        floor: u64,
+    ) -> Result<(), ProtocolError> {
+        // The cached record may predate a newer claim. Without a refresh, a
+        // floor the cache already covers would return success to a deposed
+        // writer without contacting the store.
+        self.refresh().await?;
         self.cas_transform(ProtocolError::ManifestUnavailable, |record| {
+            Self::check_claim(record, claim.epoch, &claim.owner)?;
             if record.trunc >= floor {
                 return Ok(CasTransform::Done(()));
             }
@@ -1062,12 +1103,18 @@ impl Manifest {
     }
 
     /// Drop directory entries whose every zonal copy is confirmed deleted.
-    /// Epoch-free like [`Self::raise_trunc`] — the truncator discipline only
-    /// removes entries wholly below `witnessed_floor`, which must itself be no
-    /// higher than the current committed floor. The caller must also have
-    /// confirmed every zonal copy absent. Rechecking derived ends against each
-    /// CAS retry prevents a future caller from dropping reachable history. Ids
-    /// already absent are fine: a racing pass removed them first.
+    /// The caller must have confirmed every zonal copy absent. Ids already
+    /// absent are fine: a racing pass removed them first.
+    ///
+    /// Unlike [`Self::raise_trunc`], this takes no claim. It never moves the
+    /// floor, and each CAS attempt checks `witnessed_floor` and every derived
+    /// end against the record it replaces: `witnessed_floor` must not exceed
+    /// the committed floor, and each removed entry must end below
+    /// `witnessed_floor`. Recovery and replay never read an entry below the
+    /// committed floor, and the floor never decreases, so an entry this
+    /// removes is already unreachable for the current writer and every later
+    /// one. A call from a deposed writer therefore makes the same removal the
+    /// current writer's tombstone cleanup would make.
     pub async fn remove_segments(
         &mut self,
         ids: &HashSet<String>,
