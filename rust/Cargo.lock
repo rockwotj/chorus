@@ -428,6 +428,7 @@ dependencies = [
  "prost",
  "prost-types",
  "serde",
+ "serde_json",
  "sha2",
  "slatedb",
  "thiserror 2.0.21",

@@ -76,6 +76,8 @@ mod auth;
 mod engine;
 mod error;
 mod grpc;
+#[cfg(feature = "local")]
+mod local;
 mod maintenance;
 mod manifest;
 mod manifest_store;
