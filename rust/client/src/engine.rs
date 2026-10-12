@@ -66,19 +66,23 @@ pub struct WalEngineConfig {
     /// The engine checks this threshold between records, so a segment may exceed
     /// it by one complete encoded record. This is not a hard object-size limit.
     ///
-    /// Treat this as the minimum segment-size floor for the single-pending
-    /// design. With sustained encoded throughput `T` bytes/s and worst-case
-    /// provision-plus-fold latency `L` seconds, choose at least `T * L` times
-    /// an operational safety factor. If the active pending segment crosses
-    /// this threshold before its refill is registered, dispatch pauses
-    /// fail-closed rather than acknowledging an unregistered successor.
+    /// Rotation needs a registered spare segment. If the active segment
+    /// crosses this threshold before one is ready, appends keep going into
+    /// the active segment, and rotation happens once the spare is registered.
+    /// The active segment can therefore grow past this target, up to
+    /// [`max_active_segment_bytes`](Self::max_active_segment_bytes). With
+    /// sustained encoded throughput `T` bytes/s and worst-case
+    /// provision-plus-fold latency `L` seconds, a target of at least `T * L`
+    /// keeps segments near this size.
     pub max_segment_bytes: usize,
     /// Hard encoded-byte ceiling for one active segment object.
     ///
     /// The default is 4 GiB, deliberately far below GCS's 5 TiB object limit.
     /// Rotation normally occurs at [`max_segment_bytes`](Self::max_segment_bytes),
-    /// but the manifest's bounded sealed-segment directory can defer that
-    /// rotation until truncation removes retained entries. Admission stops
+    /// but it is deferred while no registered spare segment is ready, while
+    /// the previous seal is still being enforced, and while the manifest's
+    /// bounded sealed-segment directory waits for truncation to remove
+    /// retained entries. Admission stops
     /// cleanly at this ceiling with [`Error::ActiveSegmentFull`] instead of
     /// letting the active object grow toward the provider limit or poisoning
     /// the healthy writer. This physical-object ceiling is not a scheduling
@@ -889,7 +893,6 @@ async fn run_engine(
                 fold_attempts: 0,
                 retry: None,
                 fold_capacity_blocked: false,
-                successor_due: false,
             });
     let mut rotation_rechecks_open = true;
     // Spare provisioning runs on a dedicated worker; its result channel is a
@@ -1074,7 +1077,6 @@ async fn run_engine(
                         fold_attempts: 0,
                         retry: None,
                         fold_capacity_blocked: false,
-                        successor_due: false,
                     };
                     active_capacity.send_replace(ActiveSegmentCapacity {
                         admission_start_bytes: state.last_dispatched_admission_bytes,
@@ -1111,10 +1113,10 @@ async fn run_engine(
             }
         }
 
-        // Dispatch pauses when rotation is due without a confirmed pending
-        // segment, including when the consumed pending segment itself crosses
-        // the threshold before fold/refill completes.
-        while !rotation.dispatch_paused()
+        // Dispatch pauses only while a due rotation has a registered spare,
+        // so in-flight records can drain to the swap boundary. Without a
+        // spare, records keep going into the active segment.
+        while !rotation.dispatch_paused(writer.spare_ready())
             && matches!(state.queue.front(), Some(Command::Append(_)))
             && state.pending_bytes < config.pipeline_window_bytes
         {
@@ -1522,7 +1524,6 @@ async fn seal_active_on_shutdown(
             fold_attempts: 0,
             retry: None,
             fold_capacity_blocked: false,
-            successor_due: false,
         };
         return;
     }
@@ -1575,8 +1576,9 @@ enum RotationEvent {
 enum Rotation {
     /// Active segment within its advisory size budget.
     Idle,
-    /// Budget crossed. Dispatch is fail-closed until a confirmed pending
-    /// segment is available for the in-memory swap.
+    /// Budget crossed. Once a registered spare is ready, dispatch pauses
+    /// until every admitted record is committed, then the in-memory swap
+    /// runs. Until then, records keep going into the active segment.
     Due,
     /// Admissions already route to the adopted spare; the swapped-out
     /// segment is draining toward its admitted end. The active successor was
@@ -1590,10 +1592,6 @@ enum Rotation {
         /// application truncation removes retained entries. Keep the exact
         /// transition parked instead of retrying a permanent local predicate.
         fold_capacity_blocked: bool,
-        /// The consumed pending segment itself crossed the rotation floor
-        /// before fold/refill completed. With no second pending slot, dispatch
-        /// pauses until the fold registers the refill.
-        successor_due: bool,
     },
     /// The swapped-out segment's seal enforcement is in flight. The next
     /// swap would overwrite the manifest seal record that segment needs for
@@ -1612,8 +1610,9 @@ impl Rotation {
         }
         match self {
             Rotation::Idle => *self = Rotation::Due,
-            Rotation::Draining { successor_due, .. } => *successor_due = true,
-            Rotation::Due | Rotation::Sealing { .. } => {}
+            // A segment that crosses the target while the previous rotation
+            // is unfinished is re-checked when that rotation settles.
+            Rotation::Draining { .. } | Rotation::Due | Rotation::Sealing { .. } => {}
         }
     }
 
@@ -1649,15 +1648,8 @@ impl Rotation {
         matches!(self, Rotation::Draining { retry: Some(_), .. })
     }
 
-    fn dispatch_paused(&self) -> bool {
-        matches!(
-            self,
-            Rotation::Due
-                | Rotation::Draining {
-                    successor_due: true,
-                    ..
-                }
-        )
+    fn dispatch_paused(&self, spare_ready: bool) -> bool {
+        matches!(self, Rotation::Due) && spare_ready
     }
 
     fn arm_fold_retry(&mut self, config: &crate::protocol::ClientConfig) {
