@@ -1266,6 +1266,114 @@ async fn appends_continue_into_the_pending_segment_until_refill_is_registered() 
 }
 
 #[tokio::test]
+async fn failed_spare_creation_backs_off_and_reports_a_blocked_rotation() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = SegmentedVolume::new_with_factories_and_metrics_recorder(
+        factories,
+        &manifest_factory,
+        "spare-backoff-wal",
+        ClientConfig {
+            max_retries: 0,
+            retry_base: Duration::from_millis(50),
+        },
+        Arc::new(crate::NoopMetricsRecorder),
+    )
+    .expect("test clusters use a supported replica count");
+    let writer = volume.recover_writer().await.unwrap();
+    let mut handle = WalEngine::start(
+        writer,
+        WalEngineConfig {
+            max_segment_bytes: 1,
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Record 0 rotates into the preregistered pending segment, which needs
+    // a refill before the next rotation.
+    handle
+        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"zero"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.status().rotation_blocked.is_some()
+            || servers[0]
+                .service
+                .operation_count(Operation::BidiCreate)
+                .await
+                < 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first rotation did not settle");
+
+    // Two zones reject every create, so no refill can reach a quorum.
+    for server in &servers[..2] {
+        for _ in 0..1000 {
+            server
+                .service
+                .inject(Operation::BidiCreate, Code::PermissionDenied)
+                .await;
+        }
+    }
+    for server in &servers[..3] {
+        server.service.reset_operation_counts().await;
+    }
+    // Record 1 rotates into the spare already registered. Record 2 then
+    // pushes the new active segment past the target while its refill fails,
+    // and still commits.
+    for (seqno, payload) in [(1, b"one".as_slice()), (2, b"two")] {
+        handle
+            .enqueue_append(
+                WalSeqNo::record(seqno),
+                bytes::Bytes::copy_from_slice(payload),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Backoff of 50, 100, 200 and 400 ms allows about four attempts in this
+    // window. Retrying back to back would make hundreds.
+    let attempts = servers[0]
+        .service
+        .operation_count(Operation::BidiCreate)
+        .await;
+    assert!(
+        (1..=8).contains(&attempts),
+        "spare creation retried {attempts} times in 600 ms"
+    );
+    let status = handle.status();
+    assert_eq!(
+        status.rotation_blocked.map(|blocked| blocked.reason),
+        Some(crate::RotationBlocker::SpareNotReady)
+    );
+    assert!(status.active_segment_bytes > 0);
+    assert!(!status.closed);
+
+    for server in &servers[..2] {
+        server
+            .service
+            .clear_injected_operation(Operation::BidiCreate)
+            .await;
+    }
+    // The next attempt is at most the capped backoff away.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while handle.status().rotation_blocked.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation stayed blocked after spare creation recovered");
+    shutdown_engine(handle).await;
+}
+
+#[tokio::test]
 async fn rotation_targets_repair_at_a_copy_missing_finalization() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let (volume, metrics) = volume_with_metrics(

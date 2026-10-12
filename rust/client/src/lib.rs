@@ -95,7 +95,10 @@ mod transport;
 mod grpc_internal_tests;
 
 pub use auth::{AccessTokenSource, BearerAuth, RefreshingAuthConfig};
-pub use engine::{AppendCompletion, AppendReceipt, WalEngineConfig, WalHandle};
+pub use engine::{
+    AppendCompletion, AppendReceipt, RotationBlocked, RotationBlocker, WalEngineConfig, WalHandle,
+    WalStatus,
+};
 pub use error::Error;
 pub use grpc::GrpcReplicaFactory;
 pub use manifest_store::{ManifestStore, ManifestStoreError, ManifestVersion, VersionedManifest};
