@@ -1242,12 +1242,12 @@ async fn run_engine(
                         rotation.mark_due(writer.rotation_due(config.max_segment_bytes));
                     }
                     RotationEvent::Sealed(Err(_)) => {
-                        tracing::warn!(
-                            "seal enforcement exhausted retries; rotation disabled until restart"
-                        );
-                        rotation = Rotation::Disabled {
-                            due: writer.rotation_due(config.max_segment_bytes),
-                        };
+                        // Maintenance retries a failed seal until it succeeds
+                        // or truncation covers the segment, so the sender is
+                        // dropped only when the maintenance task stopped.
+                        tracing::warn!("maintenance task stopped before the committed seal was enforced");
+                        state.fail_queued(&mut receiver, Error::Closed, &metrics);
+                        break 'engine;
                     }
                     RotationEvent::RetryElapsed => {
                         if let Rotation::Draining { retry, .. } = &mut rotation {
@@ -1314,9 +1314,8 @@ async fn run_engine(
                                         %error,
                                         "maintenance task stopped before committed seal was queued"
                                     );
-                                    rotation = Rotation::Disabled {
-                                        due: writer.rotation_due(config.max_segment_bytes),
-                                    };
+                                    state.fail_queued(&mut receiver, Error::Closed, &metrics);
+                                    break 'engine;
                                 }
                             }
                         } else {
@@ -1420,7 +1419,7 @@ async fn seal_active_on_shutdown(
             }
             *rotation = Rotation::Idle;
         }
-        Rotation::Draining { .. } | Rotation::Disabled { .. } => {
+        Rotation::Draining { .. } => {
             tracing::info!("WAL shutdown seal skipped: an earlier rotation is unfinished");
             return;
         }
@@ -1600,12 +1599,10 @@ enum Rotation {
     /// swap would overwrite the manifest seal record that segment needs for
     /// recovery, so rotation holds until `enforced` resolves — at most one
     /// sealed segment ever lacks a finalized quorum, and it is always the
-    /// manifest's current seal record.
+    /// manifest's current seal record. Maintenance retries a failed seal
+    /// until it succeeds, so appends meanwhile continue into the active
+    /// segment until its hard ceiling returns [`Error::ActiveSegmentFull`].
     Sealing { enforced: oneshot::Receiver<()> },
-    /// Live sealing and bounded idempotent reconstruction both failed: no
-    /// further rotation until restart recovery enforces the segment named by
-    /// the manifest's seal record.
-    Disabled { due: bool },
 }
 
 impl Rotation {
@@ -1616,7 +1613,6 @@ impl Rotation {
         match self {
             Rotation::Idle => *self = Rotation::Due,
             Rotation::Draining { successor_due, .. } => *successor_due = true,
-            Rotation::Disabled { due: disabled_due } => *disabled_due = true,
             Rotation::Due | Rotation::Sealing { .. } => {}
         }
     }
@@ -1661,7 +1657,6 @@ impl Rotation {
                     successor_due: true,
                     ..
                 }
-                | Rotation::Disabled { due: true }
         )
     }
 

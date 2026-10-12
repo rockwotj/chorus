@@ -102,3 +102,48 @@ async fn maintenance_sweeps_dead_spares_without_failing_recovery() {
     }
     shutdown_engine(handle).await;
 }
+
+/// The fold CAS commits a new seal record before the engine publishes the
+/// catalog snapshot that marks it `seal_pending`. A truncation that adopted the
+/// older snapshot deletes the swapped segment's copies under its live lanes,
+/// and the queued seal then runs against a segment below the committed floor.
+/// That seal has nothing to protect and must release the engine.
+#[tokio::test]
+async fn seal_after_truncation_past_the_segment_releases_rotation() {
+    let (_servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(
+        factories.clone(),
+        manifest_factory.clone(),
+        "seal-below-floor-wal",
+    );
+    let mut writer = volume.recover_writer().await.unwrap();
+    append_one(&mut writer, b"zero").await;
+    let swapped = writer.rotate_unsealed().await.unwrap();
+    let object = segment_object("seal-below-floor-wal", &swapped.id);
+
+    // The snapshot from before the fold result reached the engine.
+    let (_catalog_tx, catalog_rx) = tokio::sync::watch::channel(Vec::new());
+    let (maintenance, task) = crate::maintenance::start(
+        writer.maintenance_config(None).unwrap(),
+        catalog_rx,
+        writer.metrics(),
+    );
+    let report = maintenance.truncate(WalSeqNo::record(1)).await.unwrap();
+    assert_eq!(report.deleted_objects, factories.len());
+    for factory in &factories {
+        assert_eq!(
+            factory.replica(&object).stat().await.unwrap_err().code,
+            TransportCode::NotFound
+        );
+    }
+
+    let enforced = maintenance.seal_segment(swapped).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), enforced)
+        .await
+        .expect("seal of a truncated segment did not finish")
+        .expect("seal of a truncated segment disabled rotation");
+
+    maintenance.shutdown();
+    drop(maintenance);
+    task.await.unwrap();
+}

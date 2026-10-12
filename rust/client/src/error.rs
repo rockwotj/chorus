@@ -165,8 +165,8 @@ pub enum Error {
     /// The writer remains healthy and the sequence number was not consumed.
     /// This is backpressure, not poison: truncating old sealed segments may
     /// free manifest-directory room so the engine can rotate and resume
-    /// admission. A permanently failed seal still requires restart recovery
-    /// before rotation can resume.
+    /// admission. While maintenance retries a failed seal, rotation waits and
+    /// admission resumes once that seal completes.
     #[error(
         "active WAL segment holds {current} encoded bytes; admitting {requested} more would \
          exceed the configured ceiling {max}"

@@ -1355,10 +1355,88 @@ async fn transient_seal_enforcement_failure_retries_without_gating_rotation() {
     }
     wait_for_counter(&metrics, "chorus.wal.seal.segments", 1).await;
 
-    // A dropped enforcement sender would put the engine in Rotation::Disabled:
+    // A seal that never completed would hold the engine in Rotation::Sealing:
     // this record would commit into the successor but never produce another
-    // seal. Observing the second seal proves the transient failure did not
-    // become a gate-until-restart availability cliff.
+    // seal. Observing the second seal proves rotation resumed.
+    handle
+        .enqueue_append(WalSeqNo::record(1), bytes::Bytes::from_static(b"second"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    wait_for_counter(&metrics, "chorus.wal.seal.segments", 2).await;
+    shutdown_engine(handle).await;
+}
+
+#[tokio::test]
+async fn seal_enforcement_keeps_retrying_until_storage_returns() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let metrics = Arc::new(TestMetricsRecorder::default());
+    let metrics_recorder: Arc<dyn crate::MetricsRecorder> = metrics.clone();
+    let volume = SegmentedVolume::new_with_factories_and_metrics_recorder(
+        factories,
+        &manifest_factory,
+        "persistent-seal-failure-wal",
+        ClientConfig {
+            retry_base: Duration::from_millis(1),
+            ..test_config()
+        },
+        metrics_recorder,
+    )
+    .expect("test clusters use a supported replica count");
+    let writer = volume.recover_writer().await.unwrap();
+
+    servers[3].service.reset_operation_counts().await;
+    servers[3]
+        .service
+        .inject_delay(Operation::Update, Duration::from_millis(500))
+        .await;
+    let mut handle = WalEngine::start(
+        writer,
+        WalEngineConfig {
+            max_segment_bytes: 1,
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    handle
+        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"first"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while servers[3].service.operation_count(Operation::Update).await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background fold did not reach the manifest update");
+    for zone in [0usize, 1] {
+        servers[zone].service.reset_operation_counts().await;
+        servers[zone].service.set_crashed(true).await;
+    }
+
+    // Each failed recovery makes max_retries + 1 identity reads. Nine
+    // failed enforcement attempts after the live seal is well past the
+    // max_retries outer attempts the bounded budget used to allow.
+    let reads_per_attempt = test_config().max_retries as u64 + 1;
+    let retry_reads = reads_per_attempt * 10;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while servers[0].service.operation_count(Operation::Get).await < retry_reads {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed seal enforcement stopped retrying while storage was down");
+    assert_eq!(metrics.counter("chorus.wal.seal.segments"), 0);
+    for zone in [0usize, 1] {
+        servers[zone].service.set_crashed(false).await;
+    }
+    wait_for_counter(&metrics, "chorus.wal.seal.segments", 1).await;
+
     handle
         .enqueue_append(WalSeqNo::record(1), bytes::Bytes::from_static(b"second"))
         .await
