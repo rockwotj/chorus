@@ -2434,7 +2434,7 @@ mod writer {
         }
 
         #[cfg(test)]
-        pub(crate) async fn rotate(&mut self) -> Result<(), Error> {
+        async fn swap_and_fold(&mut self) -> Result<Option<SwappedSegment>, Error> {
             if self.segment_writer.is_poisoned() {
                 return Err(Error::Poisoned);
             }
@@ -2446,7 +2446,7 @@ mod writer {
                 )));
             }
             if committed == 0 {
-                return Ok(());
+                return Ok(None);
             }
             let swap = self.begin_swap().await?.ok_or_else(|| {
                 Error::Internal("non-empty test rotation produced no swap".into())
@@ -2468,10 +2468,26 @@ mod writer {
             let fold = self.pending_fold_request(&swap)?;
             let update = fold_registered_pending(manifest, fold).await?;
             self.confirm_fold(&swap, update)?;
-            let sealed_id = swap.id.clone();
-            let mut segment = swap
-                .into_segment()
-                .ok_or_else(|| Error::Internal("live rotation lost its old writer".into()))?;
+            swap.into_segment()
+                .map(Some)
+                .ok_or_else(|| Error::Internal("live rotation lost its old writer".into()))
+        }
+
+        /// Swap and fold like [`Self::rotate`], and return the swapped segment
+        /// without sealing it, as the engine hands it to maintenance.
+        #[cfg(test)]
+        pub(crate) async fn rotate_unsealed(&mut self) -> Result<SwappedSegment, Error> {
+            self.swap_and_fold()
+                .await?
+                .ok_or_else(|| Error::Internal("non-empty test rotation produced no swap".into()))
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn rotate(&mut self) -> Result<(), Error> {
+            let Some(mut segment) = self.swap_and_fold().await? else {
+                return Ok(());
+            };
+            let sealed_id = segment.id.clone();
             segment.writer.seal().await?;
             #[cfg(any(test, feature = "dst-support"))]
             self.metrics.segments_sealed.increment();
@@ -3397,11 +3413,10 @@ mod maintenance {
             .raise_trunc(claim, floor)
             .await
             .map_err(Error::from)?;
-        let report =
-            delete_segments_below_committed_floor(factories, prefix, sealed_segments, manifest)
-                .await?;
+        // The floor is committed even if a delete below fails, and a pending
+        // seal relies on this value to skip segments the floor covers.
         *checkpoint_floor = floor;
-        Ok(report)
+        delete_segments_below_committed_floor(factories, prefix, sealed_segments, manifest).await
     }
 
     /// Delete segment objects left behind by dead writer incarnations.
@@ -3527,11 +3542,10 @@ mod maintenance {
     /// Delete directory entries wholly below the manifest's cached floor and drop
     /// only fully absent entries from the register.
     ///
-    /// Generation-matched deletes make every zonal action idempotent. The pending
-    /// seal exclusion is intentionally shared by application truncation and
-    /// autonomous cleanup: a committed floor authorizes deletion, but the engine's
-    /// finalized-quorum gate still needs its source object until enforcement
-    /// completes.
+    /// Generation-matched deletes make every zonal action idempotent. An entry
+    /// whose maintenance seal has not run yet is deleted like any other: the
+    /// seal runs on the same maintenance task, and a seal of a segment below
+    /// the committed floor completes without touching storage.
     async fn delete_segments_below_committed_floor(
         factories: &[Arc<dyn ReplicaFactory>],
         prefix: &str,
@@ -3541,16 +3555,6 @@ mod maintenance {
         let record = manifest.record().clone();
         let floor = record.trunc;
         let directory = record.segments.clone();
-        // A swap whose maintenance seal has not settled yet is published with
-        // `seal_pending` in the chain snapshot (the engine sends the snapshot
-        // before it enqueues the seal). Deleting copies underneath that
-        // in-flight seal would fail it and gate rotation until restart, so
-        // those entries wait for a later pass.
-        let seal_in_flight: HashSet<&str> = sealed_segments
-            .iter()
-            .filter(|segment| segment.seal_pending)
-            .map(|segment| segment.id.as_str())
-            .collect();
         let mut deleted_objects = 0usize;
         let mut deleted_bases = HashSet::new();
         let mut fully_deleted = HashSet::new();
@@ -3562,9 +3566,6 @@ mod maintenance {
                 continue;
             };
             if end >= floor {
-                continue;
-            }
-            if seal_in_flight.contains(entry.id.as_str()) {
                 continue;
             }
             let object = segment_object(prefix, &entry.id);

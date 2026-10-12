@@ -22,7 +22,7 @@ use crate::error::Error;
 use crate::manifest::{Manifest, WriterClaim};
 use crate::manifest_store::ManifestStore;
 use crate::metrics::Metrics;
-use crate::protocol::{retry_sleep, ClientConfig};
+use crate::protocol::{retry_delay, ClientConfig};
 use crate::segment::{
     cleanup_tombstones_pass, enforce_committed_seal, repair_sealed_pass, sweep_dead_segments,
     truncate_pass, DeadSegmentSweep, SegmentDescriptor, SwappedSegment, TruncationReport, WalSeqNo,
@@ -30,6 +30,10 @@ use crate::segment::{
 use crate::transport::ReplicaFactory;
 
 const MAINTENANCE_COMMAND_CAPACITY: usize = 64;
+
+/// Upper bound on the delay between attempts to enforce a pending committed
+/// seal. Delays start at [`ClientConfig::retry_base`] and double up to this.
+const COMMITTED_SEAL_MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 pub(crate) enum MaintenanceCmd {
     /// Repair only one newly sealed segment whose finalization did not
@@ -96,9 +100,9 @@ impl MaintenanceHandle {
 
     /// Hand a swapped-out segment to the maintenance task for seal
     /// enforcement. The returned receiver resolves once a finalized quorum
-    /// exists; the engine gates its next swap on it. If the sender is dropped
-    /// instead (live sealing and bounded idempotent enforcement both failed,
-    /// or the task died), the engine disables rotation until restart.
+    /// exists or truncation has passed the segment; the engine gates its next
+    /// swap on it. Maintenance retries a failed seal until one of those
+    /// happens, so the sender is dropped only when the task stops.
     pub(crate) async fn seal_segment(
         &self,
         segment: SwappedSegment,
@@ -175,6 +179,9 @@ struct MaintenanceState {
     /// and restart recovery enforces it.
     sealed: HashSet<u64>,
     checkpoint_floor: u64,
+    /// A committed seal whose live finalization and first storage-only
+    /// enforcement both failed. The run loop retries it between other work.
+    pending_seal: Option<PendingSeal>,
     /// Retained until every zone was listed and every eligible object was
     /// deleted or already absent. The keep set may be stale; its strict
     /// below-claimed-epoch guard is the safety fence.
@@ -202,6 +209,7 @@ async fn run(
         deleted: HashSet::new(),
         sealed: HashSet::new(),
         checkpoint_floor: config.checkpoint_floor,
+        pending_seal: None,
         dead_segment_sweep: Some(config.dead_segment_sweep),
         manifest: None,
         metrics,
@@ -224,6 +232,24 @@ async fn run(
         return;
     }
     loop {
+        // An overdue seal retry gets one attempt per iteration before ticks
+        // and commands, so a stream of other work cannot postpone it forever.
+        // With zero backoff it alternates with that work. Shutdown still wins.
+        if task
+            .pending_seal
+            .as_ref()
+            .is_some_and(|pending| pending.retry_at <= Instant::now())
+        {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    commands.close();
+                    break;
+                }
+                () = task.retry_pending_seal(&mut catalog_rx) => {}
+            }
+        }
+        let seal_retry_at = task.pending_seal.as_ref().map(|pending| pending.retry_at);
         // `biased` keeps the poll order deterministic (an unbiased `select!`
         // randomizes its starting branch per call). Shutdown wins even when
         // every maintenance pass overruns a hot interval. An overdue tick then
@@ -249,6 +275,9 @@ async fn run(
                 Some(command) => execute_command(&mut task, &mut catalog_rx, command).await,
                 None => return,
             },
+            // Wakes an idle loop when the next retry is due. The retry
+            // itself runs at the top of the loop.
+            () = sleep_until_retry(seal_retry_at) => {}
         }
     }
 
@@ -270,6 +299,7 @@ async fn maintenance_pass_or_shutdown(
             task.adopt_catalog(catalog_rx);
             task.sweep_dead_segments_once().await;
             task.cleanup_tombstones_once().await;
+            task.release_seal_covered_by_floor(catalog_rx).await;
             task.repair_once().await;
         } => false,
     }
@@ -313,6 +343,7 @@ async fn execute_command(
                     task.manifest = None;
                 }
             }
+            task.release_seal_covered_by_floor(catalog_rx).await;
             for response in responses {
                 let _ = response.send(result.clone());
             }
@@ -492,9 +523,14 @@ impl MaintenanceState {
     /// writer. The manifest decision remains valid, however. On any fast-path
     /// failure we therefore switch to the storage-only path, which reconstructs
     /// the exact committed record count from a read quorum, verifies the digest
-    /// committed by the fold CAS, and idempotently installs the bytes. Only
-    /// exhaustion of that separate retry budget drops `enforced` and preserves
-    /// the old gate-until-restart fallback.
+    /// committed by the fold CAS, and idempotently installs the bytes. If that
+    /// fails too, the seal stays pending and the run loop retries it with
+    /// backoff between other maintenance work.
+    ///
+    /// A segment below the committed truncation floor needs no enforcement:
+    /// recovery and readers never read it, and truncation may already have
+    /// deleted its copies. Truncation runs on this task, so the floor is
+    /// checked before the seal and before every retry.
     async fn seal_segment(
         &mut self,
         segment: SwappedSegment,
@@ -509,101 +545,160 @@ impl MaintenanceState {
             crc32c,
             mut writer,
         } = segment;
-        let seal_started = tokio::time::Instant::now();
+        if let Some(previous) = self.pending_seal.take() {
+            // The engine gates every swap on the previous seal, so this
+            // indicates a bug. Dropping the sender stops that engine.
+            tracing::error!(
+                segment_base = previous.base,
+                next_segment_base = base,
+                "a new seal arrived while a previous seal was still pending"
+            );
+        }
+        if end < self.checkpoint_floor {
+            writer.shutdown_background_tasks().await;
+            self.skip_seal_below_floor(base, end, enforced, catalog_rx);
+            return;
+        }
+        let started = Instant::now();
         let quorum = crate::protocol::majority(self.factories.len());
-        let enforcement = match writer.seal().await {
-            Ok(report) => Ok((
-                SegmentDescriptor {
-                    id: id.clone(),
+        match writer.seal().await {
+            Ok(report) => {
+                let segment = SegmentDescriptor {
+                    id,
                     base_record_index: base,
                     end_record_index: end,
                     crc32c,
                     copies: quorum,
                     finalized_copies: quorum,
                     seal_pending: false,
-                },
-                report.all_replicas_finalized(),
-            )),
+                };
+                self.finish_seal(
+                    segment,
+                    report.all_replicas_finalized(),
+                    started,
+                    enforced,
+                    catalog_rx,
+                )
+                .await;
+            }
             Err(error) => {
                 tracing::warn!(
                     segment_base = base,
                     %error,
                     "live swapped-segment seal failed; reconstructing committed seal from storage"
                 );
-                self.retry_committed_seal(&id, base, end, &digest, crc32c)
-                    .await
-                    .map(|segment| (segment, false))
-            }
-        };
-
-        match enforcement {
-            Ok((segment, all_replicas_finalized)) => {
-                self.sealed.insert(base);
-                #[cfg(any(test, feature = "dst-support"))]
-                self.metrics.segments_sealed.increment();
-                self.metrics
-                    .seal_duration
-                    .record_duration(seal_started.elapsed());
-                tracing::info!(segment_base = base, "swapped segment seal enforced");
-                self.adopt_catalog(catalog_rx);
-                let _ = enforced.send(());
-                if !all_replicas_finalized {
-                    self.repair_segment_once(segment).await;
-                }
-            }
-            Err(error) => {
-                // The record range and digest remain in the manifest. Keeping
-                // the oneshot unresolved until this point lets transient
-                // outages recover without an availability cliff; dropping it
-                // only after bounded retries leaves the same safe restart
-                // recovery path as before.
-                tracing::warn!(
-                    segment_base = base,
-                    %error,
-                    "committed seal enforcement exhausted retries; rotation disabled until restart"
-                );
-                drop(enforced);
+                self.pending_seal = Some(PendingSeal {
+                    id,
+                    base,
+                    end,
+                    digest,
+                    crc32c,
+                    enforced,
+                    started,
+                    attempt: 0,
+                    retry_at: started,
+                });
+                self.retry_pending_seal(catalog_rx).await;
             }
         }
     }
 
-    async fn retry_committed_seal(
-        &self,
-        id: &str,
-        base_record_index: u64,
-        end_record_index: u64,
-        digest: &str,
-        crc32c: u32,
-    ) -> Result<SegmentDescriptor, Error> {
-        let mut attempt = 0usize;
-        loop {
-            match enforce_committed_seal(
-                &self.factories,
-                &self.prefix,
-                &self.client_config,
-                Arc::clone(&self.metrics),
-                id,
-                base_record_index,
-                end_record_index,
-                Some(digest),
-                crc32c,
-            )
-            .await
-            {
-                Ok(segment) => return Ok(segment),
-                Err(error) if attempt < self.client_config.max_retries => {
-                    tracing::warn!(
-                        segment_base = base_record_index,
-                        retry = attempt + 1,
-                        %error,
-                        "committed seal enforcement failed; retrying"
-                    );
-                    retry_sleep(&self.client_config, attempt).await;
-                    attempt += 1;
-                }
-                Err(error) => return Err(error),
+    /// Make one storage-only enforcement attempt for the pending seal, or
+    /// release it if truncation has passed the segment. A failed attempt
+    /// schedules the next one.
+    async fn retry_pending_seal(
+        &mut self,
+        catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
+    ) {
+        let Some(mut pending) = self.pending_seal.take() else {
+            return;
+        };
+        if pending.end < self.checkpoint_floor {
+            self.skip_seal_below_floor(pending.base, pending.end, pending.enforced, catalog_rx);
+            return;
+        }
+        match enforce_committed_seal(
+            &self.factories,
+            &self.prefix,
+            &self.client_config,
+            Arc::clone(&self.metrics),
+            &pending.id,
+            pending.base,
+            pending.end,
+            Some(&pending.digest),
+            pending.crc32c,
+        )
+        .await
+        {
+            Ok(segment) => {
+                self.finish_seal(
+                    segment,
+                    false,
+                    pending.started,
+                    pending.enforced,
+                    catalog_rx,
+                )
+                .await;
+            }
+            Err(error) => {
+                let delay = retry_delay(&self.client_config, pending.attempt)
+                    .min(COMMITTED_SEAL_MAX_RETRY_DELAY);
+                pending.attempt = pending.attempt.saturating_add(1);
+                pending.retry_at = Instant::now() + delay;
+                tracing::warn!(
+                    segment_base = pending.base,
+                    retry = pending.attempt,
+                    delay_ms = delay.as_millis(),
+                    %error,
+                    "committed seal enforcement failed; retrying"
+                );
+                self.pending_seal = Some(pending);
             }
         }
+    }
+
+    async fn finish_seal(
+        &mut self,
+        segment: SegmentDescriptor,
+        all_replicas_finalized: bool,
+        started: Instant,
+        enforced: oneshot::Sender<()>,
+        catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
+    ) {
+        let base = segment.base_record_index;
+        self.sealed.insert(base);
+        #[cfg(any(test, feature = "dst-support"))]
+        self.metrics.segments_sealed.increment();
+        self.metrics
+            .seal_duration
+            .record_duration(started.elapsed());
+        tracing::info!(segment_base = base, "swapped segment seal enforced");
+        self.adopt_catalog(catalog_rx);
+        let _ = enforced.send(());
+        if !all_replicas_finalized {
+            self.repair_segment_once(segment).await;
+        }
+    }
+
+    /// Release the engine for a segment below the committed floor. Marking it
+    /// sealed clears `seal_pending` from the catalog, so a later truncation
+    /// pass deletes any copies that remain.
+    fn skip_seal_below_floor(
+        &mut self,
+        base: u64,
+        end: u64,
+        enforced: oneshot::Sender<()>,
+        catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
+    ) {
+        tracing::info!(
+            segment_base = base,
+            segment_end = end,
+            floor = self.checkpoint_floor,
+            "swapped segment is below the committed truncation floor; seal skipped"
+        );
+        self.sealed.insert(base);
+        self.adopt_catalog(catalog_rx);
+        let _ = enforced.send(());
     }
 
     /// Merge the engine's latest sealed-catalog snapshot, keeping our
@@ -697,6 +792,7 @@ impl MaintenanceState {
             .collect();
         let result =
             cleanup_tombstones_pass(&factories, &prefix, &mut self.catalog, &mut manifest).await;
+        self.observe_committed_floor(&manifest);
         self.manifest = Some(manifest);
         match result {
             Ok(report) => {
@@ -888,10 +984,36 @@ impl MaintenanceState {
             floor,
         )
         .await;
+        self.observe_committed_floor(&manifest);
         self.manifest = Some(manifest);
         let report = result?;
         self.remember_catalog_deletions(before);
         Ok(report)
+    }
+
+    /// Raise the local floor to the manifest's committed floor.
+    ///
+    /// A floor can commit while this task fails to learn it directly: a
+    /// `raise_trunc` whose response was lost, or a cleanup pass that refreshed
+    /// the manifest and then failed a delete. Copies below that floor may be
+    /// deleted, so a pending seal must see it to stop reconstructing them.
+    fn observe_committed_floor(&mut self, manifest: &Manifest) {
+        self.checkpoint_floor = self.checkpoint_floor.max(manifest.record().trunc);
+    }
+
+    /// Release a pending seal now if the committed floor covers it, instead of
+    /// waiting for its next retry.
+    async fn release_seal_covered_by_floor(
+        &mut self,
+        catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
+    ) {
+        if self
+            .pending_seal
+            .as_ref()
+            .is_some_and(|pending| pending.end < self.checkpoint_floor)
+        {
+            self.retry_pending_seal(catalog_rx).await;
+        }
     }
 
     fn remember_catalog_deletions(&mut self, before: HashSet<u64>) {
@@ -904,6 +1026,26 @@ impl MaintenanceState {
                 self.deleted.insert(gone);
             }
         }
+    }
+}
+
+/// A committed seal waiting for its next storage-only enforcement attempt.
+struct PendingSeal {
+    id: String,
+    base: u64,
+    end: u64,
+    digest: String,
+    crc32c: u32,
+    enforced: oneshot::Sender<()>,
+    started: Instant,
+    attempt: usize,
+    retry_at: Instant,
+}
+
+async fn sleep_until_retry(retry_at: Option<Instant>) {
+    match retry_at {
+        Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+        None => std::future::pending().await,
     }
 }
 
