@@ -31,6 +31,10 @@ async fn floor(servers: &[RunningFake]) -> u64 {
     manifest(servers).await["chorus.trunc"].parse().unwrap()
 }
 
+async fn tail_base(servers: &[RunningFake]) -> u64 {
+    manifest(servers).await["chorus.tail_base"].parse().unwrap()
+}
+
 async fn names(servers: &[RunningFake], zone: usize) -> HashSet<String> {
     servers[zone]
         .service
@@ -602,6 +606,17 @@ async fn gc_keeps_live_history_bounded_across_more_than_one_directory_of_rotatio
     for seq in 1..=600 {
         writer.wal_writer.append(&[row(seq)]).await.unwrap();
         writer.wal_writer.flush().await.unwrap().await.unwrap();
+        // Appends no longer wait for a spare segment, so a slow spare lets
+        // more records share one segment. Two rows cross the 100-byte
+        // target; wait for that rotation to fold so the test produces the
+        // same number of segments however fast spares are provisioned.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while tail_base(&servers).await + 1 < seq {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotation did not keep up with appends");
         if seq % 8 == 0 {
             let current = names(&servers, 0).await;
             all_objects.extend(current);
