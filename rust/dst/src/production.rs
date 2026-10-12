@@ -2803,17 +2803,19 @@ impl ProductionHarness {
     /// Adversarial check for single-pending exhaustion. The first oversized
     /// record consumes the one preregistered pending segment. Refill creates
     /// are held, so the second oversized record commits on that segment and
-    /// makes another rotation due with no registered successor. Dispatch must
-    /// then remain fail-closed until refill and fold complete.
+    /// makes another rotation due with no registered successor. Appends must
+    /// keep committing into that registered pending segment, and nothing may
+    /// be written to an unregistered one, until refill and fold complete.
     ///
     /// The trap walks the engine there one record at a time so every rotation
     /// decision lands at a chosen record instead of a byte-count race. Each
     /// record alone overflows the segment budget; `inject_open_hold` holds
     /// only appendable CREATES, exactly the expensive awaits inside refill
     /// provisioning. Records [1]+[2] consume and fill the registered pending
-    /// segment while its replacement remains unavailable. Records [3..5] can
-    /// only queue. Releasing the holds lets the provisioner create the refill,
-    /// atomically fold the old tail and register it, and wake dispatch.
+    /// segment while its replacement remains unavailable. Records [3..5]
+    /// commit on the same segment. Releasing the holds lets the provisioner
+    /// create the refill, atomically fold the old tail and register it, and
+    /// rotate.
     async fn delayed_spare_provisioning(&mut self, remaining: u64) -> Result<()> {
         // The walk needs a healthy quorum and five oversized records;
         // degraded seeds exercise provisioning delay through other phases.
@@ -2845,47 +2847,21 @@ impl ProductionHarness {
                 }
             }
             self.wait_for_pre_fold_window(&tail, &pending).await?;
-            // [3..5]: the parked engine can only queue these
-            let mut parked_completions = Vec::new();
+            // [3..5]: no spare is registered, so these go into the active
+            // pending segment and commit while the refill is still held.
             for _ in 0..3 {
-                parked_completions.push(self.admit_padded(payload_len).await?);
-            }
-            // let the engine absorb the queue wakes and park for good before
-            // the release: from here its only legitimate wake is the
-            // provisioning completion itself
-            advance_virtual_ticks(SETTLING_MARGIN_TICKS).await;
-            let mut parked = Box::pin(join_all(parked_completions));
-            if let Ok(results) = tokio::time::timeout(SIM_TICK, &mut parked).await {
-                for zone in 0..3 {
-                    self.servers[zone].release_open_holds().await;
+                match self.settle_trap_record(payload_len, &mut receipts).await? {
+                    TrapStep::Committed => {}
+                    TrapStep::Poisoned => return Ok(TrapWalk::Poisoned(receipts)),
                 }
-                if results.iter().any(Result::is_ok) {
-                    bail!("pending exhaustion acknowledged a queued record before refill");
-                }
-                return Ok(TrapWalk::Poisoned(receipts));
             }
+            // The manifest still names the pre-fold [tail, pending] pair, so
+            // those records were written only to registered segments.
+            self.wait_for_pre_fold_window(&tail, &pending).await?;
             for zone in 0..3 {
                 self.servers[zone].release_open_holds().await;
             }
-            let mut poisoned = false;
-            for result in parked.await {
-                match result {
-                    Ok(receipt) => receipts.push(receipt),
-                    Err(chorus_client::Error::Poisoned)
-                    | Err(chorus_client::Error::Fenced(_))
-                    | Err(chorus_client::Error::Closed) => {
-                        poisoned = true;
-                    }
-                    Err(error) => {
-                        return Err(error).context("delayed-spare trap completion failed");
-                    }
-                }
-            }
-            Ok(if poisoned {
-                TrapWalk::Poisoned(receipts)
-            } else {
-                TrapWalk::Committed(receipts)
-            })
+            Ok::<_, anyhow::Error>(TrapWalk::Committed(receipts))
         };
         // A broken provisioning wake-up deadlocks the engine; fail the seed
         // instead of hanging the suite. The bound is virtual time — generous,

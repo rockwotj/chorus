@@ -56,12 +56,14 @@
 //! bounds that deferral with non-poisoning [`Error::ActiveSegmentFull`]
 //! backpressure.
 //!
-//! The default GCS manifest is one repeatedly updated object. Treat
-//! [`WalEngineConfig::max_segment_bytes`] as the single-pending refill floor:
-//! for encoded throughput `T` bytes/s and worst-case provision-plus-fold
-//! latency `L`, size it above `T * L` with operational headroom. Exceeding that
-//! bound is fail-closed: append dispatch pauses before an unregistered segment
-//! can receive records.
+//! The default GCS manifest is one repeatedly updated object. Rotation needs a
+//! registered spare segment, and the engine provisions one in the background.
+//! For encoded throughput `T` bytes/s and worst-case provision-plus-fold
+//! latency `L`, size [`WalEngineConfig::max_segment_bytes`] above `T * L` with
+//! operational headroom. A rotation that finds no spare ready is deferred, and
+//! appends keep going into the active segment up to
+//! [`WalEngineConfig::max_active_segment_bytes`]. No record is ever written to
+//! a segment that the manifest does not name.
 
 #![doc = ""]
 #![doc = "# Complete example"]

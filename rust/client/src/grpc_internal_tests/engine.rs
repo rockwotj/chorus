@@ -1188,7 +1188,7 @@ async fn ambiguous_not_found_takeover_cannot_retire_a_manifest_tail() {
 }
 
 #[tokio::test]
-async fn pending_exhaustion_backpressures_until_refill_is_registered() {
+async fn appends_continue_into_the_pending_segment_until_refill_is_registered() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(factories, manifest_factory, "pending-exhaustion-wal");
     let writer = volume.recover_writer().await.unwrap();
@@ -1205,41 +1205,64 @@ async fn pending_exhaustion_backpressures_until_refill_is_registered() {
     )
     .unwrap();
 
-    handle
-        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"old-tail"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
-    handle
-        .enqueue_append(
-            WalSeqNo::record(1),
-            bytes::Bytes::from_static(b"pending-tail"),
-        )
-        .await
-        .unwrap()
-        .await
-        .unwrap();
-    let blocked = handle
-        .enqueue_append(
-            WalSeqNo::record(2),
-            bytes::Bytes::from_static(b"after-refill"),
-        )
-        .await
-        .unwrap();
-    tokio::pin!(blocked);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), blocked.as_mut())
+    // Record 0 rotates the tail into the preregistered pending segment.
+    // Record 1 commits there and crosses the target again, but the refill
+    // create is held, so no spare is ready for a second rotation.
+    for (seqno, payload) in [(0, b"old-tail".as_slice()), (1, b"pending-tail")] {
+        handle
+            .enqueue_append(
+                WalSeqNo::record(seqno),
+                bytes::Bytes::copy_from_slice(payload),
+            )
             .await
-            .is_err(),
-        "append escaped while the single pending slot was exhausted"
-    );
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    // Without a spare, the record goes into the same registered pending
+    // segment instead of waiting for the refill.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .enqueue_append(
+                WalSeqNo::record(2),
+                bytes::Bytes::from_static(b"before-refill"),
+            )
+            .await
+            .unwrap(),
+    )
+    .await
+    .expect("append waited for the refill instead of using the active segment")
+    .unwrap();
 
     for server in &servers[..3] {
         server.service.release_open_holds().await;
     }
-    blocked.await.unwrap();
+    handle
+        .enqueue_append(
+            WalSeqNo::record(3),
+            bytes::Bytes::from_static(b"after-refill"),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
     shutdown_engine(handle).await;
+
+    let mut recovery = volume.recover(WalSeqNo::ZERO).await.unwrap();
+    let mut replayed = Vec::new();
+    while let Some(record) = recovery.try_next().await.unwrap() {
+        replayed.push((record.seqno.record_index, record.payload));
+    }
+    assert_eq!(
+        replayed,
+        vec![
+            (0, bytes::Bytes::from_static(b"old-tail")),
+            (1, bytes::Bytes::from_static(b"pending-tail")),
+            (2, bytes::Bytes::from_static(b"before-refill")),
+            (3, bytes::Bytes::from_static(b"after-refill")),
+        ]
+    );
 }
 
 #[tokio::test]
