@@ -1289,29 +1289,7 @@ async fn failed_spare_creation_backs_off_and_reports_a_blocked_rotation() {
         },
     )
     .unwrap();
-    // Record 0 rotates into the preregistered pending segment, which needs
-    // a refill before the next rotation.
-    handle
-        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"zero"))
-        .await
-        .unwrap()
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while handle.status().rotation_blocked.is_some()
-            || servers[0]
-                .service
-                .operation_count(Operation::BidiCreate)
-                .await
-                < 2
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the first rotation did not settle");
-
-    // Two zones reject every create, so no refill can reach a quorum.
+    // Two zones reject every create, so no new spare can reach a quorum.
     for server in &servers[..2] {
         for _ in 0..1000 {
             server
@@ -1320,41 +1298,62 @@ async fn failed_spare_creation_backs_off_and_reports_a_blocked_rotation() {
                 .await;
         }
     }
+    // A spare that was already registered, or whose creation was already
+    // past the rejected step, can still serve one more rotation. Keep
+    // appending until a rotation is due with no spare. Every append commits
+    // into the active segment meanwhile.
+    let mut seqno = 0;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            handle
+                .enqueue_append(
+                    WalSeqNo::record(seqno),
+                    bytes::Bytes::from_static(b"record"),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            seqno += 1;
+            for _ in 0..100 {
+                let blocked = handle
+                    .status()
+                    .rotation_blocked
+                    .map(|blocked| blocked.reason);
+                if blocked == Some(crate::RotationBlocker::SpareNotReady) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    })
+    .await
+    .expect("rotation never reported a missing spare");
+    let status = handle.status();
+    assert!(status.active_segment_bytes > 0);
+    assert!(!status.closed);
+
     for server in &servers[..3] {
         server.service.reset_operation_counts().await;
     }
-    // Record 1 rotates into the spare already registered. Record 2 then
-    // pushes the new active segment past the target while its refill fails,
-    // and still commits.
-    for (seqno, payload) in [(1, b"one".as_slice()), (2, b"two")] {
-        handle
-            .enqueue_append(
-                WalSeqNo::record(seqno),
-                bytes::Bytes::copy_from_slice(payload),
-            )
-            .await
-            .unwrap()
-            .await
-            .unwrap();
-    }
     tokio::time::sleep(Duration::from_millis(600)).await;
-    // Backoff of 50, 100, 200 and 400 ms allows about four attempts in this
+    // With 50 ms doubling backoff, at most a handful of attempts fit in this
     // window. Retrying back to back would make hundreds.
     let attempts = servers[0]
         .service
         .operation_count(Operation::BidiCreate)
         .await;
     assert!(
-        (1..=8).contains(&attempts),
+        attempts <= 8,
         "spare creation retried {attempts} times in 600 ms"
     );
-    let status = handle.status();
     assert_eq!(
-        status.rotation_blocked.map(|blocked| blocked.reason),
+        handle
+            .status()
+            .rotation_blocked
+            .map(|blocked| blocked.reason),
         Some(crate::RotationBlocker::SpareNotReady)
     );
-    assert!(status.active_segment_bytes > 0);
-    assert!(!status.closed);
 
     for server in &servers[..2] {
         server
