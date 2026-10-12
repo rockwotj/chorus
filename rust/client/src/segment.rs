@@ -2116,7 +2116,6 @@ mod writer {
         }
 
         /// Base record index of the active appendable segment.
-        #[cfg(test)]
         pub(crate) fn active_segment_base(&self) -> u64 {
             self.base_record_index
         }
@@ -2164,6 +2163,12 @@ mod writer {
         /// entries. Admitting a swap with room for only one wedges that
         /// recovery on [`ProtocolError::SegmentDirectoryFull`]; gating on two
         /// keeps the swap window always recoverable.
+        /// Whether the manifest directory has room for the two entries a
+        /// rotation reserves.
+        pub(crate) fn rotation_has_directory_room(&self) -> bool {
+            self.manifest.directory_has_room(2)
+        }
+
         pub(crate) fn rotation_due(&self, max_segment_bytes: usize) -> bool {
             self.segment_writer.committed_len() != 0
                 && !self.segment_writer.is_poisoned()

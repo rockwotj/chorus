@@ -22,6 +22,9 @@ use crate::transport::Replica;
 const DEFAULT_PIPELINE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_QUEUE_CAPACITY_BYTES: usize = DEFAULT_PIPELINE_WINDOW_BYTES * 16;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Upper bound on the delay before retrying failed spare provisioning or a
+/// failed fold. Delays start at `ClientConfig::retry_base` and double.
+const ROTATION_MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 /// Capacity controls for the in-process transactional WAL pipeline.
@@ -201,6 +204,74 @@ impl AppendReceipt {
     }
 }
 
+/// Point-in-time rotation and capacity health of a running WAL engine.
+///
+/// Rotation can be held up while appends keep committing into the active
+/// segment. Once that segment reaches
+/// [`WalEngineConfig::max_active_segment_bytes`], admission fails with
+/// [`Error::ActiveSegmentFull`]. An application that holds writer ownership
+/// through a lease can use this snapshot to report itself unhealthy before
+/// that point, for example when rotation has been blocked longer than its
+/// provisioning budget, so another process can take over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WalStatus {
+    /// Why the active segment has passed
+    /// [`WalEngineConfig::max_segment_bytes`] without rotating, and for how
+    /// long. `None` while the segment is within the target or a swap is
+    /// about to run.
+    pub rotation_blocked: Option<RotationBlocked>,
+    /// Encoded bytes admitted to the active segment, including queued and
+    /// in-flight records. Admission returns [`Error::ActiveSegmentFull`] when
+    /// the next record would take this past `max_active_segment_bytes`.
+    pub active_segment_bytes: usize,
+    /// Configured [`WalEngineConfig::max_active_segment_bytes`].
+    pub max_active_segment_bytes: usize,
+    /// Whether the engine has stopped. Admission then returns
+    /// [`Error::Closed`].
+    pub closed: bool,
+}
+
+/// A rotation that is due but cannot run yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RotationBlocked {
+    /// What the rotation is waiting for.
+    pub reason: RotationBlocker,
+    /// How long rotation has been blocked, across changes of reason.
+    pub duration: Duration,
+}
+
+/// What a blocked rotation is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RotationBlocker {
+    /// No registered spare segment is ready. Spare provisioning, or the fold
+    /// that registers the next spare, is in progress or retrying.
+    SpareNotReady,
+    /// The previous segment's seal has not reached a finalized quorum yet.
+    /// Maintenance retries it until it does or truncation covers it.
+    SealPending,
+    /// The manifest's sealed-segment directory is full. Truncation must
+    /// remove retained segments before rotation can proceed.
+    DirectoryFull,
+}
+
+/// Rotation health the engine publishes after each loop iteration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EngineStatus {
+    blocked: Option<BlockedRotation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockedRotation {
+    reason: RotationBlocker,
+    /// Base of the active segment whose rotation is blocked. A different base
+    /// means a rotation completed, so the blocked time starts over.
+    segment_base: u64,
+    since: tokio::time::Instant,
+}
+
 /// Owned durability future returned after a record is admitted in sequence.
 ///
 /// Dropping this value does not cancel the append. The WAL continues processing
@@ -262,6 +333,7 @@ pub struct WalHandle {
     max_active_segment_bytes: usize,
     total_admitted_bytes: u128,
     active_capacity: watch::Receiver<ActiveSegmentCapacity>,
+    status: watch::Receiver<EngineStatus>,
     inflight_bytes: Arc<Semaphore>,
     queue_slots: Arc<Semaphore>,
     queued_bytes: Arc<AtomicUsize>,
@@ -427,6 +499,7 @@ struct EngineControl {
     catalog: watch::Sender<Vec<crate::segment::SegmentDescriptor>>,
     maintenance: crate::maintenance::MaintenanceHandle,
     active_capacity: watch::Sender<ActiveSegmentCapacity>,
+    status: watch::Sender<EngineStatus>,
     queued_bytes: Arc<AtomicUsize>,
     rotation_rechecks: mpsc::Receiver<()>,
     provision_requests: mpsc::Sender<ProvisionAttempt>,
@@ -481,6 +554,7 @@ impl WalEngine {
             existing_bytes: active_segment_bytes,
             seal_room: active_segment_seal_room,
         });
+        let (status_tx, status) = watch::channel(EngineStatus::default());
         let (rotation_recheck, rotation_rechecks) = mpsc::channel(1);
         let (provision_requests, provision_attempts) = mpsc::channel::<ProvisionAttempt>(1);
         let (provision_results_tx, provision_results) = mpsc::channel(1);
@@ -510,6 +584,7 @@ impl WalEngine {
                 catalog: catalog_tx,
                 maintenance: maintenance.clone(),
                 active_capacity: active_capacity_tx,
+                status: status_tx,
                 queued_bytes: Arc::clone(&queued_bytes),
                 rotation_rechecks,
                 provision_requests,
@@ -530,6 +605,7 @@ impl WalEngine {
             max_active_segment_bytes,
             total_admitted_bytes: 0,
             active_capacity,
+            status,
             inflight_bytes,
             queue_slots,
             queued_bytes,
@@ -662,6 +738,29 @@ impl WalHandle {
         self.total_admitted_bytes = admission_end_bytes;
         self.next_seqno += 1;
         Ok(admitted)
+    }
+
+    /// Current rotation and capacity health. See [`WalStatus`].
+    pub fn status(&self) -> WalStatus {
+        let status = *self.status.borrow();
+        // The same accounting admission checks against the hard ceiling.
+        let capacity = *self.active_capacity.borrow();
+        let admitted_here = self
+            .total_admitted_bytes
+            .saturating_sub(capacity.admission_start_bytes);
+        let active_segment_bytes = (capacity.existing_bytes as u128)
+            .saturating_add(admitted_here)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        WalStatus {
+            rotation_blocked: status.blocked.map(|blocked| RotationBlocked {
+                reason: blocked.reason,
+                duration: blocked.since.elapsed(),
+            }),
+            active_segment_bytes,
+            max_active_segment_bytes: self.max_active_segment_bytes,
+            closed: self.sender.is_closed(),
+        }
     }
 
     /// Advance the application checkpoint floor and delete eligible sealed
@@ -878,6 +977,7 @@ async fn run_engine(
         catalog,
         maintenance,
         active_capacity,
+        status,
         queued_bytes,
         mut rotation_rechecks,
         provision_requests,
@@ -899,6 +999,10 @@ async fn run_engine(
     // `select!` wake source, so a swap waiting on a slow spare can never park
     // the engine. `spare_requested` keeps at most one attempt outstanding.
     let mut spare_requested = false;
+    // A failed spare attempt waits for `spare_retry` before the next one, so
+    // a failing provider does not see back-to-back object creates.
+    let mut spare_attempts = 0usize;
+    let mut spare_retry: Option<Pin<Box<Sleep>>> = None;
 
     'engine: loop {
         state.drain_available(&mut receiver);
@@ -982,7 +1086,7 @@ async fn run_engine(
         // a rotation it provisions then confirms `pending`; after a swap it
         // provisions an unregistered refill, then atomically folds the old
         // tail and registers that refill.
-        if !spare_requested {
+        if !spare_requested && spare_retry.is_none() {
             let attempt = if rotation.fold_ready(state.next_completion)
                 && writer.unregistered_spare_ready()
             {
@@ -1200,6 +1304,8 @@ async fn run_engine(
             break;
         }
 
+        publish_status(&status, &rotation, &writer, config.max_segment_bytes);
+
         // The single wait point: every event that can unblock the engine is a
         // branch here, so nothing the loop is waiting for can fail to wake it.
         //
@@ -1281,6 +1387,14 @@ async fn run_engine(
                     None => rotation_rechecks_open = false,
                 }
             }
+            () = async {
+                match spare_retry.as_mut() {
+                    Some(retry) => retry.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if spare_retry.is_some() => {
+                spare_retry = None;
+            }
             // provisioning results arrive the same way: with every caller
             // blocked on a queued append no command wakes the loop, and a due
             // rotation must swap the moment its spare lands
@@ -1288,9 +1402,11 @@ async fn run_engine(
                 spare_requested = false;
                 match result {
                     Some(Ok(ProvisionOutcome::Registered(spare))) => {
+                        spare_attempts = 0;
                         writer.adopt_registered_spare(*spare);
                     }
                     Some(Ok(ProvisionOutcome::Unregistered(id, spare))) => {
+                        spare_attempts = 0;
                         writer.adopt_unregistered_spare(id, spare);
                     }
                     Some(Ok(ProvisionOutcome::Folded(update))) => {
@@ -1348,6 +1464,11 @@ async fn run_engine(
                             tracing::warn!(%error, "background rotation work failed; will retry");
                             if rotation.has_pending_fold() && writer.unregistered_spare_ready() {
                                 rotation.arm_fold_retry(&client_config);
+                            } else {
+                                let delay = crate::protocol::retry_delay(&client_config, spare_attempts)
+                                    .min(ROTATION_MAX_RETRY_DELAY);
+                                spare_attempts = spare_attempts.saturating_add(1);
+                                spare_retry = Some(Box::pin(tokio::time::sleep(delay)));
                             }
                         }
                     }
@@ -1564,6 +1685,53 @@ async fn seal_active_on_shutdown(
     }
 }
 
+/// Publish what, if anything, holds up a rotation the active segment's size
+/// calls for. The blocked-since time survives a change of reason but starts
+/// over when the active segment changes.
+fn publish_status(
+    status: &watch::Sender<EngineStatus>,
+    rotation: &Rotation,
+    writer: &SegmentedWriter,
+    max_segment_bytes: usize,
+) {
+    let blocker = if writer.active_segment_bytes() < max_segment_bytes {
+        None
+    } else {
+        match rotation {
+            Rotation::Idle => {
+                (!writer.rotation_has_directory_room()).then_some(RotationBlocker::DirectoryFull)
+            }
+            Rotation::Due => (!writer.spare_ready()).then_some(RotationBlocker::SpareNotReady),
+            Rotation::Draining {
+                fold_capacity_blocked: true,
+                ..
+            } => Some(RotationBlocker::DirectoryFull),
+            Rotation::Draining { .. } => Some(RotationBlocker::SpareNotReady),
+            Rotation::Sealing { .. } => Some(RotationBlocker::SealPending),
+        }
+    };
+    let segment_base = writer.active_segment_base();
+    status.send_if_modified(|current| {
+        let blocked = blocker.map(|reason| {
+            let since = current
+                .blocked
+                .filter(|blocked| blocked.segment_base == segment_base)
+                .map_or_else(tokio::time::Instant::now, |blocked| blocked.since);
+            BlockedRotation {
+                reason,
+                segment_base,
+                since,
+            }
+        });
+        let next = EngineStatus { blocked };
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    });
+}
+
 /// What the rotation wake arm of the engine's `select!` observed: the two
 /// rotation states that wait on a future share one arm so only one `&mut
 /// rotation` borrow exists across the `select!`.
@@ -1659,7 +1827,8 @@ impl Rotation {
             ..
         } = self
         {
-            let delay = crate::protocol::retry_delay(config, *fold_attempts);
+            let delay =
+                crate::protocol::retry_delay(config, *fold_attempts).min(ROTATION_MAX_RETRY_DELAY);
             *fold_attempts = fold_attempts.saturating_add(1);
             *retry = Some(Box::pin(tokio::time::sleep(delay)));
         }
