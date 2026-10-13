@@ -1883,6 +1883,38 @@ async fn shutdown_deadline_aborts_a_stuck_append_pipeline() {
     );
 }
 
+#[tokio::test]
+async fn shutdown_deadline_after_the_engine_joined_does_not_panic() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(factories, manifest_factory, "shutdown-joined-wal");
+    let mut handle = WalEngine::start(
+        volume.recover_writer().await.unwrap(),
+        WalEngineConfig {
+            repair_interval: None,
+            shutdown_timeout: Duration::from_millis(200),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    handle
+        .enqueue_append(WalSeqNo::ZERO, bytes::Bytes::from_static(b"sealed"))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    // The shutdown seal runs on the maintenance task. With finalization held,
+    // the engine joins and maintenance is still sealing at the deadline.
+    for server in &servers[..3] {
+        server.service.inject_finalize_hold().await;
+    }
+    let error = tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("shutdown exceeded its configured deadline and cleanup bound")
+        .unwrap_err();
+    assert!(matches!(error, Error::ShutdownTimeout { .. }));
+}
+
 async fn append_and_shutdown(handle: WalHandle, records: u64) {
     let mut handle = handle;
     let mut completions = Vec::new();
