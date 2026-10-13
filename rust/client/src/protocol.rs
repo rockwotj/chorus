@@ -2128,6 +2128,13 @@ const MAX_OUTSTANDING_FLUSHES: usize = 2;
 /// being written as many small messages.
 const LANE_UNFLUSHED_SEND_BYTES: i64 = 1 << 20;
 
+/// Bounds on the delay between lane recovery attempts. The floor keeps a zero
+/// `retry_base` from retrying an immediately failing call without time
+/// advancing toward the stall deadline. The ceiling keeps attempts coming
+/// during a long outage, so the lane recovers soon after the service does.
+const LANE_RECOVERY_MIN_DELAY: Duration = Duration::from_millis(1);
+const LANE_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
+
 struct LaneRuntime {
     replica: Arc<dyn Replica>,
     token: AppendToken,
@@ -2756,44 +2763,39 @@ impl LaneRuntime {
                             self.flushes.push_back(end);
                             return Ok(());
                         }
-                        Err(error)
-                            if error.code.transient() && attempt < self.config.max_retries =>
-                        {
-                            if tokio::time::timeout_at(
-                                self.stall_deadline(),
-                                retry_sleep(&self.config, attempt),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                if self.confirm_timeout().await? {
-                                    continue;
-                                }
+                        Err(error) if error.code.transient() => {
+                            if !self.recovery_backoff(&mut attempt).await? {
                                 return Ok(());
                             }
-                            attempt += 1;
                         }
                         Err(error) => return Err(LaneDeath::Transport(error)),
                     }
                 }
-                Err(error) if error.code.transient() && attempt < self.config.max_retries => {
-                    if tokio::time::timeout_at(
-                        self.stall_deadline(),
-                        retry_sleep(&self.config, attempt),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        if self.confirm_timeout().await? {
-                            continue;
-                        }
+                Err(error) if error.code.transient() => {
+                    if !self.recovery_backoff(&mut attempt).await? {
                         return Ok(());
                     }
-                    attempt += 1;
                 }
                 Err(error) => return Err(LaneDeath::Transport(error)),
             }
         }
+    }
+
+    /// Wait before the next recovery attempt. Transient failures are retried
+    /// until the stall deadline, so a lane is shed only after the stall
+    /// timeout passes without durable progress. Returns whether recovery
+    /// should run again.
+    async fn recovery_backoff(&mut self, attempt: &mut usize) -> Result<bool, LaneDeath> {
+        let delay = retry_delay(&self.config, *attempt)
+            .clamp(LANE_RECOVERY_MIN_DELAY, LANE_RECOVERY_MAX_DELAY);
+        *attempt += 1;
+        if tokio::time::timeout_at(self.stall_deadline(), tokio::time::sleep(delay))
+            .await
+            .is_ok()
+        {
+            return Ok(true);
+        }
+        self.confirm_timeout().await
     }
 }
 
