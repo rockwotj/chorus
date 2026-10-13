@@ -11,7 +11,7 @@
 //! recovery epoch. Sealed-catalog snapshots arrive from the engine through a
 //! watch channel after every rotation.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,10 +36,6 @@ const MAINTENANCE_COMMAND_CAPACITY: usize = 64;
 const COMMITTED_SEAL_MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 pub(crate) enum MaintenanceCmd {
-    /// Repair only one newly sealed segment whose finalization did not
-    /// succeed on every replica.
-    #[cfg_attr(not(test), allow(dead_code))]
-    RepairSegment(SegmentDescriptor),
     /// Finalize a swapped-out segment off the hot path: await lane
     /// acknowledgments, finalize at the committed boundary (signaling
     /// `enforced`), and repair only this segment when needed.
@@ -51,10 +47,12 @@ pub(crate) enum MaintenanceCmd {
         /// exactly the one segment recovery enforces.
         enforced: oneshot::Sender<()>,
     },
-    /// Raise the committed floor and delete covered sealed segments.
+    /// Raise the committed floor and delete covered sealed segments. Queued
+    /// truncations with no seal between them run once at the highest floor
+    /// and answer every caller.
     Truncate {
         floor: WalSeqNo,
-        response: oneshot::Sender<Result<TruncationReport, Error>>,
+        responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
     },
 }
 
@@ -118,8 +116,11 @@ impl MaintenanceHandle {
 
     pub(crate) async fn truncate(&self, floor: WalSeqNo) -> Result<TruncationReport, Error> {
         let (response, receiver) = oneshot::channel();
-        self.enqueue(MaintenanceCmd::Truncate { floor, response })
-            .await?;
+        self.enqueue(MaintenanceCmd::Truncate {
+            floor,
+            responses: vec![response],
+        })
+        .await?;
         receiver.await.map_err(|_| Error::Closed)?
     }
 
@@ -223,7 +224,7 @@ async fn run(
     // deletion stragglers and immutable-copy repair. Cleanup runs first so
     // repair never spends work on a tombstone the committed floor already
     // made unreachable.
-    let mut pending = PendingCommands::default();
+    let mut pending = VecDeque::new();
     if maintenance_pass_or_shutdown(&mut task, &mut catalog_rx, &mut shutdown).await {
         commands.close();
         while let Some(command) = next_command(&mut commands, &mut pending).await {
@@ -308,21 +309,18 @@ async fn maintenance_pass_or_shutdown(
 async fn execute_command(
     task: &mut MaintenanceState,
     catalog_rx: &mut watch::Receiver<Vec<SegmentDescriptor>>,
-    command: ReadyCommand,
+    command: MaintenanceCmd,
 ) {
-    task.metrics.adjust_maintenance_queue_depth(
-        -i64::try_from(command.queued_requests).unwrap_or(i64::MAX),
-    );
-    match command.kind {
-        ReadyCommandKind::RepairSegment(segment) => {
-            task.adopt_catalog(catalog_rx);
-            task.repair_segment_once(segment).await;
-        }
-        ReadyCommandKind::SealSegment { segment, enforced } => {
+    match command {
+        MaintenanceCmd::SealSegment { segment, enforced } => {
+            task.metrics.adjust_maintenance_queue_depth(-1);
             task.seal_segment(*segment, enforced, catalog_rx).await;
             task.adopt_catalog(catalog_rx);
         }
-        ReadyCommandKind::Truncate { floor, responses } => {
+        MaintenanceCmd::Truncate { floor, responses } => {
+            task.metrics.adjust_maintenance_queue_depth(
+                -i64::try_from(responses.len()).unwrap_or(i64::MAX),
+            );
             task.adopt_catalog(catalog_rx);
             let result = task.truncate_once(floor).await;
             match &result {
@@ -351,166 +349,39 @@ async fn execute_command(
     }
 }
 
-#[derive(Default)]
-struct PendingCommands {
-    groups: VecDeque<PendingGroup>,
-}
-
-enum PendingGroup {
-    Work(PendingWork),
-    Seal {
-        segment: Box<SwappedSegment>,
-        enforced: oneshot::Sender<()>,
-    },
-}
-
-#[derive(Default)]
-struct PendingWork {
-    repairs: BTreeMap<(u64, String), (SegmentDescriptor, usize)>,
-    truncation: Option<PendingTruncation>,
-}
-
-struct PendingTruncation {
-    floor: WalSeqNo,
-    responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
-}
-
-struct ReadyCommand {
-    kind: ReadyCommandKind,
-    queued_requests: usize,
-}
-
-enum ReadyCommandKind {
-    RepairSegment(SegmentDescriptor),
-    SealSegment {
-        segment: Box<SwappedSegment>,
-        enforced: oneshot::Sender<()>,
-    },
-    Truncate {
-        floor: WalSeqNo,
-        responses: Vec<oneshot::Sender<Result<TruncationReport, Error>>>,
-    },
-}
-
-impl PendingCommands {
-    fn push(&mut self, command: MaintenanceCmd) {
-        match command {
-            MaintenanceCmd::SealSegment { segment, enforced } => {
-                // A seal owns a swapped writer and is a strict FIFO barrier:
-                // work received before it remains before it, and work received
-                // after it cannot overtake it.
-                self.groups
-                    .push_back(PendingGroup::Seal { segment, enforced });
+/// Queue a received command. A truncation merges into a truncation at the
+/// back of the queue. A seal owns a swapped writer and is a strict FIFO
+/// barrier: work received before it stays before it, and work received after
+/// it cannot overtake it.
+fn push_command(pending: &mut VecDeque<MaintenanceCmd>, command: MaintenanceCmd) {
+    match (pending.back_mut(), command) {
+        (
+            Some(MaintenanceCmd::Truncate {
+                floor: queued_floor,
+                responses: queued_responses,
+            }),
+            MaintenanceCmd::Truncate { floor, responses },
+        ) => {
+            if floor.record_index > queued_floor.record_index {
+                *queued_floor = floor;
             }
-            MaintenanceCmd::RepairSegment(segment) => self.push_repair(segment),
-            MaintenanceCmd::Truncate { floor, response } => {
-                self.push_truncation(floor, response);
-            }
+            queued_responses.extend(responses);
         }
-    }
-
-    fn push_repair(&mut self, segment: SegmentDescriptor) {
-        let key = (segment.base_record_index, segment.id.clone());
-        if let Some(PendingGroup::Work(work)) = self.groups.back_mut() {
-            match work.repairs.entry(key) {
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let value = entry.get_mut();
-                    value.0 = segment;
-                    value.1 += 1;
-                }
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((segment, 1));
-                }
-            }
-            return;
-        }
-        let mut work = PendingWork::default();
-        work.repairs.insert(key, (segment, 1));
-        self.groups.push_back(PendingGroup::Work(work));
-    }
-
-    fn push_truncation(
-        &mut self,
-        floor: WalSeqNo,
-        response: oneshot::Sender<Result<TruncationReport, Error>>,
-    ) {
-        if let Some(PendingGroup::Work(work)) = self.groups.back_mut() {
-            merge_truncation(work, floor, response);
-            return;
-        }
-        let mut work = PendingWork::default();
-        merge_truncation(&mut work, floor, response);
-        self.groups.push_back(PendingGroup::Work(work));
-    }
-
-    fn pop_front(&mut self) -> Option<ReadyCommand> {
-        loop {
-            match self.groups.front_mut()? {
-                PendingGroup::Work(work) => {
-                    if let Some(truncation) = work.truncation.take() {
-                        let queued_requests = truncation.responses.len();
-                        return Some(ReadyCommand {
-                            kind: ReadyCommandKind::Truncate {
-                                floor: truncation.floor,
-                                responses: truncation.responses,
-                            },
-                            queued_requests,
-                        });
-                    }
-                    if let Some((_, (segment, queued_requests))) = work.repairs.pop_first() {
-                        return Some(ReadyCommand {
-                            kind: ReadyCommandKind::RepairSegment(segment),
-                            queued_requests,
-                        });
-                    }
-                    self.groups.pop_front();
-                }
-                PendingGroup::Seal { .. } => match self.groups.pop_front() {
-                    Some(PendingGroup::Seal { segment, enforced }) => {
-                        return Some(ReadyCommand {
-                            kind: ReadyCommandKind::SealSegment { segment, enforced },
-                            queued_requests: 1,
-                        });
-                    }
-                    _ => unreachable!("front group was a seal"),
-                },
-            }
-        }
-    }
-}
-
-fn merge_truncation(
-    work: &mut PendingWork,
-    floor: WalSeqNo,
-    response: oneshot::Sender<Result<TruncationReport, Error>>,
-) {
-    match &mut work.truncation {
-        Some(truncation) => {
-            if floor.record_index > truncation.floor.record_index {
-                truncation.floor = floor;
-            }
-            truncation.responses.push(response);
-        }
-        None => {
-            work.truncation = Some(PendingTruncation {
-                floor,
-                responses: vec![response],
-            });
-        }
+        (_, command) => pending.push_back(command),
     }
 }
 
 async fn next_command(
     commands: &mut mpsc::Receiver<MaintenanceCmd>,
-    pending: &mut PendingCommands,
-) -> Option<ReadyCommand> {
+    pending: &mut VecDeque<MaintenanceCmd>,
+) -> Option<MaintenanceCmd> {
     loop {
         if let Some(command) = pending.pop_front() {
             return Some(command);
         }
-        pending.push(commands.recv().await?);
+        push_command(pending, commands.recv().await?);
         while let Ok(command) = commands.try_recv() {
-            pending.push(command);
+            push_command(pending, command);
         }
     }
 }
@@ -1062,54 +933,40 @@ async fn tick(interval: &mut Option<Interval>) {
 mod tests {
     use super::*;
 
-    fn segment(base: u64) -> SegmentDescriptor {
-        SegmentDescriptor {
-            id: format!("segment-{base}"),
-            base_record_index: base,
-            end_record_index: base,
-            crc32c: base as u32,
-            copies: 3,
-            finalized_copies: 2,
-            seal_pending: false,
-        }
-    }
-
     #[tokio::test]
     async fn maintenance_command_flood_is_bounded_and_coalesced() {
         let (tx, mut rx) = mpsc::channel(MAINTENANCE_COMMAND_CAPACITY);
-        let mut truncation_receivers = Vec::new();
+        let mut receivers = Vec::new();
+        let truncate = |index: usize, receivers: &mut Vec<_>| {
+            let (response, receiver) = oneshot::channel();
+            receivers.push(receiver);
+            MaintenanceCmd::Truncate {
+                floor: WalSeqNo::record(index as u64),
+                responses: vec![response],
+            }
+        };
         for index in 0..MAINTENANCE_COMMAND_CAPACITY {
-            let command = if index % 2 == 0 {
-                MaintenanceCmd::RepairSegment(segment((index % 8) as u64))
-            } else {
-                let (response, receiver) = oneshot::channel();
-                truncation_receivers.push(receiver);
-                MaintenanceCmd::Truncate {
-                    floor: WalSeqNo::record(index as u64),
-                    response,
-                }
-            };
-            tx.try_send(command).expect("fixed-capacity flood fits");
+            tx.try_send(truncate(index, &mut receivers))
+                .expect("fixed-capacity flood fits");
         }
+        let mut overflow = Vec::new();
         assert!(matches!(
-            tx.try_send(MaintenanceCmd::RepairSegment(segment(99))),
+            tx.try_send(truncate(MAINTENANCE_COMMAND_CAPACITY, &mut overflow)),
             Err(mpsc::error::TrySendError::Full(_))
         ));
 
-        let mut pending = PendingCommands::default();
-        let Some(ReadyCommand {
-            kind: ReadyCommandKind::Truncate { floor, responses },
-            queued_requests,
-        }) = next_command(&mut rx, &mut pending).await
+        let mut pending = VecDeque::new();
+        let Some(MaintenanceCmd::Truncate { floor, responses }) =
+            next_command(&mut rx, &mut pending).await
         else {
-            panic!("coalesced truncation must run before deduplicated repairs");
+            panic!("the flood did not coalesce into one truncation");
         };
+        assert!(pending.is_empty());
         assert_eq!(
             floor,
             WalSeqNo::record((MAINTENANCE_COMMAND_CAPACITY - 1) as u64)
         );
-        assert_eq!(responses.len(), truncation_receivers.len());
-        assert_eq!(queued_requests, truncation_receivers.len());
+        assert_eq!(responses.len(), receivers.len());
 
         let report = TruncationReport {
             deleted_objects: 3,
@@ -1118,27 +975,8 @@ mod tests {
         for response in responses {
             let _ = response.send(Ok(report.clone()));
         }
-        for receiver in truncation_receivers {
+        for receiver in receivers {
             assert_eq!(receiver.await.unwrap().unwrap(), report);
         }
-
-        let mut repaired = Vec::new();
-        let mut repaired_requests = 0;
-        while let Some(command) = pending.pop_front() {
-            repaired_requests += command.queued_requests;
-            match command.kind {
-                ReadyCommandKind::RepairSegment(segment) => {
-                    repaired.push(segment.base_record_index);
-                }
-                ReadyCommandKind::SealSegment { .. } | ReadyCommandKind::Truncate { .. } => {
-                    panic!("flood coalescer emitted an unexpected command");
-                }
-            }
-        }
-        assert_eq!(repaired, (0..8).step_by(2).collect::<Vec<_>>());
-        assert_eq!(
-            repaired_requests + queued_requests,
-            MAINTENANCE_COMMAND_CAPACITY
-        );
     }
 }
