@@ -189,3 +189,24 @@ async fn replace_appendable_without_an_observation_creates_only_when_absent() {
     assert_eq!(observed.bytes, first);
     assert!(!observed.finalized);
 }
+
+#[tokio::test]
+async fn exhausted_read_redirects_fail_as_retryable() {
+    let server = FakeGcs::default().start().await.unwrap();
+    let factory =
+        GrpcReplicaFactory::connect(0, &server.endpoint, "projects/_/buckets/zone-0", None)
+            .await
+            .unwrap();
+    let replica = factory.replica("redirect-loop");
+    let mut token = replica.create_append_session(HashMap::new()).await.unwrap();
+    replica.finalize(&mut token, 0).await.unwrap();
+    for index in 0..16 {
+        server
+            .service
+            .inject_redirect(Operation::BidiRead, format!("redirect-{index}"))
+            .await;
+    }
+    let error = replica.read_range(0).await.unwrap_err();
+    assert_eq!(error.code, TransportCode::Unavailable);
+    assert!(error.code.transient());
+}
