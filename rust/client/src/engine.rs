@@ -936,10 +936,10 @@ impl WalHandle {
                 engine_task.abort();
                 maintenance_task.abort();
                 let cleanup = async {
-                    let _ = tokio::join!(
-                        &mut engine_task,
-                        &mut provisioner_task,
-                        &mut maintenance_task
+                    tokio::join!(
+                        join_unfinished(&mut engine_task),
+                        join_unfinished(&mut provisioner_task),
+                        join_unfinished(&mut maintenance_task)
                     );
                 };
                 if tokio::time::timeout(shutdown_timeout, cleanup)
@@ -949,10 +949,10 @@ impl WalHandle {
                     engine_task.abort();
                     provisioner_task.abort();
                     maintenance_task.abort();
-                    let _ = tokio::join!(
-                        &mut engine_task,
-                        &mut provisioner_task,
-                        &mut maintenance_task
+                    tokio::join!(
+                        join_unfinished(&mut engine_task),
+                        join_unfinished(&mut provisioner_task),
+                        join_unfinished(&mut maintenance_task)
                     );
                     tracing::error!(
                         "WAL shutdown required forced cancellation after the cleanup deadline"
@@ -963,6 +963,15 @@ impl WalHandle {
                 })
             }
         }
+    }
+}
+
+/// Await a task unless it has already finished. The graceful shutdown path
+/// may have joined a task before its deadline passed, and polling a
+/// `JoinHandle` again after it returned panics.
+async fn join_unfinished(task: &mut tokio::task::JoinHandle<()>) {
+    if !task.is_finished() {
+        let _ = task.await;
     }
 }
 
