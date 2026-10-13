@@ -1003,6 +1003,13 @@ async fn run_engine(
     // a failing provider does not see back-to-back object creates.
     let mut spare_attempts = 0usize;
     let mut spare_retry: Option<Pin<Box<Sleep>>> = None;
+    // A truncation that removed directory entries asks the engine to re-read
+    // the manifest. Until a re-read succeeds, rotation and a fold parked on a
+    // full directory see the directory as it was before the truncation, so a
+    // failed re-read is retried with backoff.
+    let mut recheck_due = false;
+    let mut recheck_attempts = 0usize;
+    let mut recheck_retry: Option<Pin<Box<Sleep>>> = None;
 
     'engine: loop {
         state.drain_available(&mut receiver);
@@ -1080,6 +1087,31 @@ async fn run_engine(
             }
             state.poison(&mut receiver, &metrics);
             break 'engine;
+        }
+
+        if recheck_due {
+            recheck_due = false;
+            match writer.refresh_rotation_due(config.max_segment_bytes).await {
+                Ok(due) => {
+                    recheck_attempts = 0;
+                    rotation.release_fold_capacity_block();
+                    rotation.mark_due(due);
+                    active_capacity.send_modify(|capacity| {
+                        capacity.seal_room = writer.active_segment_has_seal_room();
+                    });
+                }
+                Err(error) => {
+                    let delay = crate::protocol::retry_delay(&client_config, recheck_attempts)
+                        .min(ROTATION_MAX_RETRY_DELAY);
+                    recheck_attempts = recheck_attempts.saturating_add(1);
+                    recheck_retry = Some(Box::pin(tokio::time::sleep(delay)));
+                    tracing::warn!(
+                        %error,
+                        delay_ms = delay.as_millis(),
+                        "failed to refresh rotation eligibility after truncation; retrying"
+                    );
+                }
+            }
         }
 
         // The dedicated worker owns all create/open and manifest work. Before
@@ -1367,25 +1399,21 @@ async fn run_engine(
             request = rotation_rechecks.recv(), if rotation_rechecks_open => {
                 match request {
                     Some(()) => {
-                        match writer.refresh_rotation_due(config.max_segment_bytes).await {
-                            Ok(due) => {
-                                rotation.release_fold_capacity_block();
-                                rotation.mark_due(due);
-                                active_capacity.send_modify(|capacity| {
-                                    capacity.seal_room =
-                                        writer.active_segment_has_seal_room();
-                                });
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "failed to refresh rotation eligibility after truncation"
-                                );
-                            }
-                        }
+                        recheck_due = true;
+                        recheck_attempts = 0;
+                        recheck_retry = None;
                     }
                     None => rotation_rechecks_open = false,
                 }
+            }
+            () = async {
+                match recheck_retry.as_mut() {
+                    Some(retry) => retry.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if recheck_retry.is_some() => {
+                recheck_retry = None;
+                recheck_due = true;
             }
             () = async {
                 match spare_retry.as_mut() {

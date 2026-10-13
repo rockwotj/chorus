@@ -442,6 +442,68 @@ async fn active_segment_ceiling_backpressures_cleanly_until_truncation_frees_rot
 }
 
 #[tokio::test]
+async fn failed_manifest_refresh_after_truncation_is_retried() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(factories, manifest_factory, "refresh-retry-wal");
+    let mut writer = volume.recover_writer().await.unwrap();
+    loop {
+        append_one(&mut writer, b"x").await;
+        if !writer.rotation_due(1) {
+            break;
+        }
+        writer.rotate().await.unwrap();
+    }
+    let active_base = writer.active_segment_base();
+    let next = WalSeqNo::record(writer.committed_record_end());
+    let mut handle = WalEngine::start(
+        writer,
+        WalEngineConfig {
+            max_inflight_bytes: 5,
+            max_replica_lag_bytes: 5,
+            max_segment_bytes: 1,
+            max_active_segment_bytes: 5,
+            repair_interval: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        handle
+            .enqueue_append(next, bytes::Bytes::from_static(b"y"))
+            .await,
+        Err(Error::ActiveSegmentFull { .. })
+    ));
+
+    // The test runtime is single-threaded, so the engine handles the
+    // truncation's rotation recheck only after this task yields. Crash the
+    // manifest bucket first so that refresh fails.
+    let report = handle
+        .truncate_before(WalSeqNo::record(active_base))
+        .await
+        .unwrap();
+    servers[3].service.set_crashed(true).await;
+    assert!(report.deleted_segments > 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    servers[3].service.set_crashed(false).await;
+    let completion = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match handle
+                .enqueue_append(next, bytes::Bytes::from_static(b"y"))
+                .await
+            {
+                Err(Error::ActiveSegmentFull { .. }) => tokio::task::yield_now().await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("rotation did not resume after a failed manifest refresh")
+    .unwrap();
+    completion.await.unwrap();
+    shutdown_engine(handle).await;
+}
+
+#[tokio::test]
 async fn admission_requires_manifest_room_to_seal_the_active_segment() {
     let (_servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(factories, manifest_factory, "active-seal-slot-wal");
