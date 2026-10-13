@@ -105,6 +105,35 @@ async fn one_crashed_zone_does_not_block_a_write_quorum() {
 }
 
 #[tokio::test]
+async fn lanes_survive_a_quorum_outage_shorter_than_the_stall_timeout() {
+    let (servers, factories, manifest_factory) = factory_cluster().await;
+    let volume = volume(factories, manifest_factory, "short-outage-wal");
+    let mut writer = volume.recover_writer().await.unwrap();
+    assert_eq!(append_one(&mut writer, b"before").await, 0);
+
+    for zone in [0usize, 1] {
+        servers[zone].service.set_crashed(true).await;
+    }
+    let pending = writer
+        .enqueue_records(vec![record(b"during")])
+        .await
+        .unwrap()
+        .remove(0);
+    // test_config retries 3 times with no backoff, far shorter than this
+    // outage. Lanes keep retrying until the 5 second stall timeout.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for zone in [0usize, 1] {
+        servers[zone].service.set_crashed(false).await;
+    }
+    let committed = tokio::time::timeout(Duration::from_secs(5), pending.wait())
+        .await
+        .expect("append did not commit after storage returned")
+        .expect("a short outage on a quorum of zones poisoned the writer");
+    assert_eq!(committed, 1);
+    assert_eq!(append_one(&mut writer, b"after").await, 2);
+}
+
+#[tokio::test]
 async fn delayed_third_lane_does_not_block_ordered_quorum_progress() {
     let (servers, factories, manifest_factory) = factory_cluster().await;
     let volume = volume(factories.clone(), manifest_factory.clone(), "slow-lane-wal");
