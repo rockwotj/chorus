@@ -1597,7 +1597,9 @@ impl Replica for GrpcReplica {
                 "bidirectional read offset must be nonnegative",
             ));
         }
-        for attempt in 0..=MAX_WRITE_REDIRECTS {
+        // A redirect on the last attempt still records its routing token for
+        // the next call, and the read fails as retryable.
+        for _ in 0..=MAX_WRITE_REDIRECTS {
             let mut slot = self.read_session.lock().await;
             let read_id = match slot.as_mut() {
                 Some(session) => {
@@ -1658,7 +1660,7 @@ impl Replica for GrpcReplica {
                         Ok(Ok(response)) => response.into_inner(),
                         Ok(Err(status)) => {
                             drop(slot);
-                            if attempt < MAX_WRITE_REDIRECTS && self.try_capture_redirect(&status) {
+                            if self.try_capture_redirect(&status) {
                                 continue;
                             }
                             return Err(self.status(status));
@@ -1691,7 +1693,7 @@ impl Replica for GrpcReplica {
                 Err(status) => {
                     *slot = None;
                     drop(slot);
-                    if attempt < MAX_WRITE_REDIRECTS && self.try_capture_redirect(&status) {
+                    if self.try_capture_redirect(&status) {
                         continue;
                     }
                     return Err(self.status(status));
@@ -1699,7 +1701,7 @@ impl Replica for GrpcReplica {
             }
         }
         Err(self.error(
-            TransportCode::Aborted,
+            TransportCode::Unavailable,
             "BidiReadObject exhausted zonal redirects",
         ))
     }

@@ -1647,6 +1647,23 @@ impl Storage for FakeGcs {
             .read_object_spec
             .clone()
             .ok_or_else(|| Status::invalid_argument("first read request requires object spec"))?;
+        {
+            // An open carrying the front redirect's token consumes it. Any
+            // redirect still queued then redirects this open, so a queue of
+            // distinct tokens redirects one open after another.
+            let mut state = self.inner.lock().await;
+            if let Some(queue) = state.redirects.get_mut(&Operation::BidiRead) {
+                if spec.routing_token.is_some()
+                    && queue.front().map(String::as_str) == spec.routing_token.as_deref()
+                {
+                    queue.pop_front();
+                }
+                if let Some(token) = queue.front().cloned() {
+                    state.observed_faults += 1;
+                    return Err(redirect_status(token));
+                }
+            }
+        }
         if spec.generation == 0 {
             // Bind every range to the opening generation. The fake stores only
             // the current object, so replacement fails the existing generation
