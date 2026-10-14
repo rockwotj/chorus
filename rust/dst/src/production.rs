@@ -3290,6 +3290,29 @@ impl ProductionHarness {
             bail!("racing-recoveries setup acknowledged an unexpected sequence number");
         }
 
+        // The setup append only needs a quorum. Queued torn-write faults from
+        // an earlier phase can therefore retire its third lane even though the
+        // record committed. Recover that acknowledged prefix before installing
+        // the three-lane hold, so this takeover race starts with fresh sessions
+        // on every zone instead of waiting forever for a retired lane.
+        initial_writer.abort().await;
+        let mut baseline = initial_volume.recover(WalSeqNo::ZERO).await?;
+        let mut baseline_records = Vec::new();
+        while let Some(record) = baseline.try_next().await? {
+            baseline_records.push(record);
+        }
+        if baseline.end != receipt.next_seqno()
+            || baseline_records
+                != [WalRecord {
+                    seqno: WalSeqNo::ZERO,
+                    payload: payload.clone(),
+                }]
+        {
+            bail!("racing-recoveries baseline lost the acknowledged setup record");
+        }
+        let sealed_baseline_segments = baseline.sealed_segment_count();
+        initial_writer = baseline.start(self.engine_config.clone()).await?;
+
         let initial_manifest = self.manifest_observation_at(&prefix).await?;
         initial_manifest
             .tail_id
@@ -3361,14 +3384,19 @@ impl ProductionHarness {
                 .position(|operation| *operation == Operation::Read);
             if takeovers != 2
                 || operations.first().copied() != Some(Operation::Get)
-                || first_takeover != Some(1)
+                // Recovery first stats the sealed setup prefix, then resolves
+                // the current tail's generation before its takeover open.
+                || first_takeover != Some(sealed_baseline_segments + 1)
+                || operations[..first_takeover.unwrap_or(0)]
+                    .iter()
+                    .any(|operation| *operation != Operation::Get)
                 || first_read
                     .is_some_and(|read| first_takeover.is_none_or(|takeover| read < takeover))
             {
                 initial_writer.abort().await;
                 bail!(
                     "zone {zone} recovery used takeovers={takeovers}, operations={operations:?}; \
-                     expected current-generation lookup then takeover before any content read, \
+                     expected sealed-prefix stats and current-generation lookup then takeover before any content read, \
                      with one takeover for each of [tail,pending]"
                 );
             }
@@ -4103,6 +4131,29 @@ mod tests {
     #[test]
     fn production_client_seed_is_deterministic() {
         assert_deterministic(3, 48).unwrap();
+    }
+
+    #[test]
+    fn racing_recoveries_rebuilds_lanes_after_torn_setup_append() {
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(SIM_DURATION)
+            .tick_duration(SIM_TICK)
+            .rng_seed(360)
+            .build();
+        sim.client("harness", async {
+            let zones: Vec<FakeGcs> = (0..3).map(|_| FakeGcs::default()).collect();
+            let mut harness = ProductionHarness::new(360, zones, FakeGcs::default()).await?;
+            // Match the nightly failure: the first interruption tears the setup
+            // record, and the second prevents its lane from resuming. The
+            // other two zones still acknowledge it successfully.
+            harness.servers[2].inject_partial_write(1).await;
+            harness.servers[2].inject_partial_write(1).await;
+            harness.racing_recoveries().await?;
+            assert_eq!(harness.servers[2].observed_fault_count().await, 2);
+            harness.finish(0).await?;
+            Ok(())
+        });
+        sim.run().unwrap();
     }
 
     #[test]
