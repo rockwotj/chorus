@@ -670,11 +670,14 @@ impl CommitTracker {
             self.metrics
                 .adjust_zone_durable_lag(zone, lane_durable_lag(lane) - previous_lag);
         }
+        // Subscribe before recomputing: a lane may already have made this
+        // window durable, and the recompute below then publishes its commit.
+        let updates = self.subscribe();
         self.recompute_locked(&mut state);
         CommitRange {
             first_offset,
             end_offset: state.admitted,
-            updates: self.subscribe(),
+            updates,
         }
     }
 
