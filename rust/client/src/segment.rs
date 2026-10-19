@@ -20,7 +20,7 @@ use crate::metrics::{Metrics, MetricsRecorder, NoopMetricsRecorder};
 #[cfg(test)]
 use crate::protocol::PendingCommit;
 use crate::protocol::{
-    canonical_prefix, majority, valid_format, ClientConfig, CommitRange, ProtocolError,
+    canonical_prefix_bytes, majority, valid_format, ClientConfig, CommitRange, ProtocolError,
     QuorumVolume, RecoveredTail, RecoveryCandidate, Writer,
 };
 use crate::record::RecordFrame;
@@ -2619,6 +2619,29 @@ async fn read_sealed_segment(
     segment: &SegmentDescriptor,
     accept_unfinalized_crc_match: bool,
 ) -> Result<Vec<RecordFrame>, Error> {
+    Ok(
+        read_sealed_segment_bytes(factories, object, segment, accept_unfinalized_crc_match)
+            .await?
+            .records,
+    )
+}
+
+/// A sealed segment's verified bytes and the records decoded from them.
+///
+/// Every record payload is a slice of `bytes`, so the segment occupies one
+/// allocation however many of the two fields a caller keeps.
+struct SealedSegmentRead {
+    bytes: Bytes,
+    records: Vec<RecordFrame>,
+}
+
+/// [`read_sealed_segment`], also returning the verified segment bytes.
+async fn read_sealed_segment_bytes(
+    factories: &[Arc<dyn ReplicaFactory>],
+    object: &str,
+    segment: &SegmentDescriptor,
+    accept_unfinalized_crc_match: bool,
+) -> Result<SealedSegmentRead, Error> {
     let replicas = replicas_for(factories, object);
     let expected_end = segment.end_record_index;
     let expected_records = expected_end
@@ -2642,17 +2665,20 @@ async fn read_sealed_segment(
     let mut permanent = Vec::new();
     for (zone, replica) in replicas.iter().enumerate() {
         match replica.snapshot().await {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
                 if snapshot.crc32c == Some(expected_crc32c)
                     && crc32c::crc32c(&snapshot.bytes) == expected_crc32c
-                {
-                    if let Some(records) = decoded_sealed_snapshot(
+                    && usable_sealed_snapshot(
                         &snapshot,
                         expected_records,
                         !accept_unfinalized_crc_match,
-                    ) {
-                        return Ok(records);
-                    }
+                    )
+                {
+                    // The read buffer becomes the shared backing of every
+                    // payload without a copy.
+                    let bytes = Bytes::from(std::mem::take(&mut snapshot.bytes));
+                    let records = RecordFrame::decode_all_bytes(bytes.clone())?;
+                    return Ok(SealedSegmentRead { bytes, records });
                 }
                 snapshots.push(snapshot);
             }
@@ -2660,8 +2686,7 @@ async fn read_sealed_segment(
             Err(_) => {}
         }
     }
-    snapshots
-        .retain(|snapshot| decoded_sealed_snapshot(snapshot, expected_records, true).is_some());
+    snapshots.retain(|snapshot| usable_sealed_snapshot(snapshot, expected_records, true));
     let quorum = majority(replicas.len());
     if snapshots.len() < quorum {
         return Err(quorum_impossible_error(
@@ -2671,7 +2696,9 @@ async fn read_sealed_segment(
         )
         .unwrap_or(Error::NoReadQuorum));
     }
-    let records = canonical_prefix(&snapshots, quorum)?;
+    let bytes = canonical_prefix_bytes(&snapshots, quorum)?;
+    drop(snapshots);
+    let records = RecordFrame::decode_all_bytes(bytes.clone())?;
     if records.len() as u64 != expected_records {
         return Err(Error::InvalidSegmentData(format!(
             "segment {} should contain {expected_records} records but contains {}",
@@ -2679,14 +2706,14 @@ async fn read_sealed_segment(
             records.len()
         )));
     }
-    let actual_crc32c = encoded_records_crc32c(&records)?;
+    let actual_crc32c = crc32c::crc32c(&bytes);
     if actual_crc32c != expected_crc32c {
         return Err(Error::InvalidSegmentData(format!(
             "segment {} quorum bytes have CRC32C {actual_crc32c:08x}, expected {expected_crc32c:08x}",
             segment.base_record_index
         )));
     }
-    Ok(records)
+    Ok(SealedSegmentRead { bytes, records })
 }
 
 async fn read_active_quorum(
@@ -2921,24 +2948,17 @@ fn active_read_decision(
     unreachable!("an active read decision always terminates at a finite prefix")
 }
 
-fn decoded_sealed_snapshot(
+/// Whether a sealed snapshot is well-formed and holds exactly
+/// `expected_records` complete records. Validation does not copy the bytes.
+fn usable_sealed_snapshot(
     snapshot: &ReplicaSnapshot,
     expected_records: u64,
     require_finalized: bool,
-) -> Option<Vec<RecordFrame>> {
-    if (require_finalized && !snapshot.finalized) || !valid_format(&snapshot.metadata) {
-        return None;
-    }
-    let records = RecordFrame::decode_all(&snapshot.bytes).ok()?;
-    (records.len() as u64 == expected_records).then_some(records)
-}
-
-fn encoded_records_crc32c(records: &[RecordFrame]) -> Result<u32, Error> {
-    let mut crc32c = 0;
-    for record in records {
-        crc32c = crc32c::crc32c_append(crc32c, &record.encode()?);
-    }
-    Ok(crc32c)
+) -> bool {
+    (!require_finalized || snapshot.finalized)
+        && valid_format(&snapshot.metadata)
+        && RecordFrame::validate_all(&snapshot.bytes)
+            .is_ok_and(|records| records as u64 == expected_records)
 }
 
 /// Provision a spare successor under an engine-allocated ordered id:
@@ -3332,13 +3352,8 @@ mod maintenance {
             // format marker only, like every segment object
             let metadata = crate::protocol::protocol_metadata();
             for (zone, replica) in targets {
-                match repair_sealed_copy(
-                    &replica,
-                    Bytes::from(bytes.clone()),
-                    metadata.clone(),
-                    expected_crc32c,
-                )
-                .await
+                match repair_sealed_copy(&replica, bytes.clone(), metadata.clone(), expected_crc32c)
+                    .await
                 {
                     Ok(true) => report.objects_repaired += 1,
                     Ok(false) => report.objects_already_healthy += 1,
@@ -3621,13 +3636,12 @@ mod maintenance {
         factories: &[Arc<dyn ReplicaFactory>],
         object: &str,
         segment: &SegmentDescriptor,
-    ) -> Result<Vec<u8>, Error> {
-        let records = read_sealed_segment(factories, object, segment, false).await?;
-        let mut bytes = Vec::new();
-        for record in records {
-            bytes.extend_from_slice(&record.encode()?);
-        }
-        Ok(bytes)
+    ) -> Result<Bytes, Error> {
+        // The verified bytes are the segment's encoded records, so they are
+        // written back as read rather than re-encoded.
+        Ok(read_sealed_segment_bytes(factories, object, segment, false)
+            .await?
+            .bytes)
     }
 
     async fn repair_sealed_copy(
