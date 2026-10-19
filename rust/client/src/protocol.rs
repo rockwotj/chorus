@@ -461,12 +461,6 @@ impl CanonicalPrefix {
     pub fn len(&self) -> usize {
         self.record_ends.len()
     }
-
-    /// Decode the records. Each payload is a slice of the shared prefix.
-    pub fn into_records(self) -> Vec<RecordFrame> {
-        RecordFrame::decode_all_bytes(self.bytes)
-            .expect("a canonical prefix contains only complete records")
-    }
 }
 
 impl<'a> WitnessPrefix<'a> {
@@ -2871,18 +2865,26 @@ pub(crate) async fn retry_sleep(config: &ClientConfig, attempt: usize) {
 /// unavailable zone may hold another copy of a committed record. A divergent
 /// minority lane is excluded by quorum agreement; different bytes among
 /// equally long maximal candidates remain ambiguous and fail recovery.
+#[cfg(test)]
 pub(crate) fn canonical_prefix(
     snapshots: &[ReplicaSnapshot],
     quorum: usize,
 ) -> Result<Vec<RecordFrame>, ProtocolError> {
+    let bytes = canonical_prefix_bytes(snapshots, quorum)?;
+    Ok(RecordFrame::decode_all_bytes(bytes)
+        .expect("a canonical prefix contains only complete records"))
+}
+
+/// The complete records a quorum of `snapshots` agrees on, as one buffer.
+pub(crate) fn canonical_prefix_bytes(
+    snapshots: &[ReplicaSnapshot],
+    quorum: usize,
+) -> Result<Bytes, ProtocolError> {
     let selection = select_canonical_quorum(snapshots, quorum)?;
     let end = selection.record_ends.last().copied().unwrap_or(0);
-    let bytes = Bytes::copy_from_slice(&snapshots[selection.witness].bytes[..end]);
-    Ok(CanonicalPrefix {
-        bytes,
-        record_ends: selection.record_ends,
-    }
-    .into_records())
+    Ok(Bytes::copy_from_slice(
+        &snapshots[selection.witness].bytes[..end],
+    ))
 }
 
 /// Ascending index combinations of size `quorum` out of `count` snapshots,

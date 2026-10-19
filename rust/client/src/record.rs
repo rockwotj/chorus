@@ -38,6 +38,7 @@ impl RecordFrame {
     /// The borrowed input is copied once into shared storage rather than once
     /// per payload. Callers that already own [`Bytes`] should use the internal
     /// owned form to avoid that segment-level copy as well.
+    #[cfg(test)]
     pub fn decode_all(input: &[u8]) -> Result<Vec<Self>, RecordError> {
         Self::decode_all_bytes(Bytes::copy_from_slice(input))
     }
