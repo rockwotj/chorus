@@ -1849,21 +1849,27 @@ mod recovery {
             if finalized.len() < self.quorum() {
                 return Ok(None);
             }
-            let mut groups: HashMap<Vec<u8>, Vec<ReplicaSnapshot>> = HashMap::new();
+            // Each distinct content keeps the first copy's buffer and a count of
+            // identical copies. Later identical buffers are compared and dropped
+            // rather than cloned into a map key.
+            let mut groups: Vec<(Vec<u8>, usize)> = Vec::new();
             for snapshot in finalized {
-                groups
-                    .entry(snapshot.bytes.clone())
-                    .or_default()
-                    .push(snapshot);
+                match groups
+                    .iter_mut()
+                    .find(|(bytes, _)| *bytes == snapshot.bytes)
+                {
+                    Some((_, copies)) => *copies += 1,
+                    None => groups.push((snapshot.bytes, 1)),
+                }
             }
-            let Some((canonical_bytes, record_count, finalized)) = groups
+            let Some((canonical_bytes, record_count, copies)) = groups
                 .into_iter()
                 .filter_map(|(bytes, copies)| {
                     RecordFrame::validate_all(&bytes)
                         .ok()
                         .map(|record_count| (bytes, record_count, copies))
                 })
-                .filter(|(_, _, copies)| copies.len() >= self.quorum())
+                .filter(|(_, _, copies)| *copies >= self.quorum())
                 .filter(|(_, record_count, _)| {
                     expected_records
                         .is_none_or(|expected| u64::try_from(*record_count).ok() == Some(expected))
@@ -1904,8 +1910,8 @@ mod recovery {
                 base_record_index,
                 end_record_index: end,
                 crc32c: expected_crc32c,
-                copies: finalized.len(),
-                finalized_copies: finalized.len(),
+                copies,
+                finalized_copies: copies,
                 seal_pending: false,
             }))
         }
