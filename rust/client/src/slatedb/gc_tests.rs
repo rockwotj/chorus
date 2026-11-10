@@ -89,7 +89,14 @@ async fn seeded_at(
     let mut writer = initialize(&wal, 0).await;
     for seq in 1..=16 {
         writer.wal_writer.append(&[row(seq)]).await.unwrap();
-        writer.wal_writer.flush().await.unwrap().await.unwrap();
+        writer
+            .wal_writer
+            .flush()
+            .await
+            .unwrap()
+            .completion
+            .await
+            .unwrap();
     }
     writer.wal_writer.close().await.unwrap();
     let writer = initialize(&wal, checkpoint).await;
@@ -126,7 +133,14 @@ async fn gc_retention_can_precede_the_writer_replay_checkpoint() {
         .is_err());
     assert_eq!(floor(&servers).await, collected);
     writer.wal_writer.append(&[row(17)]).await.unwrap();
-    writer.wal_writer.flush().await.unwrap().await.unwrap();
+    writer
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     writer.wal_writer.close().await.unwrap();
     // The old retained checkpoint still replays, despite opening the previous
     // writer at a newer checkpoint. No physical segment was partially deleted.
@@ -174,7 +188,14 @@ async fn gc_after_restart_preserves_dry_run() {
     .unwrap();
     tokio::time::timeout(Duration::from_millis(500), async {
         writer.wal_writer.append(&[row(17)]).await.unwrap();
-        writer.wal_writer.flush().await.unwrap().await.unwrap();
+        writer
+            .wal_writer
+            .flush()
+            .await
+            .unwrap()
+            .completion
+            .await
+            .unwrap();
     })
     .await
     .expect("physical GC blocked write admission or durability");
@@ -227,7 +248,14 @@ async fn gc_leaves_active_tail_and_retries_deletion_on_a_returning_zone() {
         .await
         .contains(&format!("slatedb-test/segments/{active}")));
     writer.wal_writer.append(&[row(17)]).await.unwrap();
-    writer.wal_writer.flush().await.unwrap().await.unwrap();
+    writer
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     writer.wal_writer.close().await.unwrap();
     let mut recovered = direct_writer(&wal.volume, 16).await;
     assert_eq!(replay(&mut recovered).await[0].rows, vec![row(17)]);
@@ -290,7 +318,14 @@ async fn gc_waits_through_replay_and_collects_on_the_same_call() {
     assert!(floor(&servers).await > 0);
     assert!(names(&servers, 0).await.len() < before.len());
     writer.wal_writer.append(&[row(17)]).await.unwrap();
-    writer.wal_writer.flush().await.unwrap().await.unwrap();
+    writer
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     writer.wal_writer.close().await.unwrap();
 }
 
@@ -451,7 +486,14 @@ async fn closing_a_fenced_writer_does_not_disconnect_its_successors_gc() {
     assert!(floor(&servers).await > 0);
     assert_eq!(epoch, manifest(&servers).await["chorus.epoch"]);
     newer.wal_writer.append(&[row(17)]).await.unwrap();
-    newer.wal_writer.flush().await.unwrap().await.unwrap();
+    newer
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     newer.wal_writer.close().await.unwrap();
 }
 
@@ -605,7 +647,14 @@ async fn gc_keeps_live_history_bounded_across_more_than_one_directory_of_rotatio
     let mut all_objects = HashSet::new();
     for seq in 1..=600 {
         writer.wal_writer.append(&[row(seq)]).await.unwrap();
-        writer.wal_writer.flush().await.unwrap().await.unwrap();
+        writer
+            .wal_writer
+            .flush()
+            .await
+            .unwrap()
+            .completion
+            .await
+            .unwrap();
         // Appends no longer wait for a spare segment, so a slow spare lets
         // more records share one segment. Two rows cross the 100-byte
         // target; wait for that rotation to fold so the test produces the

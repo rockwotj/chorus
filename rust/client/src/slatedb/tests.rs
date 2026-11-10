@@ -257,7 +257,14 @@ async fn pipelined_appends_notify_only_after_quorum_and_flush_is_a_barrier() {
     assert!(replay(&mut result).await.is_empty());
     // Holds target existing sessions, so start the lazy writer first.
     result.wal_writer.append(&[row(1)]).await.unwrap();
-    result.wal_writer.flush().await.unwrap().await.unwrap();
+    result
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     for server in &servers[..3] {
         server.service.inject_flush_hold().await;
     }
@@ -275,7 +282,9 @@ async fn pipelined_appends_notify_only_after_quorum_and_flush_is_a_barrier() {
     for seq in 2..=4 {
         result.wal_writer.append(&[row(seq)]).await.unwrap();
     }
-    let mut barrier = result.wal_writer.flush().await.unwrap();
+    let flush = result.wal_writer.flush().await.unwrap();
+    assert_eq!(flush.wal_id, 4);
+    let mut barrier = flush.completion;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), &mut barrier)
             .await
@@ -300,7 +309,10 @@ async fn pipelined_appends_notify_only_after_quorum_and_flush_is_a_barrier() {
     assert_eq!(status.last_flushed_seq, Some(4));
     assert_eq!(status.estimated_bytes, 0);
     assert_eq!(status.buffered_wal_entries_count, 0);
-    let completed_barrier = result.wal_writer.flush().await.unwrap();
+    // With nothing appended since the last flush, the ID is the previous WAL file.
+    let completed = result.wal_writer.flush().await.unwrap();
+    assert_eq!(completed.wal_id, 4);
+    let completed_barrier = completed.completion;
     servers[2].service.release_flush_holds().await;
     result.wal_writer.close().await.unwrap();
     completed_barrier.await.unwrap();
@@ -327,12 +339,20 @@ async fn quorum_failure_closes_observer_and_does_not_advance_durability() {
     let mut result = direct_writer(&volume, 0).await;
     replay(&mut result).await;
     result.wal_writer.append(&[row(1)]).await.unwrap();
-    result.wal_writer.flush().await.unwrap().await.unwrap();
+    result
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     for server in &servers[..2] {
         server.service.set_crashed(true).await;
     }
     if result.wal_writer.append(&[row(2)]).await.is_ok() {
-        if let Ok(barrier) = result.wal_writer.flush().await {
+        if let Ok(flush) = result.wal_writer.flush().await {
+            let barrier = flush.completion;
             assert!(tokio::time::timeout(Duration::from_secs(10), barrier)
                 .await
                 .unwrap()
@@ -388,9 +408,23 @@ async fn incomplete_replay_fails_closed_but_oversized_batches_remain_atomic() {
     servers[2].service.inject_flush_hold().await;
     tokio::time::timeout(Duration::from_secs(5), async {
         result.wal_writer.append(&[large.clone()]).await.unwrap();
-        result.wal_writer.flush().await.unwrap().await.unwrap();
+        result
+            .wal_writer
+            .flush()
+            .await
+            .unwrap()
+            .completion
+            .await
+            .unwrap();
         result.wal_writer.append(&[row(2)]).await.unwrap();
-        result.wal_writer.flush().await.unwrap().await.unwrap();
+        result
+            .wal_writer
+            .flush()
+            .await
+            .unwrap()
+            .completion
+            .await
+            .unwrap();
     })
     .await
     .expect("oversized record must not deadlock behind byte budgets");
@@ -436,7 +470,14 @@ async fn close_without_writes_shuts_down_the_replayed_engine() {
     let (_servers, volume) = volume().await;
     let mut result = direct_writer(&volume, 0).await;
     replay(&mut result).await;
-    result.wal_writer.flush().await.unwrap().await.unwrap();
+    result
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     result.wal_writer.close().await.unwrap();
     assert_eq!(
         result.wal_writer.status().unwrap_err().last_flushed_wal_id,
@@ -450,8 +491,15 @@ async fn a_flush_barrier_does_not_include_later_appends() {
     let mut result = direct_writer(&volume, 0).await;
     replay(&mut result).await;
     result.wal_writer.append(&[row(1)]).await.unwrap();
-    result.wal_writer.flush().await.unwrap().await.unwrap();
-    let earlier = result.wal_writer.flush().await.unwrap();
+    result
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
+    let earlier = result.wal_writer.flush().await.unwrap().completion;
     for server in &servers[..3] {
         server.service.inject_flush_hold().await;
     }
@@ -460,7 +508,7 @@ async fn a_flush_barrier_does_not_include_later_appends() {
         .await
         .unwrap()
         .unwrap();
-    let mut later = result.wal_writer.flush().await.unwrap();
+    let mut later = result.wal_writer.flush().await.unwrap().completion;
     assert!(tokio::time::timeout(Duration::from_millis(30), &mut later)
         .await
         .is_err());
@@ -546,12 +594,19 @@ async fn drop_closes_observers_and_pending_barriers() {
     let mut result = direct_writer(&volume, 0).await;
     replay(&mut result).await;
     result.wal_writer.append(&[row(1)]).await.unwrap();
-    result.wal_writer.flush().await.unwrap().await.unwrap();
+    result
+        .wal_writer
+        .flush()
+        .await
+        .unwrap()
+        .completion
+        .await
+        .unwrap();
     for server in &servers[..3] {
         server.service.inject_flush_hold().await;
     }
     result.wal_writer.append(&[row(2)]).await.unwrap();
-    let barrier = result.wal_writer.flush().await.unwrap();
+    let barrier = result.wal_writer.flush().await.unwrap().completion;
     let observer = result.wal_writer.observer();
     drop(result);
     assert!(matches!(

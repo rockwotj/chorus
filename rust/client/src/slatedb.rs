@@ -64,8 +64,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use slatedb::wal::{
-    FlushResultFuture, WalError, WalEvent, WalIterator, WalObserver, WalRows, WalStatus,
-    WalStatusListener, WalWriter, WriterInit, WriterInitResult, WriterManifest,
+    FlushResultFuture, WalError, WalEvent, WalFlushResult, WalIterator, WalObserver, WalRows,
+    WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult, WriterManifest,
 };
 use slatedb::RowEntry;
 use tokio::sync::{oneshot, watch};
@@ -565,11 +565,17 @@ impl WalWriter for Writer {
         result
     }
 
-    async fn flush(&mut self) -> Result<FlushResultFuture, WalError> {
+    async fn flush(&mut self) -> Result<WalFlushResult, WalError> {
         self.observer.status().map_err(WalError::from)?;
         // Chorus dispatches on admission; flush is a prefix durability barrier,
-        // not an instruction to seal a physical segment.
-        Ok(self.observer.barrier(self.next_index))
+        // not an instruction to seal a physical segment. Record `i` is WAL file
+        // `i + 1`, so `next_index` is the last appended WAL ID, or the recovered
+        // last flushed ID when nothing was appended.
+        let wal_id = self.next_index;
+        Ok(WalFlushResult {
+            wal_id,
+            completion: self.observer.barrier(wal_id),
+        })
     }
 
     fn observer(&self) -> Box<dyn WalObserver> {

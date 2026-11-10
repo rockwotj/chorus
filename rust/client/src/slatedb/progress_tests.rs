@@ -155,7 +155,7 @@ async fn stalled_progress_consumer_does_not_limit_small_write_admission() {
         !writer.should_flush_memtable(0),
         "uncommitted writes must not request a freeze"
     );
-    let barrier = writer.flush().await.unwrap();
+    let barrier = writer.flush().await.unwrap().completion;
     for server in &servers[..3] {
         server.service.release_flush_holds().await;
     }
@@ -266,7 +266,7 @@ async fn admission_failure_publishes_unseen_durable_progress_before_closing() {
     let (_servers, volume) = volume().await;
     let (mut writer, mut progress) = writer_without_consumer(&volume, config()).await;
     writer.append(&[row(100)]).await.unwrap();
-    let barrier = writer.flush().await.unwrap();
+    let barrier = writer.flush().await.unwrap().completion;
     progress.wait_for(|p| p.committed.is_some()).await.unwrap();
     assert_eq!(writer.status().unwrap().last_flushed_wal_id, 0);
     // A sequence regression fails admission before another engine command.

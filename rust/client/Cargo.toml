@@ -1,6 +1,6 @@
 [package]
 name = "chorus-client"
-version = "0.7.3"
+version = "0.7.4"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -37,7 +37,7 @@ prost-types.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
-slatedb = { version = "0.17", default-features = false, optional = true }
+slatedb = { version = ">=0.18", default-features = false, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
