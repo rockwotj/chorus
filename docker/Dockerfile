@@ -4,8 +4,9 @@ ARG P_VERSION=3.1.0
 ARG UCLID_VERSION=0.9.5
 ARG UCLID_SHA256=57dfe2eebbbd9111d9cbf87dc2d8ce4d11a3f2390c5a97f2ba5217d5ac8aa23a
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+# Retry transient mirror/DNS failures without restarting the verification job.
+RUN apt-get -o Acquire::Retries=5 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
        build-essential ca-certificates curl jq maven openjdk-17-jdk-headless pkg-config \
        python3 unzip z3 \
     && rm -rf /var/lib/apt/lists/*
